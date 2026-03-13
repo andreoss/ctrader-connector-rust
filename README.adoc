@@ -1,0 +1,47 @@
+= ctrader-connector
+
+A Rust library for the cTrader Open API (Protobuf over TLS) and the cTrader
+FIX 4.4 API: connection and authorisation, market data, trading and account
+data.
+
+Each protocol sits behind its own feature, `open-api` and `fix`. Clients are
+built from a configuration builder and target the demo environment unless
+the live one is requested.
+
+== Requirements
+- Rust 1.86 or later, edition 2024.
+- A tokio runtime in the calling application.
+
+== Build
+[source,sh]
+----
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all-features
+----
+
+== Test
+[source,sh]
+----
+cargo test --all-features
+cargo llvm-cov --all-features --fail-under-lines 85
+----
+
+Live tests read demo account credentials from the environment.
+
+== Run
+The crate is a library. Add it to an application with the protocol features
+needed:
+
+[source,toml]
+----
+[dependencies]
+ctrader-connector = { version = "0.1", features = ["open-api", "fix"] }
+----
+
+Runnable examples live under `examples/`:
+
+[source,sh]
+----
+cargo run --example <name> --features open-api
+----

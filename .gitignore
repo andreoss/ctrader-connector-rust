@@ -1,0 +1,5 @@
+.spec/
+scratch/
+AGENTS.md
+target/
+.envrc
