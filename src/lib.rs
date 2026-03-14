@@ -11,6 +11,9 @@ pub mod fix;
 #[cfg(feature = "open-api")]
 pub mod open_api;
 
+#[cfg(test)]
+mod proto_text;
+
 /// Version of this crate as recorded in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
