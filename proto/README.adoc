@@ -1,0 +1,24 @@
+= Vendored proto files
+
+The four `.proto` files in this directory describe the messages of the cTrader Open API.
+
+== Origin
+[horizontal]
+Upstream:: https://github.com/spotware/openapi-proto-messages
+Revision:: `41ec474b4cbacc5adf6c4048f09486f41e80962e`
+Date:: 2023-11-02
+
+The files are the upstream ones with comments and `option` lines removed. Messages, fields,
+enums and their numbers are unchanged.
+
+== Generated code
+`src/open_api/messages.rs` is generated from these files and checked in, so a build needs no
+Protobuf compiler. The test `tests/proto_regeneration.rs` regenerates the code with a pure-Rust
+toolchain and fails unless the result equals the checked-in file byte for byte.
+
+== Updating
+. Replace the `.proto` files with the ones of the new upstream revision.
+. Record the new revision and date above.
+. Run the regeneration test; it fails and leaves the new code in
+  `target/tmp/proto_regeneration/_.rs`.
+. Copy that file over `src/open_api/messages.rs` and run the test again.
