@@ -1,6 +1,7 @@
 //! Conversions from the error messages of the Open API to the shared error types.
 
 use crate::common::errors::{ErrorCode, ServerError};
+use crate::common::ids::AccountId;
 use crate::open_api::messages::{ProtoErrorCode, ProtoErrorRes, ProtoOaErrorCode, ProtoOaErrorRes};
 
 impl From<ProtoErrorCode> for ErrorCode {
@@ -30,6 +31,9 @@ impl From<ProtoOaErrorRes> for ServerError {
     fn from(response: ProtoOaErrorRes) -> Self {
         let mut error = Self::new(ErrorCode::from_wire(&response.error_code));
         error.description = response.description;
+        error.account_id = response
+            .ctid_trader_account_id
+            .and_then(|id| AccountId::new(id).ok());
         error.maintenance_end_timestamp = response.maintenance_end_timestamp;
         error
     }
@@ -38,6 +42,7 @@ impl From<ProtoOaErrorRes> for ServerError {
 #[cfg(test)]
 mod tests {
     use crate::common::errors::{ErrorCode, ServerError};
+    use crate::common::ids::AccountId;
     use crate::open_api::messages::{
         ProtoErrorCode, ProtoErrorRes, ProtoOaErrorCode, ProtoOaErrorRes,
     };
@@ -106,6 +111,7 @@ mod tests {
             maintenance_end_timestamp: Some(1_700_000_000_000),
         });
         assert_eq!(error.code, ErrorCode::ServerIsUnderMaintenance);
+        assert_eq!(error.account_id.map(AccountId::get), Some(7));
         assert_eq!(error.description.as_deref(), Some("back soon"));
         assert_eq!(error.maintenance_end_timestamp, Some(1_700_000_000_000));
     }
@@ -120,6 +126,7 @@ mod tests {
             maintenance_end_timestamp: None,
         });
         assert_eq!(error.code, ErrorCode::Unknown("BRAND_NEW_CODE".to_owned()));
+        assert_eq!(error.account_id, None);
         assert_eq!(error.to_string(), "server error BRAND_NEW_CODE");
     }
 }

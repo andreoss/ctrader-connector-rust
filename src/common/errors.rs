@@ -2,7 +2,10 @@
 
 use std::fmt;
 
+use rust_decimal::Decimal;
 use thiserror::Error;
+
+use crate::common::ids::AccountId;
 
 /// Reasons a configuration is rejected before any connection is attempted.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -202,6 +205,8 @@ pub struct ServerError {
     pub code: ErrorCode,
     /// Explanation given by the server, when there is one.
     pub description: Option<String>,
+    /// Account the error concerns, when the server names one.
+    pub account_id: Option<AccountId>,
     /// End of the maintenance window in milliseconds since the Unix epoch, when announced.
     pub maintenance_end_timestamp: Option<i64>,
 }
@@ -213,6 +218,7 @@ impl ServerError {
         Self {
             code,
             description: None,
+            account_id: None,
             maintenance_end_timestamp: None,
         }
     }
@@ -221,6 +227,13 @@ impl ServerError {
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Adds the account the error concerns.
+    #[must_use]
+    pub const fn with_account_id(mut self, account_id: AccountId) -> Self {
+        self.account_id = Some(account_id);
         self
     }
 
@@ -236,6 +249,56 @@ fn detail(description: Option<&str>) -> String {
     description.map_or_else(String::new, |text| format!(": {text}"))
 }
 
+/// Reasons an identifier, a price or a volume is rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ValueError {
+    /// The identifier is not a positive integer.
+    #[error("{kind} must be a positive integer, got {value}")]
+    InvalidId {
+        /// Kind of the identifier.
+        kind: &'static str,
+        /// The rejected value as given.
+        value: String,
+    },
+    /// The text is not a decimal number.
+    #[error("{kind} is not a decimal number: {text}")]
+    InvalidDecimal {
+        /// Kind of the value.
+        kind: &'static str,
+        /// The rejected text.
+        text: String,
+    },
+    /// The value is below zero.
+    #[error("{kind} must not be negative, got {value}")]
+    Negative {
+        /// Kind of the value.
+        kind: &'static str,
+        /// The rejected value.
+        value: Decimal,
+    },
+    /// The symbol has more digits than a wire price carries.
+    #[error("symbol digits must be at most 5, got {digits}")]
+    TooManyDigits {
+        /// The rejected number of digits.
+        digits: u32,
+    },
+    /// The value is finer than the wire step or too large for the wire integer.
+    #[error("{kind} cannot be carried on the wire: {value}")]
+    Unrepresentable {
+        /// Kind of the value.
+        kind: &'static str,
+        /// The rejected value.
+        value: Decimal,
+    },
+    /// The wire integer does not fit a decimal.
+    #[error("{kind} is out of range")]
+    OutOfRange {
+        /// Kind of the value.
+        kind: &'static str,
+    },
+}
+
 /// Any failure reported by this library.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -246,6 +309,9 @@ pub enum ConnectorError {
     /// The server refused a request.
     #[error(transparent)]
     Server(#[from] ServerError),
+    /// An identifier, a price or a volume was rejected.
+    #[error("value rejected: {0}")]
+    Value(#[from] ValueError),
 }
 
 #[cfg(test)]
@@ -253,7 +319,8 @@ mod tests {
     use std::collections::HashSet;
     use std::error::Error;
 
-    use super::{ConfigError, ConnectorError, ErrorCode, ServerError};
+    use super::{ConfigError, ConnectorError, ErrorCode, ServerError, ValueError};
+    use crate::common::ids::AccountId;
     use crate::proto_text;
 
     fn proto_codes(name: &str) -> Vec<String> {
@@ -332,6 +399,9 @@ mod tests {
             "server error BRAND_NEW_CODE: try later"
         );
         assert_eq!(detailed.maintenance_end_timestamp, Some(1_700_000_000_000));
+        assert_eq!(detailed.account_id, None);
+        let account = AccountId::new(7).expect("positive id");
+        assert_eq!(detailed.with_account_id(account).account_id, Some(account));
     }
 
     #[test]
@@ -347,6 +417,11 @@ mod tests {
         assert_eq!(
             config.to_string(),
             "configuration rejected: port must not be zero"
+        );
+        let value = ConnectorError::from(ValueError::TooManyDigits { digits: 9 });
+        assert_eq!(
+            value.to_string(),
+            "value rejected: symbol digits must be at most 5, got 9"
         );
         assert_eq!(
             config.source().map(ToString::to_string),
