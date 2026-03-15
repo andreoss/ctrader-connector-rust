@@ -6,5 +6,7 @@ pub mod errors;
 #[rustfmt::skip]
 pub mod messages;
 
+pub mod transport;
+
 #[cfg(test)]
 mod messages_tests;

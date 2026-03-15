@@ -14,13 +14,16 @@ path = "src/lib.rs"
 
 [features]
 default = []
-open-api = ["dep:prost"]
+open-api = ["dep:prost", "dep:tokio", "dep:tokio-rustls", "dep:webpki-roots"]
 fix = []
 
 [dependencies]
 prost = { version = "0.14.5", optional = true }
 rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
 thiserror = "2"
+tokio = { version = "1", optional = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+webpki-roots = { version = "1", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -34,3 +37,12 @@ missing_panics_doc = "deny"
 [dev-dependencies]
 prost-build = "0.14.5"
 protox = "0.10.0"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[[test]]
+name = "open_api_mock"
+required-features = ["open-api"]
+
+[[test]]
+name = "open_api_live"
+required-features = ["open-api"]

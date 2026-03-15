@@ -1,6 +1,7 @@
 //! Error types shared by every protocol.
 
 use std::fmt;
+use std::time::Duration;
 
 use rust_decimal::Decimal;
 use thiserror::Error;
@@ -299,6 +300,55 @@ pub enum ValueError {
     },
 }
 
+/// Reasons a connection fails below the level of protocol messages.
+///
+/// The variants carry text instead of the underlying error values so the type stays comparable
+/// and cloneable.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum TransportError {
+    /// Reading from or writing to the socket failed.
+    #[error("input or output failed ({kind:?}): {message}")]
+    Io {
+        /// Kind of the failure.
+        kind: std::io::ErrorKind,
+        /// Explanation given by the operating system or the runtime.
+        message: String,
+    },
+    /// The TLS layer refused the configuration or the handshake.
+    #[error("TLS failed: {0}")]
+    Tls(String),
+    /// The host is not a name a certificate can be checked against.
+    #[error("host is not a valid server name: {0}")]
+    InvalidHost(String),
+    /// The connection was not established in time.
+    #[error("connecting timed out after {0:?}")]
+    ConnectTimeout(Duration),
+    /// A frame is longer than the limit.
+    #[error("frame of {length} bytes exceeds the limit of {limit} bytes")]
+    FrameTooLong {
+        /// Length announced by the frame.
+        length: usize,
+        /// Longest frame accepted.
+        limit: usize,
+    },
+    /// A frame does not hold a valid message.
+    #[error("frame cannot be decoded: {0}")]
+    Decode(String),
+    /// The peer closed the connection.
+    #[error("connection closed by the peer")]
+    Closed,
+}
+
+impl From<std::io::Error> for TransportError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Any failure reported by this library.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -312,6 +362,9 @@ pub enum ConnectorError {
     /// An identifier, a price or a volume was rejected.
     #[error("value rejected: {0}")]
     Value(#[from] ValueError),
+    /// The connection failed below the level of protocol messages.
+    #[error("transport failed: {0}")]
+    Transport(#[from] TransportError),
 }
 
 #[cfg(test)]
@@ -319,7 +372,9 @@ mod tests {
     use std::collections::HashSet;
     use std::error::Error;
 
-    use super::{ConfigError, ConnectorError, ErrorCode, ServerError, ValueError};
+    use std::time::Duration;
+
+    use super::{ConfigError, ConnectorError, ErrorCode, ServerError, TransportError, ValueError};
     use crate::common::ids::AccountId;
     use crate::proto_text;
 
@@ -426,6 +481,39 @@ mod tests {
         assert_eq!(
             config.source().map(ToString::to_string),
             Some("port must not be zero".to_owned())
+        );
+    }
+
+    #[test]
+    fn transport_error_keeps_the_kind_of_an_io_failure() {
+        let source = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer");
+        let error = TransportError::from(source);
+        assert_eq!(
+            error,
+            TransportError::Io {
+                kind: std::io::ErrorKind::ConnectionReset,
+                message: "reset by peer".to_owned(),
+            }
+        );
+        assert_eq!(
+            ConnectorError::from(error).to_string(),
+            "transport failed: input or output failed (ConnectionReset): reset by peer"
+        );
+        assert_eq!(
+            TransportError::FrameTooLong {
+                length: 9,
+                limit: 8
+            }
+            .to_string(),
+            "frame of 9 bytes exceeds the limit of 8 bytes"
+        );
+        assert_eq!(
+            TransportError::ConnectTimeout(Duration::from_secs(15)).to_string(),
+            "connecting timed out after 15s"
+        );
+        assert_eq!(
+            TransportError::Closed.to_string(),
+            "connection closed by the peer"
         );
     }
 }
