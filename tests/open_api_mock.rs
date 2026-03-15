@@ -4,7 +4,10 @@ mod support;
 
 use std::time::Duration;
 
+use ctrader_connector::common::config::{ConfigurationOpenApi, ConfigurationOpenApiBuilder};
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TransportError};
+use ctrader_connector::common::ids::AccountId;
+use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
     ProtoHeartbeatEvent, ProtoOaApplicationAuthReq, ProtoOaGetAccountListByAccessTokenReq,
@@ -12,8 +15,9 @@ use ctrader_connector::open_api::messages::{
 };
 use ctrader_connector::open_api::transport::{Connect, Framed, Plain, Tls};
 use support::{
-    ACCESS_TOKEN, APPLICATION_AUTH_REQ, APPLICATION_AUTH_RES, CLIENT_ID, CLIENT_SECRET, HEARTBEAT,
-    HOST, MockOptions, MockServer, OA_ERROR, VERSION_REQ, VERSION_RES, envelope,
+    ACCESS_TOKEN, ACCOUNT_AUTH_REQ, ACCOUNT_LIST_REQ, APPLICATION_AUTH_REQ, APPLICATION_AUTH_RES,
+    CLIENT_ID, CLIENT_SECRET, HEARTBEAT, HOST, MockOptions, MockServer, OA_ERROR, REFRESH_TOKEN,
+    VERSION_REQ, VERSION_RES, envelope,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -343,4 +347,122 @@ async fn lost_connection_fails_pending_requests_and_is_reported() {
         next_event(&mut events).await,
         Event::Disconnected(TransportError::Closed)
     );
+}
+
+fn builder(server: &MockServer) -> ConfigurationOpenApiBuilder {
+    ConfigurationOpenApi::demo()
+        .host(HOST)
+        .port(server.port())
+        .client_id(CLIENT_ID)
+        .client_secret(CLIENT_SECRET)
+        .access_token(ACCESS_TOKEN)
+        .refresh_token(REFRESH_TOKEN)
+        .timeout(Duration::from_secs(5))
+}
+
+async fn client(configuration: ConfigurationOpenApiBuilder) -> OpenApiClient {
+    let configuration = configuration.build().expect("configuration");
+    let options = ConnectionOptions::from(&configuration);
+    OpenApiClient::connect_with(configuration, Plain, options)
+        .await
+        .expect("client")
+}
+
+fn account(id: i64) -> AccountId {
+    AccountId::new(id).expect("account id")
+}
+
+fn code(outcome: Result<(), ConnectorError>) -> Option<ErrorCode> {
+    match outcome {
+        Err(ConnectorError::Server(error)) => Some(error.code),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn application_and_account_are_authorised_in_order() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server)).await;
+    assert_eq!(client.configuration().port(), server.port());
+    client.authorise_application().await.expect("application");
+    assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
+    let accounts = client.accounts().await.expect("accounts");
+    assert_eq!(
+        accounts.iter().map(|a| a.id.get()).collect::<Vec<_>>(),
+        vec![101, 102]
+    );
+    assert!(accounts.iter().all(|a| !a.is_live && a.login == Some(7)));
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("account");
+    assert_eq!(
+        server.types_on(1),
+        vec![
+            APPLICATION_AUTH_REQ,
+            VERSION_REQ,
+            ACCOUNT_LIST_REQ,
+            ACCOUNT_AUTH_REQ
+        ]
+    );
+    assert_eq!(
+        code(client.authorise_account(account(999)).await),
+        Some(ErrorCode::ChCtidTraderAccountNotFound)
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn bad_secret_yields_the_typed_error() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server).client_secret("wrong")).await;
+    assert_eq!(
+        code(client.authorise_application().await),
+        Some(ErrorCode::ChClientAuthFailure)
+    );
+    assert_eq!(
+        code(client.authorise_account(account(101)).await),
+        Some(ErrorCode::ChClientNotAuthenticated)
+    );
+}
+
+#[tokio::test]
+async fn bad_token_yields_the_typed_error() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server).access_token("stale")).await;
+    client.authorise_application().await.expect("application");
+    assert_eq!(
+        code(client.authorise_account(account(101)).await),
+        Some(ErrorCode::ChAccessTokenInvalid)
+    );
+    assert_eq!(
+        code(client.accounts().await.map(|_| ())),
+        Some(ErrorCode::ChAccessTokenInvalid)
+    );
+}
+
+#[tokio::test]
+async fn account_id_out_of_range_is_a_value_error() {
+    let server = MockServer::start(MockOptions {
+        accounts: vec![0],
+        ..MockOptions::default()
+    })
+    .await;
+    let client = client(builder(&server)).await;
+    client.authorise_application().await.expect("application");
+    assert!(matches!(
+        client.accounts().await,
+        Err(ConnectorError::Value(_))
+    ));
+}
+
+#[tokio::test]
+async fn default_connect_uses_tls_and_fails_against_a_plain_server() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let configuration = builder(&server).build().expect("configuration");
+    let outcome = OpenApiClient::connect(configuration).await;
+    assert!(matches!(
+        outcome.map(|_| ()),
+        Err(ConnectorError::Transport(TransportError::Tls(_)))
+    ));
 }

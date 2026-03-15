@@ -6,6 +6,7 @@ pub mod errors;
 #[rustfmt::skip]
 pub mod messages;
 
+pub mod client;
 pub mod connection;
 pub mod payload;
 pub mod transport;

@@ -6,6 +6,8 @@
 use std::time::Duration;
 
 use ctrader_connector::common::config::{ConfigurationOpenApi, Environment};
+use ctrader_connector::common::errors::{ConnectorError, ErrorCode};
+use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes,
@@ -134,4 +136,67 @@ async fn live_concurrent_requests_and_heartbeats_over_an_idle_period() {
     );
     assert!(stats.heartbeats_sent >= 3);
     connection.shutdown().await;
+}
+
+fn code(outcome: Result<(), ConnectorError>) -> Option<ErrorCode> {
+    match outcome {
+        Err(ConnectorError::Server(error)) => Some(error.code),
+        _ => None,
+    }
+}
+
+async fn demo_account(client: &OpenApiClient) -> Account {
+    let accounts = client.accounts().await.expect("account list");
+    let demo: Vec<&Account> = accounts.iter().filter(|a| !a.is_live).collect();
+    println!(
+        "live accounts: {} in total, {} demo",
+        accounts.len(),
+        demo.len()
+    );
+    **demo
+        .first()
+        .expect("the access token grants at least one demo account")
+}
+
+#[tokio::test]
+async fn live_application_and_demo_account_are_authorised() {
+    let _guard = LIVE.lock().await;
+    let client = OpenApiClient::connect(configuration())
+        .await
+        .expect("connect to the demo host");
+    client
+        .authorise_application()
+        .await
+        .expect("application authorisation");
+    let account = demo_account(&client).await;
+    client
+        .authorise_account(account.id)
+        .await
+        .expect("account authorisation");
+    println!(
+        "live authorisation: application and account {} authorised",
+        account.id
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_bad_secret_yields_the_typed_error() {
+    let _guard = LIVE.lock().await;
+    let good = configuration();
+    let bad = ConfigurationOpenApi::demo()
+        .host(good.host())
+        .port(good.port())
+        .client_id(good.client_id().as_str())
+        .client_secret("not-the-secret-of-this-application")
+        .access_token(good.access_token().expose())
+        .build()
+        .expect("configuration");
+    let client = OpenApiClient::connect(bad)
+        .await
+        .expect("connect to the demo host");
+    let refused = code(client.authorise_application().await);
+    println!("live bad secret: {refused:?}");
+    assert_eq!(refused, Some(ErrorCode::ChClientAuthFailure));
+    client.shutdown().await;
 }
