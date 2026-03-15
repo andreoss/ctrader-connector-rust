@@ -365,6 +365,20 @@ pub enum ConnectorError {
     /// The connection failed below the level of protocol messages.
     #[error("transport failed: {0}")]
     Transport(#[from] TransportError),
+    /// The server did not answer a request in time.
+    #[error("no response within {0:?}")]
+    Timeout(Duration),
+    /// The connection is shut down and accepts no further requests.
+    #[error("connection is shut down")]
+    Closed,
+    /// The server answered with a message of another type than the request calls for.
+    #[error("expected payload type {expected}, received {received}")]
+    UnexpectedResponse {
+        /// Payload type of the response the request calls for.
+        expected: u32,
+        /// Payload type the server sent.
+        received: u32,
+    },
 }
 
 #[cfg(test)]

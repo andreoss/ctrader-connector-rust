@@ -2,13 +2,21 @@
 
 mod support;
 
-use ctrader_connector::common::errors::TransportError;
-use ctrader_connector::open_api::messages::{ProtoOaApplicationAuthReq, ProtoOaVersionReq};
+use std::time::Duration;
+
+use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TransportError};
+use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
+use ctrader_connector::open_api::messages::{
+    ProtoHeartbeatEvent, ProtoOaApplicationAuthReq, ProtoOaGetAccountListByAccessTokenReq,
+    ProtoOaSpotEvent, ProtoOaVersionReq,
+};
 use ctrader_connector::open_api::transport::{Connect, Framed, Plain, Tls};
 use support::{
-    APPLICATION_AUTH_REQ, APPLICATION_AUTH_RES, CLIENT_ID, CLIENT_SECRET, HOST, MockOptions,
-    MockServer, OA_ERROR, VERSION_REQ, envelope,
+    ACCESS_TOKEN, APPLICATION_AUTH_REQ, APPLICATION_AUTH_RES, CLIENT_ID, CLIENT_SECRET, HEARTBEAT,
+    HOST, MockOptions, MockServer, OA_ERROR, VERSION_REQ, VERSION_RES, envelope,
 };
+use tokio::sync::broadcast;
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn framed_round_trip_against_the_mock_server() {
@@ -67,5 +75,272 @@ async fn connecting_to_a_closed_port_fails_with_an_io_error() {
     assert!(
         matches!(error, Some(TransportError::Io { .. })),
         "unexpected outcome: {error:?}"
+    );
+}
+
+fn options() -> ConnectionOptions {
+    ConnectionOptions::new()
+        .timeout(Duration::from_secs(5))
+        .heartbeat_interval(Duration::from_secs(5))
+}
+
+async fn open(server: &MockServer, options: ConnectionOptions) -> Connection {
+    Connection::open(Plain, HOST, server.port(), options)
+        .await
+        .expect("connection")
+}
+
+fn application_auth(secret: &str) -> ProtoOaApplicationAuthReq {
+    ProtoOaApplicationAuthReq {
+        payload_type: None,
+        client_id: CLIENT_ID.to_owned(),
+        client_secret: secret.to_owned(),
+    }
+}
+
+fn account_list() -> ProtoOaGetAccountListByAccessTokenReq {
+    ProtoOaGetAccountListByAccessTokenReq {
+        payload_type: None,
+        access_token: ACCESS_TOKEN.to_owned(),
+    }
+}
+
+async fn eventually(what: &str, check: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not reached: {what}");
+}
+
+async fn next_event(events: &mut broadcast::Receiver<Event>) -> Event {
+    timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("event in time")
+        .expect("event")
+}
+
+#[tokio::test]
+async fn concurrent_requests_resolve_to_their_own_responses() {
+    let server = MockServer::start(MockOptions {
+        reverse_batch: 6,
+        ..MockOptions::default()
+    })
+    .await;
+    let connection = open(&server, options()).await;
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application authorisation");
+    let version = ProtoOaVersionReq::default();
+    let accounts = account_list();
+    let (v1, a1, v2, a2, v3, a3) = tokio::join!(
+        connection.request(&version),
+        connection.request(&accounts),
+        connection.request(&version),
+        connection.request(&accounts),
+        connection.request(&version),
+        connection.request(&accounts),
+    );
+    for response in [v1, v2, v3] {
+        assert_eq!(response.expect("version").version, "mock-1");
+    }
+    for response in [a1, a2, a3] {
+        assert_eq!(response.expect("accounts").ctid_trader_account.len(), 2);
+    }
+    assert_eq!(connection.stats().requests_sent, 7);
+    connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_error_is_delivered_to_the_request_it_answers() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options()).await;
+    let early = connection.request(&ProtoOaVersionReq::default()).await;
+    assert!(matches!(
+        early,
+        Err(ConnectorError::Server(error)) if error.code == ErrorCode::ChClientNotAuthenticated
+    ));
+    let refused = connection.request(&application_auth("wrong")).await;
+    assert!(matches!(
+        refused,
+        Err(ConnectorError::Server(error)) if error.code == ErrorCode::ChClientAuthFailure
+    ));
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application authorisation");
+    let unsupported = connection.request_message(9999, Vec::new()).await;
+    assert!(matches!(
+        unsupported,
+        Err(ConnectorError::Server(error)) if error.code == ErrorCode::UnsupportedMessage
+    ));
+    let mismatched = connection
+        .request_message(VERSION_REQ, Vec::new())
+        .await
+        .expect("version envelope");
+    assert_eq!(mismatched.payload_type, VERSION_RES);
+}
+
+#[tokio::test]
+async fn heartbeats_are_sent_while_the_connection_is_idle() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(
+        &server,
+        options().heartbeat_interval(Duration::from_millis(40)),
+    )
+    .await;
+    eventually("three heartbeats", || server.count(HEARTBEAT) >= 3).await;
+    assert!(connection.stats().heartbeats_sent >= 3);
+    server.push(envelope(HEARTBEAT, &ProtoHeartbeatEvent::default(), None));
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("request after idling");
+    eventually("server heartbeat counted", || {
+        connection.stats().heartbeats_received == 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn unanswered_request_times_out() {
+    let server = MockServer::start(MockOptions {
+        silent: vec![VERSION_REQ],
+        ..MockOptions::default()
+    })
+    .await;
+    let connection = open(&server, options().timeout(Duration::from_millis(80))).await;
+    let outcome = connection.request(&ProtoOaVersionReq::default()).await;
+    assert_eq!(
+        outcome.err(),
+        Some(ConnectorError::Timeout(Duration::from_millis(80)))
+    );
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("later request");
+}
+
+#[tokio::test]
+async fn pushed_messages_reach_every_subscriber() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options()).await;
+    let mut first = connection.events();
+    let mut second = connection.clone().events();
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application authorisation");
+    server.push_spot(101, 1, 123_456);
+    for events in [&mut first, &mut second] {
+        let spot = next_event(events)
+            .await
+            .decode::<ProtoOaSpotEvent>()
+            .expect("spot event");
+        assert_eq!(spot.symbol_id, 1);
+        assert_eq!(spot.bid, Some(123_456));
+    }
+}
+
+#[tokio::test]
+async fn shutdown_fails_pending_and_later_requests() {
+    let server = MockServer::start(MockOptions {
+        silent: vec![VERSION_REQ],
+        ..MockOptions::default()
+    })
+    .await;
+    let connection = open(&server, options()).await;
+    let pending = {
+        let connection = connection.clone();
+        tokio::spawn(async move { connection.request(&ProtoOaVersionReq::default()).await })
+    };
+    eventually("request reached the server", || {
+        server.count(VERSION_REQ) == 1
+    })
+    .await;
+    connection.shutdown().await;
+    assert_eq!(
+        pending.await.expect("task").err(),
+        Some(ConnectorError::Closed)
+    );
+    let later = connection.request(&ProtoOaVersionReq::default()).await;
+    assert_eq!(later.err(), Some(ConnectorError::Closed));
+    connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropping_every_handle_closes_the_socket() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options()).await;
+    let stream = Plain.connect(HOST, server.port()).await.expect("probe");
+    drop(connection);
+    drop(stream);
+    eventually("server saw both connections", || server.connections() == 2).await;
+    eventually("server saw the sockets close", || {
+        server.open_connections() == 0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn oversized_request_fails_alone() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options()).await;
+    let huge = connection
+        .request_message(VERSION_REQ, vec![0; 16 * 1024 * 1024 + 1])
+        .await;
+    assert!(matches!(
+        huge,
+        Err(ConnectorError::Transport(
+            TransportError::FrameTooLong { .. }
+        ))
+    ));
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("connection still usable");
+}
+
+#[tokio::test]
+async fn opening_fails_when_nothing_listens() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let port = server.port();
+    drop(server);
+    tokio::task::yield_now().await;
+    let outcome = Connection::open(Plain, HOST, port, options()).await;
+    assert!(matches!(
+        outcome,
+        Err(ConnectorError::Transport(TransportError::Io { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn lost_connection_fails_pending_requests_and_is_reported() {
+    let server = MockServer::start(MockOptions {
+        silent: vec![VERSION_REQ],
+        ..MockOptions::default()
+    })
+    .await;
+    let connection = open(&server, options()).await;
+    let mut events = connection.events();
+    let pending = {
+        let connection = connection.clone();
+        tokio::spawn(async move { connection.request(&ProtoOaVersionReq::default()).await })
+    };
+    eventually("request reached the server", || {
+        server.count(VERSION_REQ) == 1
+    })
+    .await;
+    server.drop_connections();
+    assert_eq!(
+        pending.await.expect("task").err(),
+        Some(ConnectorError::Transport(TransportError::Closed))
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
     );
 }

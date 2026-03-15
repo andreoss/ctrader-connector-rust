@@ -86,6 +86,7 @@ struct State {
     options: MockOptions,
     received: Vec<Received>,
     connections: usize,
+    open: usize,
     generation: u32,
     held: Vec<ProtoMessage>,
     recent: VecDeque<Instant>,
@@ -143,6 +144,7 @@ impl MockServer {
             options,
             received: Vec::new(),
             connections: 0,
+            open: 0,
             generation: 0,
             held: Vec::new(),
             recent: VecDeque::new(),
@@ -187,6 +189,10 @@ impl MockServer {
 
     pub fn connections(&self) -> usize {
         lock(&self.state).connections
+    }
+
+    pub fn open_connections(&self) -> usize {
+        lock(&self.state).open
     }
 
     pub fn limited(&self) -> usize {
@@ -243,6 +249,7 @@ async fn accept(
                 continue;
             }
             state.connections += 1;
+            state.open += 1;
             state.connections
         };
         tokio::spawn(serve(
@@ -269,7 +276,7 @@ async fn serve(
                 let replies = lock(&state).handle(number, &mut authorised, message);
                 for reply in replies {
                     if framed.send(&reply).await.is_err() {
-                        return;
+                        break;
                     }
                 }
             }
@@ -283,6 +290,7 @@ async fn serve(
             },
         }
     }
+    lock(&state).open -= 1;
 }
 
 impl State {
@@ -354,15 +362,8 @@ impl State {
                 "application is not authorised",
                 id,
             ),
-            VERSION_REQ => {
-                let reply = envelope(
-                    VERSION_RES,
-                    &ProtoOaVersionRes {
-                        payload_type: None,
-                        version: "mock-1".to_owned(),
-                    },
-                    id,
-                );
+            other => {
+                let reply = self.session_reply(other, &payload, id);
                 if self.options.reverse_batch > 0 {
                     self.held.push(reply);
                     if self.held.len() < self.options.reverse_batch {
@@ -374,11 +375,11 @@ impl State {
                 }
                 reply
             }
-            other => self.session_reply(other, &payload, id),
         };
         vec![reply]
     }
 
+    #[allow(clippy::too_many_lines)]
     fn session_reply(
         &mut self,
         payload_type: u32,
@@ -386,6 +387,14 @@ impl State {
         id: Option<String>,
     ) -> ProtoMessage {
         match payload_type {
+            VERSION_REQ => envelope(
+                VERSION_RES,
+                &ProtoOaVersionRes {
+                    payload_type: None,
+                    version: "mock-1".to_owned(),
+                },
+                id,
+            ),
             ACCOUNT_LIST_REQ => match ProtoOaGetAccountListByAccessTokenReq::decode(payload) {
                 Ok(request) if request.access_token == self.token() => envelope(
                     ACCOUNT_LIST_RES,
