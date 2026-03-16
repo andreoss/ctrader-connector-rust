@@ -9,6 +9,8 @@ pub mod messages;
 pub mod client;
 pub mod connection;
 pub mod payload;
+pub mod quotes;
+mod stream;
 pub mod symbols;
 pub mod token;
 pub mod transport;

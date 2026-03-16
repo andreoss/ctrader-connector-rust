@@ -497,6 +497,12 @@ impl Connection {
         self.events.subscribe()
     }
 
+    /// Waits until the connection task has ended, after which every request fails with
+    /// [`ConnectorError::Closed`].
+    pub async fn closed(&self) {
+        self.commands.closed().await;
+    }
+
     /// Returns the counters of the connection.
     #[must_use]
     pub fn stats(&self) -> Stats {

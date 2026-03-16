@@ -15,6 +15,7 @@ use ctrader_connector::common::config::{
 };
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
 use ctrader_connector::common::ids::SymbolId;
+use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
@@ -571,5 +572,80 @@ async fn live_accounts_assets_symbols_and_details_parse_into_typed_values() {
     assert_eq!(euro.pip_position, 4);
     assert!(euro.min_volume <= euro.max_volume);
     assert!(euro.min_volume.is_some() && euro.step_volume.is_some());
+    client.shutdown().await;
+}
+
+const QUOTING_CANDIDATES: [&str; 3] = ["BTCUSD", "ETHUSD", "EURUSD"];
+
+async fn candidates(client: &OpenApiClient, account: &Account) -> Vec<(SymbolId, String)> {
+    let list = client
+        .symbols(SymbolsParams::new(account.id))
+        .await
+        .expect("symbols");
+    let found: Vec<(SymbolId, String)> = QUOTING_CANDIDATES
+        .iter()
+        .filter_map(|name| {
+            list.symbols
+                .iter()
+                .find(|symbol| symbol.enabled && symbol.name.as_deref() == Some(*name))
+                .map(|symbol| (symbol.id, (*name).to_owned()))
+        })
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "the demo account lists none of {QUOTING_CANDIDATES:?}"
+    );
+    found
+}
+
+#[tokio::test]
+async fn live_quotes_arrive_while_subscribed_and_stop_after_unsubscribing() {
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let candidates = candidates(&client, &account).await;
+    let ids: Vec<SymbolId> = candidates.iter().map(|(id, _)| *id).collect();
+    let mut quotes = client
+        .subscribe_quotes(account.id, &ids)
+        .await
+        .expect("spot subscription");
+    let mut received = 0_usize;
+    let mut sample = None;
+    let window = tokio::time::Instant::now() + Duration::from_secs(60);
+    while received < 5 || sample.is_none() {
+        let quote = tokio::time::timeout_at(window, quotes.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("none of {QUOTING_CANDIDATES:?} quoted both sides five times in 60 s (received {received}); the markets may be closed")
+            })
+            .expect("quote");
+        received += 1;
+        if quote.bid.is_some() && quote.ask.is_some() {
+            sample = Some(quote);
+        }
+    }
+    let sample = sample.expect("a quote with both sides");
+    let name = candidates
+        .iter()
+        .find(|(id, _)| *id == sample.symbol)
+        .map_or("?", |(_, name)| name.as_str());
+    quotes.unsubscribe().await.expect("end of subscription");
+    let mut after = client.quotes(account.id, &ids);
+    let quiet = Duration::from_secs(8);
+    let late = timeout(quiet, after.next()).await.ok();
+    println!(
+        "live quotes: {received} quotes while subscribed to {ids:?}; sample {name} ({}) bid {} ask {} at {:?}; after unsubscribing {} in {quiet:?}",
+        sample.symbol,
+        sample
+            .bid
+            .map_or_else(String::new, |price| price.to_string()),
+        sample
+            .ask
+            .map_or_else(String::new, |price| price.to_string()),
+        sample.timestamp.map(Timestamp::as_millis),
+        late.as_ref().map_or("none", |_| "a quote arrived"),
+    );
+    assert!(sample.bid <= sample.ask, "bid above ask: {sample:?}");
+    assert!(sample.timestamp.is_some());
+    assert!(late.is_none(), "quote after unsubscribing: {late:?}");
     client.shutdown().await;
 }

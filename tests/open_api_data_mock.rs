@@ -6,20 +6,24 @@ use std::time::Duration;
 
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, ValueError};
 use ctrader_connector::common::ids::{AccountId, SymbolId};
+use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::ConnectionOptions;
 use ctrader_connector::open_api::messages::{
-    ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
-    ProtoOaLightSymbol, ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes,
-    ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
+    ProtoMessage, ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
+    ProtoOaLightSymbol, ProtoOaSpotEvent, ProtoOaSubscribeSpotsReq, ProtoOaSymbol,
+    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
+    ProtoOaUnsubscribeSpotsReq,
 };
+use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{SymbolsParams, TradingMode};
 use ctrader_connector::open_api::transport::Plain;
 use prost::Message as _;
 use support::{
     ACCESS_TOKEN, Answer, CLIENT_ID, CLIENT_SECRET, HOST, MockOptions, MockServer, REFRESH_TOKEN,
-    Responder, answer, refuse,
+    Responder, SPOT_EVENT, SUBSCRIBE_SPOTS_REQ, UNSUBSCRIBE_SPOTS_REQ, answer, envelope, refuse,
 };
+use tokio::time::timeout;
 
 const ASSET_LIST_REQ: u32 = 2112;
 const ASSET_LIST_RES: u32 = 2113;
@@ -243,4 +247,135 @@ async fn refused_and_malformed_reference_data_yield_typed_errors() {
         }))
     );
     client.shutdown().await;
+}
+
+fn silent(_: u32, _: &[u8]) -> Answer {
+    None
+}
+
+fn spot(
+    account: i64,
+    symbol: i64,
+    bid: Option<u64>,
+    ask: Option<u64>,
+    timestamp: Option<i64>,
+) -> ProtoMessage {
+    envelope(
+        SPOT_EVENT,
+        &ProtoOaSpotEvent {
+            ctid_trader_account_id: account,
+            symbol_id: symbol,
+            bid,
+            ask,
+            timestamp,
+            ..ProtoOaSpotEvent::default()
+        },
+        None,
+    )
+}
+
+async fn soon<T>(what: &str, future: impl Future<Output = T>) -> T {
+    timeout(Duration::from_secs(5), future)
+        .await
+        .unwrap_or_else(|_| panic!("nothing arrived in time: {what}"))
+}
+
+async fn eventually(what: &str, check: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not reached: {what}");
+}
+
+fn last_request<M: prost::Message + Default>(server: &MockServer, payload_type: u32) -> M {
+    let received = server.received();
+    let message = received
+        .iter()
+        .rfind(|message| message.payload_type == payload_type)
+        .unwrap_or_else(|| panic!("no request of type {payload_type}"));
+    M::decode(message.payload.as_slice()).expect("request")
+}
+
+#[tokio::test]
+async fn quotes_keep_the_last_known_side_and_end_with_the_subscription() {
+    let Session { server, client } = session(silent).await;
+    let mut quotes = client
+        .subscribe_quotes(account(101), &[symbol(1), symbol(2)])
+        .await
+        .expect("subscription");
+    assert_eq!(quotes.account(), account(101));
+    assert_eq!(quotes.symbols().collect::<Vec<_>>(), [symbol(1), symbol(2)]);
+    let sent: ProtoOaSubscribeSpotsReq = last_request(&server, SUBSCRIBE_SPOTS_REQ);
+    assert_eq!(sent.symbol_id, vec![1, 2]);
+    assert_eq!(sent.subscribe_to_spot_timestamp, Some(true));
+    server.push(spot(102, 1, Some(5), None, None));
+    server.push(spot(101, 3, Some(5), None, None));
+    server.push(spot(101, 1, None, None, None));
+    server.push(spot(101, 1, Some(108_512), None, Some(1_000)));
+    server.push(spot(101, 2, Some(7), Some(9), None));
+    server.push(spot(101, 1, None, Some(108_520), Some(1_001)));
+    let first = soon("first quote", quotes.next()).await.expect("quote");
+    assert_eq!(first.symbol, symbol(1));
+    assert_eq!(
+        first.bid.map(|price| price.to_string()).as_deref(),
+        Some("1.08512")
+    );
+    assert_eq!(first.ask, None);
+    assert_eq!(first.timestamp.map(Timestamp::as_millis), Some(1_000));
+    let second = soon("second quote", quotes.next()).await.expect("quote");
+    assert_eq!(second.symbol, symbol(2));
+    assert_eq!(second.price(QuoteSide::Ask), "0.00009".parse().ok());
+    let third = soon("third quote", quotes.next()).await.expect("quote");
+    assert_eq!(third.bid, first.bid);
+    assert_eq!(third.price(QuoteSide::Ask), "1.08520".parse().ok());
+    assert_eq!(quotes.last(symbol(1)), Some(&third));
+    assert_eq!(quotes.last(symbol(3)), None);
+    quotes.unsubscribe().await.expect("end of subscription");
+    let ended: ProtoOaUnsubscribeSpotsReq = last_request(&server, UNSUBSCRIBE_SPOTS_REQ);
+    assert_eq!(ended.symbol_id, vec![1, 2]);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn quotes_resume_after_a_reconnection_and_end_when_the_connection_closes() {
+    let Session { server, client } = session(silent).await;
+    let mut quotes = client
+        .subscribe_quotes(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    let mut listener = client.quotes(account(101), &[symbol(1)]);
+    server.drop_connections();
+    eventually("the subscription is replayed", || {
+        server.count(SUBSCRIBE_SPOTS_REQ) == 2
+    })
+    .await;
+    server.push(spot(101, 1, Some(11), None, None));
+    let quote = soon("quote after the reconnection", quotes.next())
+        .await
+        .expect("quote");
+    assert_eq!(quote.symbol, symbol(1));
+    assert_eq!(soon("same quote", listener.next()).await, Ok(quote));
+    server.push(spot(101, 1, Some(11), None, Some(-1)));
+    assert_eq!(
+        soon("malformed quote", quotes.next()).await,
+        Err(ConnectorError::Value(ValueError::OutOfRange {
+            kind: "timestamp"
+        }))
+    );
+    assert!(matches!(
+        soon("malformed quote at the listener", listener.next()).await,
+        Err(ConnectorError::Value(_))
+    ));
+    client.shutdown().await;
+    assert_eq!(
+        soon("end of the stream", quotes.next()).await,
+        Err(ConnectorError::Closed)
+    );
+    assert_eq!(
+        soon("end of the listener", listener.next()).await,
+        Err(ConnectorError::Closed)
+    );
 }

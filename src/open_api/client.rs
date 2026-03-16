@@ -311,7 +311,7 @@ impl OpenApiClient {
             payload_type: None,
             ctid_trader_account_id: account.get(),
             symbol_id: symbols.iter().map(|symbol| symbol.get()).collect(),
-            subscribe_to_spot_timestamp: None,
+            subscribe_to_spot_timestamp: Some(true),
         };
         self.connection.request(&request(symbols)).await?;
         for symbol in symbols {
