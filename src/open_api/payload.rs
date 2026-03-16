@@ -80,6 +80,14 @@ macro_rules! requests {
 
             const HISTORICAL: bool = $historical;
         })*
+
+        /// Tells whether requests of the payload type count against the limit for historical data.
+        #[must_use]
+        pub fn is_historical(payload_type: u32) -> bool {
+            [$((<$request as Payload>::PAYLOAD_TYPE, $historical)),*]
+                .iter()
+                .any(|(known, historical)| *historical && *known == payload_type)
+        }
     };
 }
 
@@ -131,7 +139,7 @@ requests! {
 
 #[cfg(test)]
 mod tests {
-    use super::{Payload, Request, declared};
+    use super::{Payload, Request, declared, is_historical};
     use crate::common::errors::{ConnectorError, TransportError};
     use crate::open_api::messages::{
         ProtoHeartbeatEvent, ProtoMessage, ProtoOaGetTrendbarsReq, ProtoOaVersionReq,
@@ -156,6 +164,9 @@ mod tests {
         }
         assert!(historical(&ProtoOaGetTrendbarsReq::default()));
         assert!(!historical(&ProtoOaVersionReq::default()));
+        assert!(is_historical(ProtoOaGetTrendbarsReq::PAYLOAD_TYPE));
+        assert!(!is_historical(ProtoOaVersionReq::PAYLOAD_TYPE));
+        assert!(!is_historical(0));
     }
 
     #[test]

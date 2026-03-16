@@ -450,3 +450,41 @@ async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
     assert_eq!(reconnects, 1);
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn live_burst_above_the_limit_completes_without_a_limit_error() {
+    const BURST: usize = 120;
+    let _guard = LIVE.lock().await;
+    let client = OpenApiClient::connect(configuration())
+        .await
+        .expect("connect to the demo host");
+    client
+        .authorise_application()
+        .await
+        .expect("application authorisation");
+    let started = std::time::Instant::now();
+    let tasks: Vec<_> = (0..BURST)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.version().await })
+        })
+        .collect();
+    let mut failures = Vec::new();
+    let mut answered = 0_usize;
+    for task in tasks {
+        match task.await.expect("task") {
+            Ok(_) => answered += 1,
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    let elapsed = started.elapsed();
+    let stats = client.connection().stats();
+    println!(
+        "live burst: {answered} of {BURST} version requests answered in {elapsed:.1?}, failures {failures:?}, requests sent {}, throttle retries {}",
+        stats.requests_sent, stats.throttle_retries
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(answered, BURST);
+    assert!(elapsed >= Duration::from_secs(2));
+    client.shutdown().await;
+}

@@ -10,6 +10,11 @@
 //! event stream is a bounded broadcast, so a subscriber that falls behind skips the oldest
 //! events instead of stalling the task.
 //!
+//! Limits: the server accepts a number of requests per second on one connection, fewer for
+//! historical data. The task holds requests back so that neither limit is exceeded, and when
+//! the server still answers that a limit was exceeded it pauses and sends the request again, up
+//! to the configured number of retries.
+//!
 //! Reconnection: when the socket is lost the task fails the requests in flight, reports
 //! [`Event::Disconnected`] and connects again, waiting twice as long before every further
 //! attempt. Once connected it sends the registered requests again in the order of their
@@ -27,12 +32,15 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 
-use crate::common::config::{ConfigurationOpenApi, DEFAULT_RECONNECT_DELAY, DEFAULT_TIMEOUT};
-use crate::common::errors::{ConnectorError, ServerError, TransportError};
+use crate::common::config::{
+    ConfigurationOpenApi, DEFAULT_BACKOFF, DEFAULT_RECONNECT_DELAY, DEFAULT_RETRIES,
+    DEFAULT_TIMEOUT,
+};
+use crate::common::errors::{ConnectorError, ErrorCode, ServerError, TransportError};
 use crate::open_api::messages::{
     ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaErrorRes,
 };
-use crate::open_api::payload::{Payload, Request};
+use crate::open_api::payload::{Payload, Request, is_historical};
 use crate::open_api::transport::{Connect, Framed};
 
 /// Pause after the last write before a heartbeat is sent.
@@ -43,6 +51,17 @@ pub const DEFAULT_COMMAND_CAPACITY: usize = 64;
 
 /// Number of events kept for a subscriber that falls behind.
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
+
+/// Requests the server accepts per second on one connection, historical data excluded.
+pub const REQUEST_LIMIT: u32 = 50;
+
+/// Requests for historical data the server accepts per second on one connection.
+pub const HISTORICAL_LIMIT: u32 = 5;
+
+/// Longest pause after the server answered that a limit was exceeded.
+pub const BACKOFF_LIMIT: Duration = Duration::from_secs(30);
+
+const LIMIT_WINDOW: Duration = Duration::from_millis(1100);
 
 /// Longest pause between two reconnection attempts.
 pub const RECONNECT_DELAY_LIMIT: Duration = Duration::from_secs(60);
@@ -66,6 +85,10 @@ pub struct ConnectionOptions {
     event_capacity: usize,
     reconnect_delay: Duration,
     reconnect_attempts: Option<u32>,
+    request_limit: u32,
+    historical_limit: u32,
+    retries: u32,
+    backoff: Duration,
 }
 
 impl Default for ConnectionOptions {
@@ -77,6 +100,10 @@ impl Default for ConnectionOptions {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             reconnect_delay: DEFAULT_RECONNECT_DELAY,
             reconnect_attempts: None,
+            request_limit: REQUEST_LIMIT,
+            historical_limit: HISTORICAL_LIMIT,
+            retries: DEFAULT_RETRIES,
+            backoff: DEFAULT_BACKOFF,
         }
     }
 }
@@ -86,6 +113,8 @@ impl From<&ConfigurationOpenApi> for ConnectionOptions {
         Self::default()
             .timeout(configuration.timeout())
             .reconnect_delay(configuration.reconnect_delay())
+            .retries(configuration.retries())
+            .backoff(configuration.backoff())
     }
 }
 
@@ -137,6 +166,34 @@ impl ConnectionOptions {
     /// `None` keeps trying, which is the default; `Some(0)` turns reconnection off.
     pub const fn reconnect_attempts(mut self, attempts: Option<u32>) -> Self {
         self.reconnect_attempts = attempts;
+        self
+    }
+
+    /// Sets the number of requests sent per second, historical data excluded; at least one.
+    pub fn request_limit(mut self, limit: u32) -> Self {
+        self.request_limit = limit.max(1);
+        self
+    }
+
+    /// Sets the number of requests for historical data sent per second; at least one.
+    pub fn historical_limit(mut self, limit: u32) -> Self {
+        self.historical_limit = limit.max(1);
+        self
+    }
+
+    /// Sets how often a request is sent again after the server answered that a limit was
+    /// exceeded; zero hands the error to the caller at once.
+    pub const fn retries(mut self, retries: u32) -> Self {
+        self.retries = retries;
+        self
+    }
+
+    /// Sets the pause after the server answered that a limit was exceeded; it doubles with
+    /// every retry of the same request up to [`BACKOFF_LIMIT`].
+    ///
+    /// A duration below one millisecond is raised to one millisecond.
+    pub fn backoff(mut self, backoff: Duration) -> Self {
+        self.backoff = backoff.max(SHORTEST_INTERVAL);
         self
     }
 }
@@ -193,6 +250,8 @@ pub struct Stats {
     pub heartbeats_received: u64,
     /// Times the connection was established again after a loss.
     pub reconnects: u64,
+    /// Requests sent again after the server answered that a limit was exceeded.
+    pub throttle_retries: u64,
 }
 
 #[derive(Debug, Default)]
@@ -201,6 +260,7 @@ struct Counters {
     heartbeats_sent: AtomicU64,
     heartbeats_received: AtomicU64,
     reconnects: AtomicU64,
+    throttle_retries: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -264,6 +324,8 @@ type Reply = oneshot::Sender<Result<ProtoMessage, ConnectorError>>;
 struct Outbound {
     payload_type: u32,
     payload: Vec<u8>,
+    historical: bool,
+    attempts: u32,
     reply: Reply,
 }
 
@@ -317,6 +379,9 @@ impl Connection {
             pending: HashMap::new(),
             deadlines: VecDeque::new(),
             replays: Replays::new(),
+            throttles: [Throttle::default(), Throttle::default()],
+            paused_until: None,
+            send_at: None,
             next_id: 0,
         };
         let task = tokio::spawn(actor.run(Framed::new(stream)));
@@ -339,7 +404,7 @@ impl Connection {
     /// [`ConnectorError::Closed`] when the connection is shut down.
     pub async fn request<R: Request>(&self, request: &R) -> Result<R::Response, ConnectorError> {
         let message = self
-            .request_message(R::PAYLOAD_TYPE, request.encode_to_vec())
+            .send(R::PAYLOAD_TYPE, request.encode_to_vec(), R::HISTORICAL)
             .await?;
         R::Response::from_message(&message)
     }
@@ -354,11 +419,23 @@ impl Connection {
         payload_type: u32,
         payload: Vec<u8>,
     ) -> Result<ProtoMessage, ConnectorError> {
+        self.send(payload_type, payload, is_historical(payload_type))
+            .await
+    }
+
+    async fn send(
+        &self,
+        payload_type: u32,
+        payload: Vec<u8>,
+        historical: bool,
+    ) -> Result<ProtoMessage, ConnectorError> {
         let (reply, response) = oneshot::channel();
         let outbound = Outbound {
             payload_type,
             payload,
             reply,
+            historical,
+            attempts: 0,
         };
         self.commands
             .send(Command::Request(outbound))
@@ -428,6 +505,7 @@ impl Connection {
             heartbeats_sent: self.counters.heartbeats_sent.load(Ordering::Relaxed),
             heartbeats_received: self.counters.heartbeats_received.load(Ordering::Relaxed),
             reconnects: self.counters.reconnects.load(Ordering::Relaxed),
+            throttle_retries: self.counters.throttle_retries.load(Ordering::Relaxed),
         }
     }
 
@@ -463,9 +541,12 @@ struct Actor<C: Connect> {
     events: broadcast::Sender<Event>,
     counters: Arc<Counters>,
     queue: VecDeque<Outbound>,
-    pending: HashMap<String, Reply>,
+    pending: HashMap<String, Outbound>,
     deadlines: VecDeque<(Instant, String)>,
     replays: Replays,
+    throttles: [Throttle; 2],
+    paused_until: Option<Instant>,
+    send_at: Option<Instant>,
     next_id: u64,
     heartbeat_at: Instant,
 }
@@ -515,11 +596,14 @@ impl<C: Connect> Actor<C> {
                 .iter()
                 .map(|(key, stored)| (key.clone(), stored.clone()))
                 .collect();
+            let replays_sent = replays.len();
+            let spacing = LIMIT_WINDOW / self.options.request_limit;
             let work = restore(
                 &self.connector,
                 &self.host,
                 self.port,
                 self.options.timeout,
+                spacing,
                 replays,
                 &self.events,
             );
@@ -527,6 +611,13 @@ impl<C: Connect> Actor<C> {
                 Ok(framed) => {
                     log_debug!(attempt, "reconnected");
                     bump(&self.counters.reconnects);
+                    let seeded = replays_sent
+                        .min(usize::try_from(self.options.request_limit).unwrap_or(usize::MAX));
+                    if let Some(throttle) = self.throttles.first_mut() {
+                        throttle
+                            .sent
+                            .extend(std::iter::repeat_n(Instant::now(), seeded));
+                    }
                     self.heartbeat_at = Instant::now() + self.options.heartbeat_interval;
                     let _ = self.events.send(Event::Reconnected { attempt });
                     return Ok(framed);
@@ -549,12 +640,13 @@ impl<C: Connect> Actor<C> {
                 return Exit::Lost(reason);
             }
             let wake = self.next_wake();
+            let capacity = self.options.command_capacity;
             tokio::select! {
                 incoming = framed.receive() => match incoming {
                     Ok(message) => self.dispatch(message),
                     Err(reason) => return Exit::Lost(reason),
                 },
-                command = self.commands.recv() => match command {
+                command = self.commands.recv(), if self.queue.len() < capacity => match command {
                     Some(Command::Request(outbound)) => self.queue.push_back(outbound),
                     Some(Command::Replay(key, stored)) => store(&mut self.replays, key, stored),
                     Some(Command::Reconnect) => return Exit::Lost(TransportError::Closed),
@@ -570,15 +662,54 @@ impl<C: Connect> Actor<C> {
     }
 
     fn next_wake(&self) -> Instant {
-        self.deadlines
-            .front()
-            .map_or(self.heartbeat_at, |(deadline, _)| {
-                self.heartbeat_at.min(*deadline)
-            })
+        let mut wake = self.heartbeat_at;
+        if let Some((deadline, _)) = self.deadlines.front() {
+            wake = wake.min(*deadline);
+        }
+        if let Some(send_at) = self.send_at {
+            wake = wake.min(send_at);
+        }
+        wake
+    }
+
+    fn next_ready(&mut self, now: Instant) -> Option<usize> {
+        self.send_at = None;
+        if let Some(until) = self.paused_until {
+            if until > now {
+                if !self.queue.is_empty() {
+                    self.send_at = Some(until);
+                }
+                return None;
+            }
+            self.paused_until = None;
+        }
+        let limits = [self.options.request_limit, self.options.historical_limit];
+        let mut ready = [None, None];
+        for ((throttle, limit), ready) in self.throttles.iter_mut().zip(limits).zip(&mut ready) {
+            *ready = throttle.ready_at(now, limit);
+        }
+        for (index, outbound) in self.queue.iter().enumerate() {
+            match ready
+                .get(usize::from(outbound.historical))
+                .copied()
+                .flatten()
+            {
+                None => return Some(index),
+                Some(at) => self.send_at = Some(self.send_at.map_or(at, |known| known.min(at))),
+            }
+        }
+        None
     }
 
     async fn flush(&mut self, framed: &mut Framed<C::Stream>) -> Result<(), TransportError> {
-        while let Some(outbound) = self.queue.pop_front() {
+        loop {
+            let now = Instant::now();
+            let Some(outbound) = self
+                .next_ready(now)
+                .and_then(|index| self.queue.remove(index))
+            else {
+                return Ok(());
+            };
             if outbound.reply.is_closed() {
                 continue;
             }
@@ -586,17 +717,20 @@ impl<C: Connect> Actor<C> {
             let id = self.next_id.to_string();
             let message = ProtoMessage {
                 payload_type: outbound.payload_type,
-                payload: Some(outbound.payload),
+                payload: Some(outbound.payload.clone()),
                 client_msg_id: Some(id.clone()),
             };
             match framed.send(&message).await {
                 Ok(()) => {
-                    let now = Instant::now();
                     bump(&self.counters.requests_sent);
+                    if let Some(throttle) = self.throttles.get_mut(usize::from(outbound.historical))
+                    {
+                        throttle.sent.push_back(now);
+                    }
                     self.heartbeat_at = now + self.options.heartbeat_interval;
                     self.deadlines
                         .push_back((now + self.options.timeout, id.clone()));
-                    self.pending.insert(id, outbound.reply);
+                    self.pending.insert(id, outbound);
                 }
                 Err(error @ TransportError::FrameTooLong { .. }) => {
                     let _ = outbound.reply.send(Err(error.into()));
@@ -607,7 +741,6 @@ impl<C: Connect> Actor<C> {
                 }
             }
         }
-        Ok(())
     }
 
     async fn tick(&mut self, framed: &mut Framed<C::Stream>) -> Result<(), TransportError> {
@@ -617,8 +750,10 @@ impl<C: Connect> Actor<C> {
                 self.deadlines.push_front((deadline, id));
                 break;
             }
-            if let Some(reply) = self.pending.remove(&id) {
-                let _ = reply.send(Err(ConnectorError::Timeout(self.options.timeout)));
+            if let Some(outbound) = self.pending.remove(&id) {
+                let _ = outbound
+                    .reply
+                    .send(Err(ConnectorError::Timeout(self.options.timeout)));
             }
         }
         if now >= self.heartbeat_at {
@@ -636,27 +771,48 @@ impl<C: Connect> Actor<C> {
             bump(&self.counters.heartbeats_received);
             return;
         }
-        let reply = message
+        let waiting = message
             .client_msg_id
             .as_ref()
             .and_then(|id| self.pending.remove(id));
-        match reply {
-            Some(reply) => {
-                let _ = reply.send(outcome(message));
-            }
-            None => {
-                let _ = self.events.send(Event::Message(message));
-            }
+        let Some(mut outbound) = waiting else {
+            let _ = self.events.send(Event::Message(message));
+            return;
+        };
+        let result = outcome(message);
+        if over_limit(&result) && outbound.attempts < self.options.retries {
+            let pause = self
+                .options
+                .backoff
+                .saturating_mul(1 << outbound.attempts.min(16))
+                .min(BACKOFF_LIMIT.max(self.options.backoff));
+            let until = Instant::now() + pause;
+            log_debug!(
+                payload_type = outbound.payload_type,
+                ?pause,
+                "limit exceeded"
+            );
+            self.paused_until = Some(self.paused_until.map_or(until, |known| known.max(until)));
+            outbound.attempts += 1;
+            bump(&self.counters.throttle_retries);
+            self.queue.push_front(outbound);
+        } else {
+            let _ = outbound.reply.send(result);
         }
     }
 
     fn fail_in_flight(&mut self, error: &ConnectorError) {
         self.deadlines.clear();
-        for (_, reply) in self.pending.drain() {
-            let _ = reply.send(Err(error.clone()));
+        for (_, outbound) in self.pending.drain() {
+            let _ = outbound.reply.send(Err(error.clone()));
         }
         for outbound in self.queue.drain(..) {
             let _ = outbound.reply.send(Err(error.clone()));
+        }
+        self.paused_until = None;
+        self.send_at = None;
+        for throttle in &mut self.throttles {
+            throttle.sent.clear();
         }
     }
 
@@ -669,6 +825,37 @@ impl<C: Connect> Actor<C> {
             }
         }
     }
+}
+
+#[derive(Default)]
+struct Throttle {
+    sent: VecDeque<Instant>,
+}
+
+impl Throttle {
+    fn ready_at(&mut self, now: Instant, limit: u32) -> Option<Instant> {
+        while self
+            .sent
+            .front()
+            .is_some_and(|sent| now.duration_since(*sent) >= LIMIT_WINDOW)
+        {
+            self.sent.pop_front();
+        }
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let excess = (self.sent.len() + 1).checked_sub(limit)?;
+        let blocking = excess.checked_sub(1)?;
+        self.sent.get(blocking).map(|sent| *sent + LIMIT_WINDOW)
+    }
+}
+
+fn over_limit(result: &Result<ProtoMessage, ConnectorError>) -> bool {
+    matches!(
+        result,
+        Err(ConnectorError::Server(error)) if matches!(
+            error.code,
+            ErrorCode::RequestFrequencyExceeded | ErrorCode::BlockedPayloadType
+        )
+    )
 }
 
 fn store(replays: &mut Replays, key: ReplayKey, stored: Option<Stored>) {
@@ -709,6 +896,7 @@ async fn restore<C: Connect>(
     host: &str,
     port: u16,
     limit: Duration,
+    spacing: Duration,
     replays: Vec<(ReplayKey, Stored)>,
     events: &broadcast::Sender<Event>,
 ) -> Result<Framed<C::Stream>, TransportError> {
@@ -729,6 +917,7 @@ async fn restore<C: Connect>(
             log_debug!(%error, "replayed request failed");
             let _ = events.send(Event::ReplayFailed { key, error });
         }
+        sleep(spacing).await;
     }
     Ok(framed)
 }
@@ -765,22 +954,28 @@ fn outcome(message: ProtoMessage) -> Result<ProtoMessage, ConnectorError> {
 mod tests {
     use std::time::Duration;
 
-    use super::{ConnectionOptions, Event, ReplayKey, ReplayStage, outcome};
+    use super::{
+        ConnectionOptions, Event, LIMIT_WINDOW, ReplayKey, ReplayStage, Throttle, outcome,
+        over_limit,
+    };
     use crate::common::config::ConfigurationOpenApi;
     use crate::common::errors::{ConnectorError, ErrorCode, TransportError};
     use crate::open_api::messages::{
         ProtoErrorRes, ProtoMessage, ProtoOaErrorRes, ProtoOaSpotEvent, ProtoOaVersionRes,
     };
     use crate::open_api::payload::Payload;
+    use tokio::time::Instant;
 
     #[test]
-    fn options_take_timeout_and_reconnect_delay_of_the_configuration() {
+    fn options_take_timing_and_retries_of_the_configuration() {
         let configuration = ConfigurationOpenApi::builder()
             .client_id("id")
             .client_secret("secret")
             .access_token("token")
             .timeout(Duration::from_secs(3))
             .reconnect_delay(Duration::from_secs(2))
+            .retries(7)
+            .backoff(Duration::from_millis(250))
             .build()
             .expect("configuration");
         let options = ConnectionOptions::from(&configuration);
@@ -789,6 +984,8 @@ mod tests {
             ConnectionOptions::new()
                 .timeout(Duration::from_secs(3))
                 .reconnect_delay(Duration::from_secs(2))
+                .retries(7)
+                .backoff(Duration::from_millis(250))
         );
     }
 
@@ -800,13 +997,21 @@ mod tests {
             .command_capacity(0)
             .event_capacity(0)
             .reconnect_delay(Duration::ZERO)
-            .reconnect_attempts(Some(4));
+            .reconnect_attempts(Some(4))
+            .request_limit(0)
+            .historical_limit(0)
+            .retries(0)
+            .backoff(Duration::ZERO);
         assert_eq!(options.timeout, Duration::from_millis(1));
         assert_eq!(options.heartbeat_interval, Duration::from_millis(1));
         assert_eq!(options.command_capacity, 1);
         assert_eq!(options.event_capacity, 1);
         assert_eq!(options.reconnect_delay, Duration::from_millis(1));
         assert_eq!(options.reconnect_attempts, Some(4));
+        assert_eq!(options.request_limit, 1);
+        assert_eq!(options.historical_limit, 1);
+        assert_eq!(options.retries, 0);
+        assert_eq!(options.backoff, Duration::from_millis(1));
         assert_eq!(ConnectionOptions::new().reconnect_attempts, None);
     }
 
@@ -879,5 +1084,44 @@ mod tests {
                 (ReplayStage::Subscription, "a"),
             ]
         );
+    }
+
+    #[test]
+    fn throttle_names_the_moment_the_next_request_may_go() {
+        let start = Instant::now();
+        let mut throttle = Throttle::default();
+        assert_eq!(throttle.ready_at(start, 2), None);
+        throttle.sent.push_back(start);
+        assert_eq!(throttle.ready_at(start, 2), None);
+        throttle.sent.push_back(start + Duration::from_millis(10));
+        assert_eq!(throttle.ready_at(start, 2), Some(start + LIMIT_WINDOW));
+        throttle.sent.push_back(start + Duration::from_millis(20));
+        assert_eq!(
+            throttle.ready_at(start, 2),
+            Some(start + Duration::from_millis(10) + LIMIT_WINDOW)
+        );
+        let later = start + LIMIT_WINDOW + Duration::from_millis(10);
+        assert_eq!(throttle.ready_at(later, 2), None);
+        assert_eq!(throttle.sent.len(), 1);
+    }
+
+    #[test]
+    fn only_limit_errors_are_retried() {
+        let refusal = |code: &str| {
+            outcome(
+                ProtoOaErrorRes {
+                    error_code: code.to_owned(),
+                    ..ProtoOaErrorRes::default()
+                }
+                .to_message(None),
+            )
+        };
+        assert!(over_limit(&refusal("REQUEST_FREQUENCY_EXCEEDED")));
+        assert!(over_limit(&refusal("BLOCKED_PAYLOAD_TYPE")));
+        assert!(!over_limit(&refusal("INVALID_REQUEST")));
+        assert!(!over_limit(&Ok(
+            ProtoOaVersionRes::default().to_message(None)
+        )));
+        assert!(!over_limit(&Err(ConnectorError::Closed)));
     }
 }

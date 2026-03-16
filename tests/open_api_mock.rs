@@ -13,9 +13,10 @@ use ctrader_connector::open_api::connection::{
 };
 use ctrader_connector::open_api::messages::{
     ProtoHeartbeatEvent, ProtoOaAccountAuthReq, ProtoOaApplicationAuthReq,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaSubscribeSpotsReq,
-    ProtoOaVersionReq,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTrendbarsReq, ProtoOaSpotEvent,
+    ProtoOaSubscribeSpotsReq, ProtoOaVersionReq,
 };
+use ctrader_connector::open_api::payload::Payload as _;
 use ctrader_connector::open_api::token::TokenPair;
 use ctrader_connector::open_api::transport::{Connect, Framed, Plain, Tls};
 use prost::Message as _;
@@ -937,4 +938,153 @@ async fn accounts_are_authorised_with_the_refreshed_token_after_a_reconnection()
         .collect();
     assert_eq!(tokens, vec![server.access_token()]);
     client.shutdown().await;
+}
+
+async fn burst(connection: &Connection, count: usize) -> Vec<Result<String, ConnectorError>> {
+    let tasks: Vec<_> = (0..count)
+        .map(|_| {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .request(&ProtoOaVersionReq::default())
+                    .await
+                    .map(|response| response.version)
+            })
+        })
+        .collect();
+    let mut outcomes = Vec::with_capacity(count);
+    for task in tasks {
+        outcomes.push(task.await.expect("task"));
+    }
+    outcomes
+}
+
+#[tokio::test]
+async fn burst_above_the_limit_is_held_back_and_completes() {
+    let server = MockServer::start(MockOptions {
+        limit_per_second: Some(5),
+        ..MockOptions::default()
+    })
+    .await;
+    let connection = open(&server, options().request_limit(5).command_capacity(4)).await;
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application");
+    let started = std::time::Instant::now();
+    let outcomes = burst(&connection, 11).await;
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.as_deref() == Ok("mock-1"))
+    );
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(server.limited(), 0);
+    assert_eq!(server.count(VERSION_REQ), 11);
+    assert_eq!(connection.stats().throttle_retries, 0);
+    connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn limit_error_is_retried_after_a_pause() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(
+        &server,
+        options()
+            .request_limit(100)
+            .retries(4)
+            .backoff(Duration::from_millis(600)),
+    )
+    .await;
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application");
+    server.set_limit(Some(3));
+    let outcomes = burst(&connection, 6).await;
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.as_deref() == Ok("mock-1"))
+    );
+    assert!(server.limited() >= 3);
+    let stats = connection.stats();
+    assert!(stats.throttle_retries >= 3, "{stats:?}");
+    assert_eq!(stats.requests_sent, 7 + stats.throttle_retries);
+    connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn limit_error_reaches_the_caller_when_retries_are_used_up() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let limited = |outcome: Result<String, ConnectorError>| match outcome {
+        Err(ConnectorError::Server(error)) => Some(error.code),
+        _ => None,
+    };
+    let none = open(&server, options().request_limit(100).retries(0)).await;
+    let once = open(
+        &server,
+        options()
+            .request_limit(100)
+            .retries(1)
+            .backoff(Duration::from_millis(20)),
+    )
+    .await;
+    for connection in [&none, &once] {
+        connection
+            .request(&application_auth(CLIENT_SECRET))
+            .await
+            .expect("application");
+    }
+    server.set_limit(Some(1));
+    let mut outcomes = burst(&none, 2).await;
+    outcomes.sort_by_key(Result::is_err);
+    assert_eq!(
+        outcomes.first().and_then(|first| first.as_deref().ok()),
+        Some("mock-1")
+    );
+    assert_eq!(
+        outcomes.pop().and_then(limited),
+        Some(ErrorCode::RequestFrequencyExceeded)
+    );
+    assert_eq!(none.stats().throttle_retries, 0);
+    assert_eq!(
+        burst(&once, 1).await.pop().and_then(limited),
+        Some(ErrorCode::RequestFrequencyExceeded)
+    );
+    assert_eq!(once.stats().throttle_retries, 1);
+    assert_eq!(once.stats().requests_sent, 3);
+    none.shutdown().await;
+    once.shutdown().await;
+}
+
+#[tokio::test]
+async fn historical_requests_wait_for_their_own_limit_only() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options().historical_limit(2)).await;
+    let started = std::time::Instant::now();
+    let historical: Vec<_> = (0..3)
+        .map(|_| {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                let _ = connection
+                    .request_message(ProtoOaGetTrendbarsReq::PAYLOAD_TYPE, Vec::new())
+                    .await;
+            })
+        })
+        .collect();
+    eventually("two historical requests sent", || {
+        server.count(ProtoOaGetTrendbarsReq::PAYLOAD_TYPE) == 2
+    })
+    .await;
+    let _ = connection.request(&ProtoOaVersionReq::default()).await;
+    assert_eq!(server.count(VERSION_REQ), 1);
+    assert_eq!(server.count(ProtoOaGetTrendbarsReq::PAYLOAD_TYPE), 2);
+    assert!(started.elapsed() < Duration::from_millis(900));
+    for task in historical {
+        task.await.expect("task");
+    }
+    assert_eq!(server.count(ProtoOaGetTrendbarsReq::PAYLOAD_TYPE), 3);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    connection.shutdown().await;
 }
