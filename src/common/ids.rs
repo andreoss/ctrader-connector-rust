@@ -98,11 +98,22 @@ id!(
     "deal id"
 );
 
+id!(
+    /// Identifier of an asset, such as a currency.
+    AssetId,
+    "asset id"
+);
+id!(
+    /// Identifier of a category of symbols.
+    SymbolCategoryId,
+    "symbol category id"
+);
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{AccountId, DealId, OrderId, PositionId, SymbolId};
+    use super::{AccountId, AssetId, DealId, OrderId, PositionId, SymbolCategoryId, SymbolId};
     use crate::common::errors::ValueError;
 
     macro_rules! id_tests {
@@ -174,5 +185,7 @@ mod tests {
         order: OrderId, "order id";
         position: PositionId, "position id";
         deal: DealId, "deal id";
+        asset: AssetId, "asset id";
+        symbol_category: SymbolCategoryId, "symbol category id";
     }
 }

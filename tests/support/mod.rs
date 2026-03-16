@@ -55,6 +55,7 @@ pub struct MockOptions {
     pub limit_per_second: Option<usize>,
     pub reverse_batch: usize,
     pub silent: Vec<u32>,
+    pub responder: Option<Responder>,
 }
 
 impl Default for MockOptions {
@@ -64,8 +65,41 @@ impl Default for MockOptions {
             limit_per_second: None,
             reverse_batch: 0,
             silent: Vec::new(),
+            responder: None,
         }
     }
+}
+
+/// Answer a test gives to a request: the payload type and the encoded body.
+pub type Answer = Option<(u32, Vec<u8>)>;
+
+type Respond = dyn Fn(u32, &[u8]) -> Answer + Send + Sync;
+
+/// Function a test installs to answer requests the server has no canned reply for.
+#[derive(Clone)]
+pub struct Responder(Arc<Respond>);
+
+impl Responder {
+    pub fn new(answer: impl Fn(u32, &[u8]) -> Answer + Send + Sync + 'static) -> Self {
+        Self(Arc::new(answer))
+    }
+}
+
+impl std::fmt::Debug for Responder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Responder")
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+pub fn answer<M: Message>(payload_type: u32, body: &M) -> Answer {
+    Some((payload_type, body.encode_to_vec()))
+}
+
+pub fn refuse(code: &str, description: &str) -> Answer {
+    refusal(code, description, None)
+        .payload
+        .map(|payload| (OA_ERROR, payload))
 }
 
 /// One message the server received.
@@ -387,6 +421,18 @@ impl State {
         payload: &[u8],
         id: Option<String>,
     ) -> ProtoMessage {
+        let scripted = self
+            .options
+            .responder
+            .as_ref()
+            .and_then(|responder| (responder.0)(payload_type, payload));
+        if let Some((payload_type, payload)) = scripted {
+            return ProtoMessage {
+                payload_type,
+                payload: Some(payload),
+                client_msg_id: id,
+            };
+        }
         match payload_type {
             VERSION_REQ => envelope(
                 VERSION_RES,

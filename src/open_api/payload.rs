@@ -6,13 +6,15 @@ use crate::common::errors::{ConnectorError, TransportError};
 use crate::open_api::messages::{
     ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaAccountAuthReq, ProtoOaAccountAuthRes,
     ProtoOaAccountDisconnectEvent, ProtoOaAccountsTokenInvalidatedEvent, ProtoOaApplicationAuthReq,
-    ProtoOaApplicationAuthRes, ProtoOaCashFlowHistoryListReq, ProtoOaCashFlowHistoryListRes,
-    ProtoOaClientDisconnectEvent, ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaErrorRes,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetAccountListByAccessTokenRes,
-    ProtoOaGetTickDataReq, ProtoOaGetTickDataRes, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
-    ProtoOaPayloadType, ProtoOaRefreshTokenReq, ProtoOaRefreshTokenRes, ProtoOaSpotEvent,
-    ProtoOaSubscribeSpotsReq, ProtoOaSubscribeSpotsRes, ProtoOaUnsubscribeSpotsReq,
-    ProtoOaUnsubscribeSpotsRes, ProtoOaVersionReq, ProtoOaVersionRes, ProtoPayloadType,
+    ProtoOaApplicationAuthRes, ProtoOaAssetListReq, ProtoOaAssetListRes,
+    ProtoOaCashFlowHistoryListReq, ProtoOaCashFlowHistoryListRes, ProtoOaClientDisconnectEvent,
+    ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaErrorRes, ProtoOaGetAccountListByAccessTokenReq,
+    ProtoOaGetAccountListByAccessTokenRes, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
+    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaPayloadType, ProtoOaRefreshTokenReq,
+    ProtoOaRefreshTokenRes, ProtoOaSpotEvent, ProtoOaSubscribeSpotsReq, ProtoOaSubscribeSpotsRes,
+    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
+    ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes, ProtoOaVersionReq, ProtoOaVersionRes,
+    ProtoPayloadType,
 };
 
 /// Message that travels inside a [`ProtoMessage`] under a fixed payload type.
@@ -121,6 +123,12 @@ payloads! {
     ProtoOaAccountDisconnectEvent => ProtoOaPayloadType::ProtoOaAccountDisconnectEvent,
     ProtoOaRefreshTokenReq => ProtoOaPayloadType::ProtoOaRefreshTokenReq,
     ProtoOaRefreshTokenRes => ProtoOaPayloadType::ProtoOaRefreshTokenRes,
+    ProtoOaAssetListReq => ProtoOaPayloadType::ProtoOaAssetListReq,
+    ProtoOaAssetListRes => ProtoOaPayloadType::ProtoOaAssetListRes,
+    ProtoOaSymbolsListReq => ProtoOaPayloadType::ProtoOaSymbolsListReq,
+    ProtoOaSymbolsListRes => ProtoOaPayloadType::ProtoOaSymbolsListRes,
+    ProtoOaSymbolByIdReq => ProtoOaPayloadType::ProtoOaSymbolByIdReq,
+    ProtoOaSymbolByIdRes => ProtoOaPayloadType::ProtoOaSymbolByIdRes,
 }
 
 requests! {
@@ -131,6 +139,9 @@ requests! {
     ProtoOaUnsubscribeSpotsReq => ProtoOaUnsubscribeSpotsRes, false;
     ProtoOaGetAccountListByAccessTokenReq => ProtoOaGetAccountListByAccessTokenRes, false;
     ProtoOaRefreshTokenReq => ProtoOaRefreshTokenRes, false;
+    ProtoOaAssetListReq => ProtoOaAssetListRes, false;
+    ProtoOaSymbolsListReq => ProtoOaSymbolsListRes, false;
+    ProtoOaSymbolByIdReq => ProtoOaSymbolByIdRes, false;
     ProtoOaDealListReq => ProtoOaDealListRes, true;
     ProtoOaGetTrendbarsReq => ProtoOaGetTrendbarsRes, true;
     ProtoOaCashFlowHistoryListReq => ProtoOaCashFlowHistoryListRes, true;
@@ -149,7 +160,7 @@ mod tests {
     #[test]
     fn declared_payload_types_match_the_defaults_in_the_proto_files() {
         let declared = declared();
-        assert_eq!(declared.len(), 29);
+        assert_eq!(declared.len(), 35);
         for (name, constant, default) in declared {
             assert_eq!(i64::from(constant), i64::from(default), "{name}");
         }

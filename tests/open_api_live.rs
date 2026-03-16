@@ -21,6 +21,7 @@ use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes,
     ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaVersionReq,
 };
+use ctrader_connector::open_api::symbols::SymbolsParams;
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
 use prost::Message;
 use tokio::sync::Mutex;
@@ -486,5 +487,89 @@ async fn live_burst_above_the_limit_completes_without_a_limit_error() {
     assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(answered, BURST);
     assert!(elapsed >= Duration::from_secs(2));
+    client.shutdown().await;
+}
+
+async fn authorised() -> (OpenApiClient, Account) {
+    let client = OpenApiClient::connect(configuration())
+        .await
+        .expect("connect to the demo host");
+    client
+        .authorise_application()
+        .await
+        .expect("application authorisation");
+    let account = demo_account(&client).await;
+    client
+        .authorise_account(account.id)
+        .await
+        .expect("account authorisation");
+    (client, account)
+}
+
+#[tokio::test]
+async fn live_accounts_assets_symbols_and_details_parse_into_typed_values() {
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let assets = client.assets(account.id).await.expect("assets");
+    let list = client
+        .symbols(SymbolsParams::new(account.id).include_archived(true))
+        .await
+        .expect("symbols");
+    let named = |name: &str| {
+        list.symbols
+            .iter()
+            .find(|symbol| symbol.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("the demo account lists no symbol named {name}"))
+    };
+    let light = named("EURUSD");
+    let ids = [light.id, named("BTCUSD").id];
+    let details = client
+        .symbol_details(account.id, &ids)
+        .await
+        .expect("symbol details");
+    let asset_name = |id| {
+        assets
+            .iter()
+            .find(|asset| Some(asset.id) == id)
+            .map(|asset| asset.name.clone())
+    };
+    println!(
+        "live reference data: account {}, {} assets, {} symbols ({} enabled, {} archived), EURUSD id {} base {:?} quote {:?}",
+        account.id,
+        assets.len(),
+        list.symbols.len(),
+        list.symbols.iter().filter(|symbol| symbol.enabled).count(),
+        list.archived.len(),
+        light.id,
+        asset_name(light.base_asset),
+        asset_name(light.quote_asset),
+    );
+    for symbol in &details {
+        println!(
+            "live symbol details: id {} digits {} pip position {} volume min {:?} max {:?} step {:?} lot {:?} mode {:?} units {:?}",
+            symbol.id,
+            symbol.digits,
+            symbol.pip_position,
+            symbol.min_volume.map(|volume| volume.to_string()),
+            symbol.max_volume.map(|volume| volume.to_string()),
+            symbol.step_volume.map(|volume| volume.to_string()),
+            symbol.lot_size.map(|volume| volume.to_string()),
+            symbol.trading_mode,
+            symbol.measurement_units,
+        );
+    }
+    assert!(!assets.is_empty());
+    assert!(list.symbols.len() > 1);
+    assert_eq!(asset_name(light.base_asset).as_deref(), Some("EUR"));
+    assert_eq!(asset_name(light.quote_asset).as_deref(), Some("USD"));
+    assert_eq!(details.len(), 2);
+    let euro = details
+        .iter()
+        .find(|symbol| symbol.id == light.id)
+        .expect("details of EURUSD");
+    assert_eq!(euro.digits, 5);
+    assert_eq!(euro.pip_position, 4);
+    assert!(euro.min_volume <= euro.max_volume);
+    assert!(euro.min_volume.is_some() && euro.step_volume.is_some());
     client.shutdown().await;
 }
