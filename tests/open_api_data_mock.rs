@@ -8,11 +8,13 @@ use ctrader_connector::common::errors::{ConnectorError, ErrorCode, ValueError};
 use ctrader_connector::common::ids::{AccountId, SymbolId};
 use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::OpenApiClient;
-use ctrader_connector::open_api::connection::ConnectionOptions;
+use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
-    ProtoOaLightSymbol, ProtoOaSpotEvent, ProtoOaSubscribeSpotsReq, ProtoOaSymbol,
-    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
+    ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaLightSymbol, ProtoOaSpotEvent,
+    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeSpotsReq,
+    ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
+    ProtoOaSymbolsListRes, ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
     ProtoOaUnsubscribeSpotsReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
@@ -378,4 +380,155 @@ async fn quotes_resume_after_a_reconnection_and_end_when_the_connection_closes()
         soon("end of the listener", listener.next()).await,
         Err(ConnectorError::Closed)
     );
+}
+
+const DEPTH_EVENT: u32 = 2155;
+const SUBSCRIBE_DEPTH_REQ: u32 = 2156;
+const SUBSCRIBE_DEPTH_RES: u32 = 2157;
+const UNSUBSCRIBE_DEPTH_REQ: u32 = 2158;
+const UNSUBSCRIBE_DEPTH_RES: u32 = 2159;
+
+fn depth_subscriptions(payload_type: u32, payload: &[u8]) -> Answer {
+    match payload_type {
+        SUBSCRIBE_DEPTH_REQ => {
+            let request = ProtoOaSubscribeDepthQuotesReq::decode(payload).ok()?;
+            if request.symbol_id.contains(&666) {
+                return refuse("SYMBOL_NOT_FOUND", "unknown symbol");
+            }
+            answer(
+                SUBSCRIBE_DEPTH_RES,
+                &ProtoOaSubscribeDepthQuotesRes {
+                    payload_type: None,
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                },
+            )
+        }
+        UNSUBSCRIBE_DEPTH_REQ => {
+            let request = ProtoOaUnsubscribeDepthQuotesReq::decode(payload).ok()?;
+            if request.symbol_id.contains(&2) {
+                return refuse("INVALID_REQUEST", "not subscribed");
+            }
+            answer(
+                UNSUBSCRIBE_DEPTH_RES,
+                &ProtoOaUnsubscribeDepthQuotesRes {
+                    payload_type: None,
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+fn level(id: u64, bid: Option<u64>, ask: Option<u64>) -> ProtoOaDepthQuote {
+    ProtoOaDepthQuote {
+        id,
+        size: 100,
+        bid,
+        ask,
+    }
+}
+
+fn depth(
+    account: i64,
+    symbol: u64,
+    new: Vec<ProtoOaDepthQuote>,
+    deleted: Vec<u64>,
+) -> ProtoMessage {
+    envelope(
+        DEPTH_EVENT,
+        &ProtoOaDepthEvent {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            symbol_id: symbol,
+            new_quotes: new,
+            deleted_quotes: deleted,
+        },
+        None,
+    )
+}
+
+#[tokio::test]
+async fn depth_updates_build_a_book_that_starts_again_after_a_reconnection() {
+    let Session { server, client } = session(depth_subscriptions).await;
+    assert_eq!(
+        server_code(client.subscribe_depth(account(101), &[symbol(666)]).await),
+        Some(ErrorCode::SymbolNotFound)
+    );
+    let mut stream = client
+        .subscribe_depth(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    assert_eq!(stream.account(), account(101));
+    assert_eq!(stream.symbols().collect::<Vec<_>>(), [symbol(1)]);
+    assert!(stream.book(symbol(1)).is_none());
+    server.push(depth(102, 1, vec![level(9, Some(1), None)], Vec::new()));
+    server.push(depth(101, 2, vec![level(9, Some(1), None)], Vec::new()));
+    server.push(spot(101, 1, Some(5), None, None));
+    server.push(depth(
+        101,
+        1,
+        vec![level(1, None, Some(108_520)), level(2, None, Some(108_530))],
+        Vec::new(),
+    ));
+    server.push(depth(
+        101,
+        1,
+        vec![level(3, Some(108_510), None), level(4, Some(108_500), None)],
+        vec![2],
+    ));
+    let first = soon("first update", stream.next()).await.expect("update");
+    assert_eq!(first.symbol, symbol(1));
+    assert_eq!(first.new_quotes.len(), 2);
+    assert_eq!(first.new_quotes[0].side, QuoteSide::Ask);
+    let second = soon("second update", stream.next()).await.expect("update");
+    assert_eq!(second.deleted_quotes.len(), 1);
+    let book = stream.book(symbol(1)).expect("book");
+    assert_eq!(book.len(), 3);
+    assert_eq!(book.best_bid(), "1.08510".parse().ok());
+    assert_eq!(book.best_ask(), "1.08520".parse().ok());
+    assert_eq!(book.bids().len(), 2);
+    assert_eq!(book.asks().len(), 1);
+    server.drop_connections();
+    eventually("the subscription is replayed", || {
+        server.count(SUBSCRIBE_DEPTH_REQ) == 3
+    })
+    .await;
+    let replayed: ProtoOaSubscribeDepthQuotesReq = last_request(&server, SUBSCRIBE_DEPTH_REQ);
+    assert_eq!(replayed.symbol_id, vec![1]);
+    server.push(depth(
+        101,
+        1,
+        vec![level(7, Some(108_490), None)],
+        Vec::new(),
+    ));
+    soon("update after the reconnection", stream.next())
+        .await
+        .expect("update");
+    let book = stream.book(symbol(1)).expect("book");
+    assert_eq!(book.len(), 1);
+    assert_eq!(book.best_ask(), None);
+    server.push(depth(101, 1, vec![level(8, None, None)], Vec::new()));
+    assert_eq!(
+        soon("malformed update", stream.next()).await,
+        Err(ConnectorError::Value(ValueError::OutOfRange {
+            kind: "depth quote side"
+        }))
+    );
+    stream.unsubscribe().await.expect("end of subscription");
+    let ended: ProtoOaUnsubscribeDepthQuotesReq = last_request(&server, UNSUBSCRIBE_DEPTH_REQ);
+    assert_eq!(ended.symbol_id, vec![1]);
+    assert_eq!(
+        server_code(client.unsubscribe_depth(account(101), &[symbol(2)]).await),
+        Some(ErrorCode::InvalidRequest)
+    );
+    let mut events = client.events();
+    server.drop_connections();
+    soon("reconnection", async {
+        while !matches!(events.recv().await, Ok(Event::Reconnected { .. })) {}
+    })
+    .await;
+    assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
+    assert_eq!(server.count(SUBSCRIBE_DEPTH_REQ), 3);
+    client.shutdown().await;
 }

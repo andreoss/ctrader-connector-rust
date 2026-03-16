@@ -8,11 +8,13 @@ use crate::open_api::messages::{
     ProtoOaAccountDisconnectEvent, ProtoOaAccountsTokenInvalidatedEvent, ProtoOaApplicationAuthReq,
     ProtoOaApplicationAuthRes, ProtoOaAssetListReq, ProtoOaAssetListRes,
     ProtoOaCashFlowHistoryListReq, ProtoOaCashFlowHistoryListRes, ProtoOaClientDisconnectEvent,
-    ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaErrorRes, ProtoOaGetAccountListByAccessTokenReq,
-    ProtoOaGetAccountListByAccessTokenRes, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
-    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaPayloadType, ProtoOaRefreshTokenReq,
-    ProtoOaRefreshTokenRes, ProtoOaSpotEvent, ProtoOaSubscribeSpotsReq, ProtoOaSubscribeSpotsRes,
-    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
+    ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaDepthEvent, ProtoOaErrorRes,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetAccountListByAccessTokenRes,
+    ProtoOaGetTickDataReq, ProtoOaGetTickDataRes, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
+    ProtoOaPayloadType, ProtoOaRefreshTokenReq, ProtoOaRefreshTokenRes, ProtoOaSpotEvent,
+    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeSpotsReq,
+    ProtoOaSubscribeSpotsRes, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
+    ProtoOaSymbolsListRes, ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
     ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes, ProtoOaVersionReq, ProtoOaVersionRes,
     ProtoPayloadType,
 };
@@ -123,6 +125,11 @@ payloads! {
     ProtoOaAccountDisconnectEvent => ProtoOaPayloadType::ProtoOaAccountDisconnectEvent,
     ProtoOaRefreshTokenReq => ProtoOaPayloadType::ProtoOaRefreshTokenReq,
     ProtoOaRefreshTokenRes => ProtoOaPayloadType::ProtoOaRefreshTokenRes,
+    ProtoOaDepthEvent => ProtoOaPayloadType::ProtoOaDepthEvent,
+    ProtoOaSubscribeDepthQuotesReq => ProtoOaPayloadType::ProtoOaSubscribeDepthQuotesReq,
+    ProtoOaSubscribeDepthQuotesRes => ProtoOaPayloadType::ProtoOaSubscribeDepthQuotesRes,
+    ProtoOaUnsubscribeDepthQuotesReq => ProtoOaPayloadType::ProtoOaUnsubscribeDepthQuotesReq,
+    ProtoOaUnsubscribeDepthQuotesRes => ProtoOaPayloadType::ProtoOaUnsubscribeDepthQuotesRes,
     ProtoOaAssetListReq => ProtoOaPayloadType::ProtoOaAssetListReq,
     ProtoOaAssetListRes => ProtoOaPayloadType::ProtoOaAssetListRes,
     ProtoOaSymbolsListReq => ProtoOaPayloadType::ProtoOaSymbolsListReq,
@@ -139,6 +146,8 @@ requests! {
     ProtoOaUnsubscribeSpotsReq => ProtoOaUnsubscribeSpotsRes, false;
     ProtoOaGetAccountListByAccessTokenReq => ProtoOaGetAccountListByAccessTokenRes, false;
     ProtoOaRefreshTokenReq => ProtoOaRefreshTokenRes, false;
+    ProtoOaSubscribeDepthQuotesReq => ProtoOaSubscribeDepthQuotesRes, false;
+    ProtoOaUnsubscribeDepthQuotesReq => ProtoOaUnsubscribeDepthQuotesRes, false;
     ProtoOaAssetListReq => ProtoOaAssetListRes, false;
     ProtoOaSymbolsListReq => ProtoOaSymbolsListRes, false;
     ProtoOaSymbolByIdReq => ProtoOaSymbolByIdRes, false;
@@ -160,7 +169,7 @@ mod tests {
     #[test]
     fn declared_payload_types_match_the_defaults_in_the_proto_files() {
         let declared = declared();
-        assert_eq!(declared.len(), 35);
+        assert_eq!(declared.len(), 40);
         for (name, constant, default) in declared {
             assert_eq!(i64::from(constant), i64::from(default), "{name}");
         }

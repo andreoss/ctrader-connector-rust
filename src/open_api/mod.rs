@@ -8,6 +8,7 @@ pub mod messages;
 
 pub mod client;
 pub mod connection;
+pub mod depth;
 pub mod payload;
 pub mod quotes;
 mod stream;

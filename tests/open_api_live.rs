@@ -649,3 +649,53 @@ async fn live_quotes_arrive_while_subscribed_and_stop_after_unsubscribing() {
     assert!(late.is_none(), "quote after unsubscribing: {late:?}");
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn live_depth_updates_rebuild_a_book_with_bids_below_asks() {
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let candidates = candidates(&client, &account).await;
+    let ids: Vec<SymbolId> = candidates.iter().map(|(id, _)| *id).collect();
+    let mut depth = client
+        .subscribe_depth(account.id, &ids)
+        .await
+        .expect("depth subscription");
+    let window = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut updates = 0_usize;
+    let (mut added, mut deleted) = (0_usize, 0_usize);
+    let symbol = loop {
+        let update = tokio::time::timeout_at(window, depth.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("none of {QUOTING_CANDIDATES:?} sent five depth updates with both sides in 60 s (received {updates}); the markets may be closed")
+            })
+            .expect("depth update");
+        updates += 1;
+        added += update.new_quotes.len();
+        deleted += update.deleted_quotes.len();
+        let book = depth.book(update.symbol).expect("book of the symbol");
+        if updates >= 5 && book.best_bid().is_some() && book.best_ask().is_some() {
+            break update.symbol;
+        }
+    };
+    let book = depth.book(symbol).expect("book of the symbol").clone();
+    let name = candidates
+        .iter()
+        .find(|(id, _)| *id == symbol)
+        .map_or("?", |(_, name)| name.as_str());
+    let (bids, asks) = (book.bids(), book.asks());
+    println!(
+        "live depth: {updates} updates ({added} new, {deleted} deleted quotes); book of {name} ({symbol}) holds {} bids and {} asks; best bid {} x {} / best ask {} x {}",
+        bids.len(),
+        asks.len(),
+        bids[0].price,
+        bids[0].size,
+        asks[0].price,
+        asks[0].size,
+    );
+    assert!(book.best_bid() < book.best_ask(), "crossed book: {book:?}");
+    assert!(bids.windows(2).all(|pair| pair[0].price >= pair[1].price));
+    assert!(asks.windows(2).all(|pair| pair[0].price <= pair[1].price));
+    depth.unsubscribe().await.expect("end of subscription");
+    client.shutdown().await;
+}
