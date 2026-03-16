@@ -14,15 +14,17 @@ use ctrader_connector::common::config::{
     ConfigurationOpenApi, ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN, Environment,
 };
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
+use ctrader_connector::common::ids::SymbolId;
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
-use ctrader_connector::open_api::connection::{Connection, ConnectionOptions};
+use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaVersionReq,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
 use prost::Message;
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 static LIVE: Mutex<()> = Mutex::const_new(());
@@ -375,5 +377,76 @@ async fn live_refresh_over_http_with_an_unknown_token_is_refused() {
         "{outcome:?}"
     );
     assert!(client.access_token() == *good.access_token());
+    client.shutdown().await;
+}
+
+async fn next_spot(events: &mut broadcast::Receiver<Event>, symbol: SymbolId) -> ProtoOaSpotEvent {
+    timeout(STEP, async {
+        loop {
+            let event = events.recv().await.expect("event");
+            if let Some(spot) = event.decode::<ProtoOaSpotEvent>() {
+                if spot.symbol_id == symbol.get() {
+                    return spot;
+                }
+            }
+        }
+    })
+    .await
+    .expect("spot event in time")
+}
+
+#[tokio::test]
+async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
+    let _guard = LIVE.lock().await;
+    let client = OpenApiClient::connect(configuration())
+        .await
+        .expect("connect to the demo host");
+    client
+        .authorise_application()
+        .await
+        .expect("application authorisation");
+    let account = demo_account(&client).await;
+    client
+        .authorise_account(account.id)
+        .await
+        .expect("account authorisation");
+    let symbol = SymbolId::new(1).expect("symbol id");
+    let mut events = client.events();
+    client
+        .subscribe_spots(account.id, &[symbol])
+        .await
+        .expect("spot subscription");
+    let before = next_spot(&mut events, symbol).await;
+    client
+        .connection()
+        .force_reconnect()
+        .await
+        .expect("forced reconnection");
+    let mut disconnected = false;
+    let mut failures = Vec::new();
+    let attempt = timeout(Duration::from_secs(90), async {
+        loop {
+            match events.recv().await.expect("event") {
+                Event::Disconnected(_) => disconnected = true,
+                Event::ReconnectFailed { reason, .. } => failures.push(reason.to_string()),
+                Event::ReplayFailed { key, error } => failures.push(format!("{key:?}: {error}")),
+                Event::Reconnected { attempt } => break attempt,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("reconnection in time");
+    let after = next_spot(&mut events, symbol).await;
+    let version = client.version().await.expect("version after reconnection");
+    let reconnects = client.connection().stats().reconnects;
+    println!(
+        "live reconnect: disconnected {disconnected}, reconnected on attempt {attempt}, failures {failures:?}, reconnects {reconnects}, spot for symbol {symbol} before {} and after {}, version {version}",
+        before.bid.is_some() || before.ask.is_some(),
+        after.bid.is_some() || after.ask.is_some()
+    );
+    assert!(disconnected);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(reconnects, 1);
     client.shutdown().await;
 }

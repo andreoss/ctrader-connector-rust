@@ -6,19 +6,23 @@ use std::time::Duration;
 
 use ctrader_connector::common::config::{ConfigurationOpenApi, ConfigurationOpenApiBuilder};
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError, TransportError};
-use ctrader_connector::common::ids::AccountId;
+use ctrader_connector::common::ids::{AccountId, SymbolId};
 use ctrader_connector::open_api::client::OpenApiClient;
-use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
+use ctrader_connector::open_api::connection::{
+    Connection, ConnectionOptions, Event, ReplayKey, ReplayStage,
+};
 use ctrader_connector::open_api::messages::{
-    ProtoHeartbeatEvent, ProtoOaApplicationAuthReq, ProtoOaGetAccountListByAccessTokenReq,
-    ProtoOaSpotEvent, ProtoOaVersionReq,
+    ProtoHeartbeatEvent, ProtoOaAccountAuthReq, ProtoOaApplicationAuthReq,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaSubscribeSpotsReq,
+    ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::token::TokenPair;
 use ctrader_connector::open_api::transport::{Connect, Framed, Plain, Tls};
+use prost::Message as _;
 use support::{
     ACCESS_TOKEN, ACCOUNT_AUTH_REQ, ACCOUNT_LIST_REQ, APPLICATION_AUTH_REQ, APPLICATION_AUTH_RES,
     CLIENT_ID, CLIENT_SECRET, HEARTBEAT, HOST, HttpMock, MockOptions, MockServer, OA_ERROR,
-    REFRESH_TOKEN, REFRESH_TOKEN_REQ, VERSION_REQ, VERSION_RES, envelope,
+    REFRESH_TOKEN, REFRESH_TOKEN_REQ, SUBSCRIBE_SPOTS_REQ, VERSION_REQ, VERSION_RES, envelope,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -87,6 +91,7 @@ fn options() -> ConnectionOptions {
     ConnectionOptions::new()
         .timeout(Duration::from_secs(5))
         .heartbeat_interval(Duration::from_secs(5))
+        .reconnect_delay(Duration::from_millis(40))
 }
 
 async fn open(server: &MockServer, options: ConnectionOptions) -> Connection {
@@ -359,6 +364,7 @@ fn builder(server: &MockServer) -> ConfigurationOpenApiBuilder {
         .access_token(ACCESS_TOKEN)
         .refresh_token(REFRESH_TOKEN)
         .timeout(Duration::from_secs(5))
+        .reconnect_delay(Duration::from_millis(40))
 }
 
 async fn client(configuration: ConfigurationOpenApiBuilder) -> OpenApiClient {
@@ -497,7 +503,7 @@ async fn refresh_rotates_the_pair_and_the_new_token_authorises() {
         code(stale.refresh_token().await.map(|_| ())),
         Some(ErrorCode::Unknown("ACCESS_DENIED".to_owned()))
     );
-    stale.set_tokens(&second);
+    stale.set_tokens(&second).await;
     stale
         .authorise_account(account(101))
         .await
@@ -606,5 +612,329 @@ async fn refresh_over_http_fails_when_the_endpoint_is_unreachable() {
         client.refresh_token_over_http_with(&Plain).await,
         Err(ConnectorError::Transport(TransportError::Io { .. }))
     ));
+    client.shutdown().await;
+}
+
+fn symbol(id: i64) -> SymbolId {
+    SymbolId::new(id).expect("symbol id")
+}
+
+fn key(stage: ReplayStage, id: &str) -> ReplayKey {
+    ReplayKey::new(stage, id)
+}
+
+async fn next_spot_bid(events: &mut broadcast::Receiver<Event>) -> Option<u64> {
+    next_event(events)
+        .await
+        .decode::<ProtoOaSpotEvent>()
+        .and_then(|spot| spot.bid)
+}
+
+async fn closed_eventually(connection: &Connection) {
+    for _ in 0..500 {
+        if connection.request(&ProtoOaVersionReq::default()).await == Err(ConnectorError::Closed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the connection task did not end");
+}
+
+#[tokio::test]
+async fn forced_disconnect_recovers_and_subscriptions_resume() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server)).await;
+    client.authorise_application().await.expect("application");
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("account");
+    client
+        .subscribe_spots(account(101), &[symbol(1), symbol(2)])
+        .await
+        .expect("subscription");
+    client
+        .unsubscribe_spots(account(101), &[symbol(2)])
+        .await
+        .expect("end of subscription");
+    let mut events = client.events();
+    server.push_spot(101, 1, 11);
+    assert_eq!(next_spot_bid(&mut events).await, Some(11));
+    server.drop_connections();
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    assert_eq!(
+        server.types_on(2),
+        vec![APPLICATION_AUTH_REQ, ACCOUNT_AUTH_REQ, SUBSCRIBE_SPOTS_REQ]
+    );
+    let replayed: Vec<Vec<i64>> = server
+        .received()
+        .iter()
+        .filter(|message| message.connection == 2 && message.payload_type == SUBSCRIBE_SPOTS_REQ)
+        .map(|message| {
+            ProtoOaSubscribeSpotsReq::decode(message.payload.as_slice())
+                .expect("subscription request")
+                .symbol_id
+        })
+        .collect();
+    assert_eq!(replayed, vec![vec![1]]);
+    server.push_spot(101, 1, 12);
+    assert_eq!(next_spot_bid(&mut events).await, Some(12));
+    assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
+    assert_eq!(client.connection().stats().reconnects, 1);
+    client
+        .connection()
+        .force_reconnect()
+        .await
+        .expect("forced reconnection");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    assert_eq!(server.connections(), 3);
+    assert_eq!(client.connection().stats().reconnects, 2);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnection_backs_off_until_the_server_accepts_again() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server).reconnect_delay(Duration::from_millis(50))).await;
+    client.authorise_application().await.expect("application");
+    let mut events = client.events();
+    server.refuse_connections(true);
+    server.drop_connections();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::Disconnected(_)
+    ));
+    for expected in 1..=2 {
+        assert!(matches!(
+            next_event(&mut events).await,
+            Event::ReconnectFailed { attempt, .. } if attempt == expected
+        ));
+    }
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    assert!(matches!(
+        client.version().await,
+        Err(ConnectorError::Transport(_))
+    ));
+    server.refuse_connections(false);
+    let attempt = loop {
+        match next_event(&mut events).await {
+            Event::Reconnected { attempt } => break attempt,
+            Event::ReconnectFailed { .. } => {}
+            other => panic!("unexpected event {other:?}"),
+        }
+    };
+    assert!(attempt >= 3, "attempt {attempt}");
+    assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
+    assert_eq!(client.connection().stats().reconnects, 1);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnection_gives_up_after_the_configured_attempts() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options().reconnect_attempts(Some(2))).await;
+    connection
+        .register_replay(
+            key(ReplayStage::Application, "application"),
+            &application_auth(CLIENT_SECRET),
+        )
+        .await
+        .expect("registration");
+    let mut events = connection.events();
+    server.refuse_connections(true);
+    server.drop_connections();
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::Disconnected(_)
+    ));
+    for expected in 1..=2 {
+        assert!(matches!(
+            next_event(&mut events).await,
+            Event::ReconnectFailed { attempt, .. } if attempt == expected
+        ));
+    }
+    closed_eventually(&connection).await;
+    assert_eq!(connection.stats().reconnects, 0);
+    assert_eq!(
+        connection.force_reconnect().await,
+        Err(ConnectorError::Closed)
+    );
+    assert_eq!(
+        connection
+            .remove_replay(key(ReplayStage::Application, "application"))
+            .await,
+        Err(ConnectorError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn reconnection_can_be_turned_off() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options().reconnect_attempts(Some(0))).await;
+    let mut events = connection.events();
+    eventually("connection accepted", || server.connections() == 1).await;
+    server.drop_connections();
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    closed_eventually(&connection).await;
+    assert_eq!(server.connections(), 1);
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_the_wait_for_the_next_attempt() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options().reconnect_delay(Duration::from_secs(30))).await;
+    let mut events = connection.events();
+    eventually("connection accepted", || server.connections() == 1).await;
+    server.drop_connections();
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    connection
+        .force_reconnect()
+        .await
+        .expect("ignored while reconnecting");
+    assert_eq!(
+        connection.request(&ProtoOaVersionReq::default()).await,
+        Err(ConnectorError::Transport(TransportError::Closed))
+    );
+    timeout(Duration::from_secs(2), connection.shutdown())
+        .await
+        .expect("shutdown in time");
+    assert_eq!(
+        connection.request(&ProtoOaVersionReq::default()).await,
+        Err(ConnectorError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn refused_and_unanswered_replays_are_reported_and_removed_ones_are_not_sent() {
+    let server = MockServer::start(MockOptions {
+        silent: vec![VERSION_REQ],
+        ..MockOptions::default()
+    })
+    .await;
+    let limit = Duration::from_millis(200);
+    let connection = open(&server, options().timeout(limit)).await;
+    let application = application_auth(CLIENT_SECRET);
+    connection.request(&application).await.expect("application");
+    let unknown = key(ReplayStage::Account, "999");
+    let silent = key(ReplayStage::Subscription, "silent");
+    let removed = key(ReplayStage::Subscription, "removed");
+    connection
+        .register_replay(key(ReplayStage::Application, "application"), &application)
+        .await
+        .expect("registration");
+    connection
+        .register_replay(
+            unknown.clone(),
+            &ProtoOaAccountAuthReq {
+                payload_type: None,
+                ctid_trader_account_id: 999,
+                access_token: ACCESS_TOKEN.to_owned(),
+            },
+        )
+        .await
+        .expect("registration");
+    connection
+        .register_replay(silent.clone(), &ProtoOaVersionReq::default())
+        .await
+        .expect("registration");
+    connection
+        .register_replay(removed.clone(), &account_list())
+        .await
+        .expect("registration");
+    connection.remove_replay(removed).await.expect("removal");
+    assert_eq!(unknown.stage(), ReplayStage::Account);
+    assert_eq!(unknown.id(), "999");
+    let mut events = connection.events();
+    connection.force_reconnect().await.expect("reconnection");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    match next_event(&mut events).await {
+        Event::ReplayFailed {
+            key,
+            error: ConnectorError::Server(error),
+        } => {
+            assert_eq!(key, unknown);
+            assert_eq!(error.code, ErrorCode::ChCtidTraderAccountNotFound);
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+    server.push_spot(101, 1, 5);
+    assert_eq!(next_spot_bid(&mut events).await, Some(5));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ReplayFailed {
+            key: silent,
+            error: ConnectorError::Timeout(limit),
+        }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    assert_eq!(
+        server.types_on(2),
+        vec![APPLICATION_AUTH_REQ, ACCOUNT_AUTH_REQ, VERSION_REQ]
+    );
+    connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn accounts_are_authorised_with_the_refreshed_token_after_a_reconnection() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server)).await;
+    client.authorise_application().await.expect("application");
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("account");
+    client.refresh_token().await.expect("refresh");
+    let mut events = client.events();
+    client
+        .connection()
+        .force_reconnect()
+        .await
+        .expect("reconnection");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    let tokens: Vec<String> = server
+        .received()
+        .iter()
+        .filter(|message| message.connection == 2 && message.payload_type == ACCOUNT_AUTH_REQ)
+        .map(|message| {
+            ProtoOaAccountAuthReq::decode(message.payload.as_slice())
+                .expect("account authorisation request")
+                .access_token
+        })
+        .collect();
+    assert_eq!(tokens, vec![server.access_token()]);
     client.shutdown().await;
 }

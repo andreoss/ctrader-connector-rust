@@ -15,17 +15,19 @@
 //! # }
 //! ```
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::broadcast;
 
 use crate::common::config::{AccessToken, ConfigurationOpenApi, RefreshToken};
 use crate::common::errors::{ConnectorError, TokenError, ValueError};
-use crate::common::ids::AccountId;
-use crate::open_api::connection::{Connection, ConnectionOptions, Event};
+use crate::common::ids::{AccountId, SymbolId};
+use crate::open_api::connection::{Connection, ConnectionOptions, Event, ReplayKey, ReplayStage};
 use crate::open_api::messages::{
     ProtoOaAccountAuthReq, ProtoOaApplicationAuthReq, ProtoOaCtidTraderAccount,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaRefreshTokenReq, ProtoOaVersionReq,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaRefreshTokenReq, ProtoOaSubscribeSpotsReq,
+    ProtoOaUnsubscribeSpotsReq, ProtoOaVersionReq,
 };
 use crate::open_api::token::{TokenPair, refresh_over_http};
 use crate::open_api::transport::{Connect, Tls};
@@ -59,10 +61,22 @@ impl TryFrom<ProtoOaCtidTraderAccount> for Account {
     }
 }
 
+fn account_key(account: AccountId) -> ReplayKey {
+    ReplayKey::new(ReplayStage::Account, account.to_string())
+}
+
+fn spot_key(account: AccountId, symbol: SymbolId) -> ReplayKey {
+    ReplayKey::new(
+        ReplayStage::Subscription,
+        format!("spots/{account}/{symbol}"),
+    )
+}
+
 #[derive(Debug)]
 struct Tokens {
     access: AccessToken,
     refresh: Option<RefreshToken>,
+    accounts: BTreeSet<AccountId>,
 }
 
 /// Cloneable client of the Open API.
@@ -106,6 +120,7 @@ impl OpenApiClient {
             tokens: Arc::new(Mutex::new(Tokens {
                 access: configuration.access_token().clone(),
                 refresh: configuration.refresh_token().cloned(),
+                accounts: BTreeSet::new(),
             })),
             configuration: Arc::new(configuration),
         })
@@ -144,7 +159,8 @@ impl OpenApiClient {
             client_secret: self.configuration.client_secret().expose().to_owned(),
         };
         self.connection.request(&request).await?;
-        Ok(())
+        let key = ReplayKey::new(ReplayStage::Application, "application");
+        self.connection.register_replay(key, &request).await
     }
 
     /// Lists the trading accounts the access token grants access to.
@@ -180,7 +196,10 @@ impl OpenApiClient {
             access_token: self.access_token().expose().to_owned(),
         };
         self.connection.request(&request).await?;
-        Ok(())
+        self.tokens().accounts.insert(account);
+        self.connection
+            .register_replay(account_key(account), &request)
+            .await
     }
 
     /// Returns the access token in use, which differs from the configured one after a refresh.
@@ -190,10 +209,27 @@ impl OpenApiClient {
     }
 
     /// Replaces the token pair the client uses for its next requests.
-    pub fn set_tokens(&self, pair: &TokenPair) {
-        let mut tokens = self.tokens();
-        tokens.access = pair.access.clone();
-        tokens.refresh = Some(pair.refresh.clone());
+    ///
+    /// The accounts authorised so far are authorised with the new access token after a
+    /// reconnection.
+    pub async fn set_tokens(&self, pair: &TokenPair) {
+        let accounts: Vec<AccountId> = {
+            let mut tokens = self.tokens();
+            tokens.access = pair.access.clone();
+            tokens.refresh = Some(pair.refresh.clone());
+            tokens.accounts.iter().copied().collect()
+        };
+        for account in accounts {
+            let request = ProtoOaAccountAuthReq {
+                payload_type: None,
+                ctid_trader_account_id: account.get(),
+                access_token: pair.access.expose().to_owned(),
+            };
+            let _ = self
+                .connection
+                .register_replay(account_key(account), &request)
+                .await;
+        }
     }
 
     /// Exchanges the refresh token for a new pair over the connection.
@@ -214,7 +250,7 @@ impl OpenApiClient {
             refresh_token: self.current_refresh_token()?.expose().to_owned(),
         };
         let pair = TokenPair::try_from(self.connection.request(&request).await?)?;
-        self.set_tokens(&pair);
+        self.set_tokens(&pair).await;
         Ok(pair)
     }
 
@@ -241,7 +277,7 @@ impl OpenApiClient {
     ) -> Result<TokenPair, ConnectorError> {
         let refresh = self.current_refresh_token()?;
         let pair = refresh_over_http(connector, &self.configuration, &refresh).await?;
-        self.set_tokens(&pair);
+        self.set_tokens(&pair).await;
         Ok(pair)
     }
 
@@ -254,6 +290,61 @@ impl OpenApiClient {
             .refresh
             .clone()
             .ok_or(TokenError::NoRefreshToken)
+    }
+
+    /// Subscribes to the spot prices of the given symbols on an authorised account.
+    ///
+    /// The prices arrive as events carrying a
+    /// [`ProtoOaSpotEvent`](crate::open_api::messages::ProtoOaSpotEvent). The subscription is
+    /// restored after a reconnection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Server`] when the server refuses the subscription, and the
+    /// errors of [`Connection::request`] otherwise.
+    pub async fn subscribe_spots(
+        &self,
+        account: AccountId,
+        symbols: &[SymbolId],
+    ) -> Result<(), ConnectorError> {
+        let request = |symbols: &[SymbolId]| ProtoOaSubscribeSpotsReq {
+            payload_type: None,
+            ctid_trader_account_id: account.get(),
+            symbol_id: symbols.iter().map(|symbol| symbol.get()).collect(),
+            subscribe_to_spot_timestamp: None,
+        };
+        self.connection.request(&request(symbols)).await?;
+        for symbol in symbols {
+            self.connection
+                .register_replay(spot_key(account, *symbol), &request(&[*symbol]))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Ends the subscription to the spot prices of the given symbols.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Server`] when the server refuses the request, and the errors
+    /// of [`Connection::request`] otherwise.
+    pub async fn unsubscribe_spots(
+        &self,
+        account: AccountId,
+        symbols: &[SymbolId],
+    ) -> Result<(), ConnectorError> {
+        let request = ProtoOaUnsubscribeSpotsReq {
+            payload_type: None,
+            ctid_trader_account_id: account.get(),
+            symbol_id: symbols.iter().map(|symbol| symbol.get()).collect(),
+        };
+        self.connection.request(&request).await?;
+        for symbol in symbols {
+            self.connection
+                .remove_replay(spot_key(account, *symbol))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Asks the server for the version of the protocol it speaks.
