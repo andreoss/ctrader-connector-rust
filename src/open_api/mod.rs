@@ -9,6 +9,7 @@ pub mod messages;
 pub mod client;
 pub mod connection;
 pub mod payload;
+pub mod token;
 pub mod transport;
 
 #[cfg(test)]

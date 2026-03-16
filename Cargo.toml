@@ -14,13 +14,14 @@ path = "src/lib.rs"
 
 [features]
 default = []
-open-api = ["dep:prost", "dep:tokio", "dep:tokio-rustls", "dep:webpki-roots"]
+open-api = ["dep:prost", "dep:serde_json", "dep:tokio", "dep:tokio-rustls", "dep:webpki-roots"]
 fix = []
 logging = ["dep:tracing"]
 
 [dependencies]
 prost = { version = "0.14.5", optional = true }
 rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
+serde_json = { version = "1", optional = true }
 thiserror = "2"
 tokio = { version = "1", optional = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }

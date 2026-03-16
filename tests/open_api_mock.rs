@@ -5,7 +5,7 @@ mod support;
 use std::time::Duration;
 
 use ctrader_connector::common::config::{ConfigurationOpenApi, ConfigurationOpenApiBuilder};
-use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TransportError};
+use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError, TransportError};
 use ctrader_connector::common::ids::AccountId;
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
@@ -13,11 +13,12 @@ use ctrader_connector::open_api::messages::{
     ProtoHeartbeatEvent, ProtoOaApplicationAuthReq, ProtoOaGetAccountListByAccessTokenReq,
     ProtoOaSpotEvent, ProtoOaVersionReq,
 };
+use ctrader_connector::open_api::token::TokenPair;
 use ctrader_connector::open_api::transport::{Connect, Framed, Plain, Tls};
 use support::{
     ACCESS_TOKEN, ACCOUNT_AUTH_REQ, ACCOUNT_LIST_REQ, APPLICATION_AUTH_REQ, APPLICATION_AUTH_RES,
-    CLIENT_ID, CLIENT_SECRET, HEARTBEAT, HOST, MockOptions, MockServer, OA_ERROR, REFRESH_TOKEN,
-    VERSION_REQ, VERSION_RES, envelope,
+    CLIENT_ID, CLIENT_SECRET, HEARTBEAT, HOST, HttpMock, MockOptions, MockServer, OA_ERROR,
+    REFRESH_TOKEN, REFRESH_TOKEN_REQ, VERSION_REQ, VERSION_RES, envelope,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -465,4 +466,145 @@ async fn default_connect_uses_tls_and_fails_against_a_plain_server() {
         outcome.map(|_| ()),
         Err(ConnectorError::Transport(TransportError::Tls(_)))
     ));
+}
+
+#[tokio::test]
+async fn refresh_rotates_the_pair_and_the_new_token_authorises() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server)).await;
+    client.authorise_application().await.expect("application");
+    assert_eq!(client.access_token().expose(), ACCESS_TOKEN);
+    let pair = client.refresh_token().await.expect("refresh");
+    assert_eq!(pair.access.expose(), "mock-access-1");
+    assert_eq!(pair.refresh.expose(), "mock-refresh-1");
+    assert_eq!(pair.expires_in, Duration::from_secs(2_628_000));
+    assert_eq!(client.access_token(), pair.access);
+    assert_eq!(server.access_token(), "mock-access-1");
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("account with the new token");
+    let second = client.refresh_token().await.expect("second refresh");
+    assert_eq!(second.refresh.expose(), "mock-refresh-2");
+    assert_eq!(server.count(REFRESH_TOKEN_REQ), 2);
+    let stale = self::client(builder(&server)).await;
+    stale.authorise_application().await.expect("application");
+    assert_eq!(
+        code(stale.authorise_account(account(101)).await),
+        Some(ErrorCode::ChAccessTokenInvalid)
+    );
+    assert_eq!(
+        code(stale.refresh_token().await.map(|_| ())),
+        Some(ErrorCode::Unknown("ACCESS_DENIED".to_owned()))
+    );
+    stale.set_tokens(&second);
+    stale
+        .authorise_account(account(101))
+        .await
+        .expect("account with the adopted pair");
+    client.shutdown().await;
+    stale.shutdown().await;
+}
+
+#[tokio::test]
+async fn refresh_without_a_refresh_token_is_refused_locally() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let configuration = ConfigurationOpenApi::demo()
+        .host(HOST)
+        .port(server.port())
+        .client_id(CLIENT_ID)
+        .client_secret(CLIENT_SECRET)
+        .access_token(ACCESS_TOKEN);
+    let client = client(configuration).await;
+    let missing = Err(ConnectorError::Token(TokenError::NoRefreshToken));
+    assert_eq!(client.refresh_token().await, missing);
+    assert_eq!(client.refresh_token_over_http_with(&Plain).await, missing);
+    assert_eq!(client.refresh_token_over_http().await, missing);
+    assert_eq!(server.count(REFRESH_TOKEN_REQ), 0);
+    client.shutdown().await;
+}
+
+async fn http_refresh(response: &str) -> (Result<TokenPair, ConnectorError>, Vec<String>) {
+    let server = MockServer::start(MockOptions::default()).await;
+    let http = HttpMock::start(response).await;
+    let configuration = builder(&server)
+        .client_secret("s e/c+ret")
+        .token_url(http.url())
+        .timeout(Duration::from_millis(500));
+    let client = client(configuration).await;
+    let outcome = client.refresh_token_over_http_with(&Plain).await;
+    if let Ok(pair) = &outcome {
+        assert_eq!(client.access_token(), pair.access);
+    } else {
+        assert_eq!(client.access_token().expose(), ACCESS_TOKEN);
+    }
+    client.shutdown().await;
+    (outcome, http.requests())
+}
+
+#[tokio::test]
+async fn refresh_over_http_sends_the_documented_query_and_reads_the_pair() {
+    let body = r#"{"accessToken":"http-access","refreshToken":"http-refresh","expiresIn":60,"tokenType":"bearer","errorCode":null,"description":null}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (outcome, requests) = http_refresh(&response).await;
+    let pair = outcome.expect("pair");
+    assert_eq!(pair.access.expose(), "http-access");
+    assert_eq!(pair.refresh.expose(), "http-refresh");
+    assert_eq!(pair.expires_in, Duration::from_secs(60));
+    assert_eq!(requests.len(), 1);
+    let expected = format!(
+        "GET /apps/token?grant_type=refresh_token&refresh_token={REFRESH_TOKEN}&client_id={CLIENT_ID}&client_secret=s%20e%2Fc%2Bret HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+    );
+    assert!(requests[0].starts_with(&expected), "{}", requests[0]);
+    assert!(requests[0].contains("\r\nConnection: close\r\n"));
+}
+
+#[tokio::test]
+async fn refresh_over_http_reports_refusals_and_broken_replies() {
+    let refused = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3b\r\n{\"errorCode\":\"ACCESS_DENIED\",\"description\":\"Access denied\"}\r\n0\r\n\r\n";
+    assert_eq!(
+        http_refresh(refused).await.0,
+        Err(ConnectorError::Token(TokenError::Refused {
+            code: "ACCESS_DENIED".to_owned(),
+            description: "Access denied".to_owned(),
+        }))
+    );
+    assert_eq!(
+        http_refresh("HTTP/1.1 503 Service Unavailable\r\n\r\n<html>")
+            .await
+            .0,
+        Err(ConnectorError::Token(TokenError::Status(503)))
+    );
+    assert_eq!(
+        http_refresh("HTTP/1.1 200 OK\r\n\r\n{}").await.0,
+        Err(ConnectorError::Token(TokenError::Malformed("expiresIn")))
+    );
+    assert_eq!(
+        http_refresh("garbage").await.0,
+        Err(ConnectorError::Token(TokenError::Malformed(
+            "HTTP response"
+        )))
+    );
+    assert_eq!(
+        http_refresh("").await.0,
+        Err(ConnectorError::Timeout(Duration::from_millis(500)))
+    );
+}
+
+#[tokio::test]
+async fn refresh_over_http_fails_when_the_endpoint_is_unreachable() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let http = HttpMock::start("x").await;
+    let url = http.url();
+    drop(http);
+    tokio::task::yield_now().await;
+    let client = client(builder(&server).token_url(url)).await;
+    assert!(matches!(
+        client.refresh_token_over_http_with(&Plain).await,
+        Err(ConnectorError::Transport(TransportError::Io { .. }))
+    ));
+    client.shutdown().await;
 }

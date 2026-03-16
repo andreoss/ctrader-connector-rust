@@ -18,6 +18,7 @@ use ctrader_connector::open_api::messages::{
 };
 use ctrader_connector::open_api::transport::Framed;
 use prost::Message;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -497,5 +498,64 @@ impl State {
 
     fn token(&self) -> String {
         format!("mock-access-{}", self.generation)
+    }
+}
+
+pub struct HttpMock {
+    address: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    task: JoinHandle<()>,
+}
+
+impl HttpMock {
+    pub async fn start(response: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        let response = response.to_owned();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                seen.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(String::from_utf8_lossy(&head).into_owned());
+                if response.is_empty() {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                } else {
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+        Self {
+            address,
+            requests,
+            task,
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("https://{}/apps/token", self.address)
+    }
+
+    pub fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for HttpMock {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }

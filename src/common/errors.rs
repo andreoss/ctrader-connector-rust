@@ -349,6 +349,31 @@ impl From<std::io::Error> for TransportError {
     }
 }
 
+/// Reasons a token refresh fails.
+///
+/// The variants never carry a token or the reply of the token endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum TokenError {
+    /// The configuration holds no refresh token.
+    #[error("no refresh token is configured")]
+    NoRefreshToken,
+    /// The token endpoint refused the refresh.
+    #[error("token refresh refused: {code}{}", detail(Some(.description.as_str()).filter(|text| !text.is_empty())))]
+    Refused {
+        /// Code of the refusal as sent.
+        code: String,
+        /// Explanation given by the endpoint; empty when there is none.
+        description: String,
+    },
+    /// The reply lacks the named part or the part is not valid.
+    #[error("token response is malformed: {0}")]
+    Malformed(&'static str),
+    /// The token endpoint answered with an HTTP status that signals a failure.
+    #[error("token endpoint answered with status {0}")]
+    Status(u16),
+}
+
 /// Any failure reported by this library.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -365,6 +390,9 @@ pub enum ConnectorError {
     /// The connection failed below the level of protocol messages.
     #[error("transport failed: {0}")]
     Transport(#[from] TransportError),
+    /// A token refresh failed.
+    #[error(transparent)]
+    Token(#[from] TokenError),
     /// The server did not answer a request in time.
     #[error("no response within {0:?}")]
     Timeout(Duration),

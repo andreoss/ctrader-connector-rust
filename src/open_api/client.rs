@@ -15,18 +15,19 @@
 //! # }
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::broadcast;
 
-use crate::common::config::ConfigurationOpenApi;
-use crate::common::errors::{ConnectorError, ValueError};
+use crate::common::config::{AccessToken, ConfigurationOpenApi, RefreshToken};
+use crate::common::errors::{ConnectorError, TokenError, ValueError};
 use crate::common::ids::AccountId;
 use crate::open_api::connection::{Connection, ConnectionOptions, Event};
 use crate::open_api::messages::{
     ProtoOaAccountAuthReq, ProtoOaApplicationAuthReq, ProtoOaCtidTraderAccount,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaVersionReq,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaRefreshTokenReq, ProtoOaVersionReq,
 };
+use crate::open_api::token::{TokenPair, refresh_over_http};
 use crate::open_api::transport::{Connect, Tls};
 
 /// Trading account an access token grants access to.
@@ -58,11 +59,18 @@ impl TryFrom<ProtoOaCtidTraderAccount> for Account {
     }
 }
 
+#[derive(Debug)]
+struct Tokens {
+    access: AccessToken,
+    refresh: Option<RefreshToken>,
+}
+
 /// Cloneable client of the Open API.
 #[derive(Debug, Clone)]
 pub struct OpenApiClient {
     connection: Connection,
     configuration: Arc<ConfigurationOpenApi>,
+    tokens: Arc<Mutex<Tokens>>,
 }
 
 impl OpenApiClient {
@@ -95,6 +103,10 @@ impl OpenApiClient {
         .await?;
         Ok(Self {
             connection,
+            tokens: Arc::new(Mutex::new(Tokens {
+                access: configuration.access_token().clone(),
+                refresh: configuration.refresh_token().cloned(),
+            })),
             configuration: Arc::new(configuration),
         })
     }
@@ -145,7 +157,7 @@ impl OpenApiClient {
     pub async fn accounts(&self) -> Result<Vec<Account>, ConnectorError> {
         let request = ProtoOaGetAccountListByAccessTokenReq {
             payload_type: None,
-            access_token: self.configuration.access_token().expose().to_owned(),
+            access_token: self.access_token().expose().to_owned(),
         };
         let response = self.connection.request(&request).await?;
         response
@@ -165,10 +177,83 @@ impl OpenApiClient {
         let request = ProtoOaAccountAuthReq {
             payload_type: None,
             ctid_trader_account_id: account.get(),
-            access_token: self.configuration.access_token().expose().to_owned(),
+            access_token: self.access_token().expose().to_owned(),
         };
         self.connection.request(&request).await?;
         Ok(())
+    }
+
+    /// Returns the access token in use, which differs from the configured one after a refresh.
+    #[must_use]
+    pub fn access_token(&self) -> AccessToken {
+        self.tokens().access.clone()
+    }
+
+    /// Replaces the token pair the client uses for its next requests.
+    pub fn set_tokens(&self, pair: &TokenPair) {
+        let mut tokens = self.tokens();
+        tokens.access = pair.access.clone();
+        tokens.refresh = Some(pair.refresh.clone());
+    }
+
+    /// Exchanges the refresh token for a new pair over the connection.
+    ///
+    /// The old pair stops working once the server has answered and the client uses the new one
+    /// from then on. Accounts authorised earlier stay authorised on this connection. Store the
+    /// returned pair before doing anything else: it is the only copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::NoRefreshToken`] when no refresh token is known,
+    /// [`ConnectorError::Server`] when the server refuses the refresh,
+    /// [`TokenError::Malformed`] when the response lacks a token, and the errors of
+    /// [`Connection::request`] otherwise.
+    pub async fn refresh_token(&self) -> Result<TokenPair, ConnectorError> {
+        let request = ProtoOaRefreshTokenReq {
+            payload_type: None,
+            refresh_token: self.current_refresh_token()?.expose().to_owned(),
+        };
+        let pair = TokenPair::try_from(self.connection.request(&request).await?)?;
+        self.set_tokens(&pair);
+        Ok(pair)
+    }
+
+    /// Exchanges the refresh token for a new pair at the token endpoint, over TLS.
+    ///
+    /// Behaves like [`OpenApiClient::refresh_token`] but does not use the connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`OpenApiClient::refresh_token_over_http_with`].
+    pub async fn refresh_token_over_http(&self) -> Result<TokenPair, ConnectorError> {
+        self.refresh_token_over_http_with(&Tls::new()?).await
+    }
+
+    /// Exchanges the refresh token for a new pair at the token endpoint through `connector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::NoRefreshToken`] when no refresh token is known and the errors of
+    /// [`refresh_over_http`] otherwise.
+    pub async fn refresh_token_over_http_with<C: Connect>(
+        &self,
+        connector: &C,
+    ) -> Result<TokenPair, ConnectorError> {
+        let refresh = self.current_refresh_token()?;
+        let pair = refresh_over_http(connector, &self.configuration, &refresh).await?;
+        self.set_tokens(&pair);
+        Ok(pair)
+    }
+
+    fn tokens(&self) -> std::sync::MutexGuard<'_, Tokens> {
+        self.tokens.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn current_refresh_token(&self) -> Result<RefreshToken, TokenError> {
+        self.tokens()
+            .refresh
+            .clone()
+            .ok_or(TokenError::NoRefreshToken)
     }
 
     /// Asks the server for the version of the protocol it speaks.
