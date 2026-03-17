@@ -28,7 +28,7 @@ use crate::common::ids::{AccountId, SymbolId};
 use crate::common::time::Timestamp;
 use crate::open_api::client::OpenApiClient;
 use crate::open_api::messages::ProtoOaSpotEvent;
-use crate::open_api::stream::Feed;
+use crate::open_api::stream::{Feed, starts_replay};
 
 /// Side of a quote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -89,7 +89,9 @@ impl Quote {
 /// Quotes of the symbols of one account, in the order the server sends them.
 ///
 /// The subscription behind the stream is restored after a reconnection, so the stream goes on
-/// without further calls.
+/// without further calls. The last known prices are forgotten the moment the loss of the
+/// connection is reported, so a price from before the loss is never combined with one from
+/// after it.
 #[derive(Debug)]
 pub struct QuoteStream {
     client: OpenApiClient,
@@ -136,6 +138,10 @@ impl QuoteStream {
     pub async fn next(&mut self) -> Result<Quote, ConnectorError> {
         loop {
             let event = self.feed.next().await?;
+            if starts_replay(&event) {
+                self.last.clear();
+                continue;
+            }
             let Some(spot) = event.decode::<ProtoOaSpotEvent>() else {
                 continue;
             };

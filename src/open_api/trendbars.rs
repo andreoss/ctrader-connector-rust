@@ -42,7 +42,7 @@ use crate::open_api::messages::{
     ProtoOaTrendbarPeriod, ProtoOaUnsubscribeLiveTrendbarReq,
 };
 use crate::open_api::quotes::wire_price;
-use crate::open_api::stream::Feed;
+use crate::open_api::stream::{Feed, starts_replay};
 
 const MINUTE: u64 = 60;
 const HOUR: u64 = 60 * MINUTE;
@@ -304,7 +304,9 @@ fn span_millis(span: Duration) -> i64 {
 
 /// The forming bar of one symbol and period, sent anew whenever a price changes it.
 ///
-/// The subscription behind the stream is restored after a reconnection.
+/// The subscription behind the stream is restored after a reconnection. The last bid the stream
+/// has seen is forgotten the moment the loss of the connection is reported, so a bar from after
+/// the loss never closes at a bid from before it.
 #[derive(Debug)]
 pub struct TrendbarStream {
     client: OpenApiClient,
@@ -348,6 +350,10 @@ impl TrendbarStream {
         let period = i32::from(self.period.wire());
         loop {
             let event = self.feed.next().await?;
+            if starts_replay(&event) {
+                self.bid = None;
+                continue;
+            }
             let Some(spot) = event.decode::<ProtoOaSpotEvent>() else {
                 continue;
             };

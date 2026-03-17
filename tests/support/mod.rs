@@ -127,6 +127,7 @@ struct State {
     recent: VecDeque<Instant>,
     refuse: bool,
     limited: usize,
+    preceding: Vec<(u32, ProtoMessage)>,
 }
 
 /// Handle of a running mock server.
@@ -185,6 +186,7 @@ impl MockServer {
             recent: VecDeque::new(),
             refuse: false,
             limited: 0,
+            preceding: Vec::new(),
         }));
         let (controls, _) = broadcast::channel(256);
         let task = tokio::spawn(accept(listener, Arc::clone(&state), controls.clone()));
@@ -244,6 +246,16 @@ impl MockServer {
 
     pub fn set_limit(&self, limit: Option<usize>) {
         lock(&self.state).options.limit_per_second = limit;
+    }
+
+    /// Makes the server send `messages` ahead of every reply to a request of the given type,
+    /// in place of the messages set for that type before.
+    pub fn precede(&self, payload_type: u32, messages: Vec<ProtoMessage>) {
+        let mut state = lock(&self.state);
+        state.preceding.retain(|(known, _)| *known != payload_type);
+        state
+            .preceding
+            .extend(messages.into_iter().map(|message| (payload_type, message)));
     }
 
     pub fn drop_connections(&self) {
@@ -399,6 +411,16 @@ impl State {
             ),
             other => {
                 let reply = self.session_reply(other, &payload, id);
+                let mut ahead: Vec<ProtoMessage> = self
+                    .preceding
+                    .iter()
+                    .filter(|(known, _)| *known == other)
+                    .map(|(_, message)| message.clone())
+                    .collect();
+                if !ahead.is_empty() {
+                    ahead.push(reply);
+                    return ahead;
+                }
                 if self.options.reverse_batch > 0 {
                     self.held.push(reply);
                     if self.held.len() < self.options.reverse_batch {

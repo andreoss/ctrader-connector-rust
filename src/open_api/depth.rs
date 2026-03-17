@@ -28,13 +28,13 @@ use crate::common::decimals::{Price, Volume};
 use crate::common::errors::{ConnectorError, ValueError};
 use crate::common::ids::{AccountId, SymbolId};
 use crate::open_api::client::OpenApiClient;
-use crate::open_api::connection::{Event, ReplayKey, ReplayStage};
+use crate::open_api::connection::{ReplayKey, ReplayStage};
 use crate::open_api::messages::{
     ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaSubscribeDepthQuotesReq,
     ProtoOaUnsubscribeDepthQuotesReq,
 };
 use crate::open_api::quotes::{QuoteSide, wire_price};
-use crate::open_api::stream::Feed;
+use crate::open_api::stream::{Feed, starts_replay};
 
 const DEPTH_SIZE: &str = "depth size";
 const DEPTH_SIDE: &str = "depth quote side";
@@ -212,8 +212,10 @@ fn depth_key(account: AccountId, symbol: SymbolId) -> ReplayKey {
 
 /// Changes of the market depth of the symbols of one account, with the books they build.
 ///
-/// The subscription behind the stream is restored after a reconnection; the books start empty
-/// again then, because the server sends the whole depth anew.
+/// The subscription behind the stream is restored after a reconnection. The books are emptied
+/// the moment the loss of the connection is reported, which is before anything the server sends
+/// for the restored subscription, so the whole depth the server then sends anew builds them
+/// afresh.
 #[derive(Debug)]
 pub struct DepthStream {
     client: OpenApiClient,
@@ -251,7 +253,7 @@ impl DepthStream {
     pub async fn next(&mut self) -> Result<DepthUpdate, ConnectorError> {
         loop {
             let event = self.feed.next().await?;
-            if matches!(event, Event::Reconnected { .. }) {
+            if starts_replay(&event) {
                 self.books.clear();
                 continue;
             }

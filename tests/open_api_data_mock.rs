@@ -9,6 +9,7 @@ use ctrader_connector::common::ids::{AccountId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
+use ctrader_connector::open_api::depth::DepthBook;
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
     ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
@@ -355,7 +356,29 @@ async fn quotes_resume_after_a_reconnection_and_end_when_the_connection_closes()
         .await
         .expect("subscription");
     let mut listener = client.quotes(account(101), &[symbol(1)]);
+    server.push(spot(101, 1, Some(9), Some(12), None));
+    let known = soon("quote before the loss", quotes.next())
+        .await
+        .expect("quote");
+    assert_eq!(known.ask, "0.00012".parse().ok());
+    assert_eq!(soon("same quote", listener.next()).await, Ok(known));
+    server.precede(
+        SUBSCRIBE_SPOTS_REQ,
+        vec![spot(101, 1, Some(10), None, None)],
+    );
+    let mut events = client.events();
     server.drop_connections();
+    let mut order = Vec::new();
+    while order.last() != Some(&"reconnected") {
+        order.push(next_marker(&mut events).await);
+    }
+    assert_eq!(order, ["disconnected", "spot", "reconnected"]);
+    let replayed = soon("quote of the replay", quotes.next())
+        .await
+        .expect("quote");
+    assert_eq!(replayed.bid, "0.00010".parse().ok());
+    assert_eq!(replayed.ask, None);
+    assert_eq!(soon("same quote", listener.next()).await, Ok(replayed));
     eventually("the subscription is replayed", || {
         server.count(SUBSCRIBE_SPOTS_REQ) == 2
     })
@@ -365,6 +388,8 @@ async fn quotes_resume_after_a_reconnection_and_end_when_the_connection_closes()
         .await
         .expect("quote");
     assert_eq!(quote.symbol, symbol(1));
+    assert_eq!(quote.ask, None);
+    assert_eq!(quotes.last(symbol(1)), Some(&quote));
     assert_eq!(soon("same quote", listener.next()).await, Ok(quote));
     server.push(spot(101, 1, Some(11), None, Some(-1)));
     assert_eq!(
@@ -536,6 +561,72 @@ async fn depth_updates_build_a_book_that_starts_again_after_a_reconnection() {
     .await;
     assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
     assert_eq!(server.count(SUBSCRIBE_DEPTH_REQ), 3);
+    client.shutdown().await;
+}
+
+async fn next_marker(events: &mut tokio::sync::broadcast::Receiver<Event>) -> &'static str {
+    soon("event of the connection", async {
+        loop {
+            match events.recv().await.expect("event") {
+                Event::Disconnected(_) => return "disconnected",
+                Event::Reconnected { .. } => return "reconnected",
+                Event::Message(message) if message.payload_type == DEPTH_EVENT => return "depth",
+                Event::Message(message) if message.payload_type == SPOT_EVENT => return "spot",
+                _ => {}
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn depth_sent_during_the_replay_survives_the_reconnection() {
+    let Session { server, client } = session(depth_subscriptions).await;
+    let mut stream = client
+        .subscribe_depth(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    server.push(depth(
+        101,
+        1,
+        vec![level(1, None, Some(108_520)), level(2, Some(108_500), None)],
+        Vec::new(),
+    ));
+    soon("first update", stream.next()).await.expect("update");
+    assert_eq!(stream.book(symbol(1)).map(DepthBook::len), Some(2));
+    server.precede(
+        SUBSCRIBE_DEPTH_REQ,
+        vec![depth(
+            101,
+            1,
+            vec![level(7, Some(108_490), None), level(8, None, Some(108_510))],
+            Vec::new(),
+        )],
+    );
+    let mut events = client.events();
+    server.drop_connections();
+    let mut order = Vec::new();
+    while order.last() != Some(&"reconnected") {
+        order.push(next_marker(&mut events).await);
+    }
+    assert_eq!(order, ["disconnected", "depth", "reconnected"]);
+    let snapshot = soon("snapshot of the replay", stream.next())
+        .await
+        .expect("update");
+    assert_eq!(snapshot.new_quotes.len(), 2);
+    let book = stream.book(symbol(1)).expect("book");
+    assert_eq!(book.len(), 2);
+    assert_eq!(book.best_bid(), "1.08490".parse().ok());
+    assert_eq!(book.best_ask(), "1.08510".parse().ok());
+    server.push(depth(101, 1, vec![level(9, Some(108_495), None)], vec![7]));
+    let change = soon("change after the reconnection", stream.next())
+        .await
+        .expect("update");
+    assert_eq!(change.deleted_quotes.len(), 1);
+    let book = stream.book(symbol(1)).expect("book");
+    assert_eq!(book.len(), 2);
+    assert_eq!(book.best_bid(), "1.08495".parse().ok());
+    assert_eq!(book.best_ask(), "1.08510".parse().ok());
     client.shutdown().await;
 }
 
@@ -809,6 +900,13 @@ async fn live_trendbars_follow_the_spot_subscription_and_close_at_the_last_bid()
     assert_eq!(other.low.to_string(), "1.00002");
     assert_eq!(other.close.to_string(), "1.00009");
     reconnected(&server, &client).await;
+    server.push(spot_with_bars(1, None, vec![live_bar(1, 100_004)]));
+    server.push(spot_with_bars(1, Some(100_020), vec![live_bar(1, 100_005)]));
+    let resumed = soon("live bar after the reconnection", one.next())
+        .await
+        .expect("bar");
+    assert_eq!(resumed.low.to_string(), "1.00005");
+    assert_eq!(resumed.close.to_string(), "1.00020");
     assert_eq!(
         server.types_on(2),
         [

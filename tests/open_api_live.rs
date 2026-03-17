@@ -7,6 +7,7 @@
 //! `BROKER_ENV_FILE` and the refresh test writes the new pair back there before it checks
 //! anything else.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -18,8 +19,9 @@ use ctrader_connector::common::ids::SymbolId;
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
+use ctrader_connector::open_api::depth::DepthUpdate;
 use ctrader_connector::open_api::messages::{
-    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes,
+    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
     ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
@@ -841,5 +843,149 @@ async fn live_tick_history_of_both_sides_falls_inside_the_range() {
     }
     let (bids, asks) = (&sides[0].1, &sides[1].1);
     assert!(bids[bids.len() - 1].price < asks[asks.len() - 1].price);
+    client.shutdown().await;
+}
+
+fn depth_ids(event: &ProtoOaDepthEvent) -> (u64, Vec<u64>, Vec<u64>) {
+    (
+        event.symbol_id,
+        event.new_quotes.iter().map(|quote| quote.id).collect(),
+        event.deleted_quotes.clone(),
+    )
+}
+
+fn update_ids(update: &DepthUpdate) -> (u64, Vec<u64>, Vec<u64>) {
+    (
+        u64::try_from(update.symbol.get()).expect("symbol id"),
+        update
+            .new_quotes
+            .iter()
+            .map(|quote| quote.id.get())
+            .collect(),
+        update.deleted_quotes.iter().map(|id| id.get()).collect(),
+    )
+}
+
+async fn depth_since_the_loss(
+    events: &mut broadcast::Receiver<Event>,
+    settle: Duration,
+) -> (Vec<&'static str>, Vec<ProtoOaDepthEvent>, usize) {
+    let mut order = Vec::new();
+    let mut replayed: Vec<ProtoOaDepthEvent> = Vec::new();
+    let mut during = 0_usize;
+    timeout(Duration::from_secs(90), async {
+        loop {
+            match events.recv().await.expect("event") {
+                Event::Disconnected(_) => {
+                    order.push("disconnected");
+                    replayed.clear();
+                }
+                Event::Reconnected { .. } => {
+                    order.push("reconnected");
+                    during = replayed.len();
+                    break;
+                }
+                Event::ReconnectFailed { .. } => {
+                    order.push("failed");
+                    replayed.clear();
+                }
+                event => {
+                    if let Some(event) = event.decode::<ProtoOaDepthEvent>() {
+                        if order.last() != Some(&"depth") {
+                            order.push("depth");
+                        }
+                        replayed.push(event);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("reconnection in time");
+    let settled = tokio::time::Instant::now() + settle;
+    while let Ok(event) = tokio::time::timeout_at(settled, events.recv()).await {
+        if let Some(event) = event.expect("event").decode::<ProtoOaDepthEvent>() {
+            replayed.push(event);
+        }
+    }
+    (order, replayed, during)
+}
+
+#[tokio::test]
+async fn live_depth_book_holds_the_replayed_depth_after_a_forced_reconnect() {
+    const SETTLE: Duration = Duration::from_secs(5);
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let candidates = candidates(&client, &account).await;
+    let ids: Vec<SymbolId> = candidates.iter().map(|(id, _)| *id).collect();
+    let mut depth = client
+        .subscribe_depth(account.id, &ids)
+        .await
+        .expect("depth subscription");
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let update = depth.next().await.expect("depth update");
+            if depth
+                .book(update.symbol)
+                .is_some_and(|book| !book.is_empty())
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("none of {QUOTING_CANDIDATES:?} sent depth in 60 s"));
+    let mut events = client.events();
+    client
+        .connection()
+        .force_reconnect()
+        .await
+        .expect("forced reconnection");
+    let (order, replayed, during) = depth_since_the_loss(&mut events, SETTLE).await;
+    assert!(
+        !replayed.is_empty(),
+        "no depth arrived after the reconnection; the markets may be closed"
+    );
+    let mut expected: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let first = depth_ids(&replayed[0]);
+    timeout(STEP, async {
+        let mut update = depth.next().await.expect("depth update");
+        while update_ids(&update) != first {
+            update = depth.next().await.expect("depth update");
+        }
+        for (index, event) in replayed.iter().enumerate() {
+            if index > 0 {
+                update = depth.next().await.expect("depth update");
+            }
+            assert_eq!(update_ids(&update), depth_ids(event));
+            let ids = expected.entry(event.symbol_id).or_default();
+            for id in &event.deleted_quotes {
+                ids.remove(id);
+            }
+            ids.extend(event.new_quotes.iter().map(|quote| quote.id));
+            let book = depth.book(update.symbol).expect("book of the symbol");
+            let held: BTreeSet<u64> = book
+                .bids()
+                .iter()
+                .chain(book.asks().iter())
+                .map(|quote| quote.id.get())
+                .collect();
+            assert_eq!(
+                &held, ids,
+                "book of {} differs from the depth sent since the loss, at event {index}",
+                update.symbol
+            );
+        }
+    })
+    .await
+    .expect("the stream delivers what the connection delivered");
+    let entries: usize = expected.values().map(BTreeSet::len).sum();
+    println!(
+        "live depth reconnect: order {order:?}, {during} depth events during the replay, {} until {SETTLE:?} after it, books of {} symbols hold {entries} entries",
+        replayed.len(),
+        expected.len()
+    );
+    assert!(entries > 0, "the books are empty after the reconnection");
+    depth.unsubscribe().await.expect("end of subscription");
     client.shutdown().await;
 }
