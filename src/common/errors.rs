@@ -250,7 +250,7 @@ fn detail(description: Option<&str>) -> String {
     description.map_or_else(String::new, |text| format!(": {text}"))
 }
 
-/// Reasons an identifier, a price or a volume is rejected.
+/// Reasons an identifier, a price, a volume or a moment in time is rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ValueError {
@@ -297,6 +297,20 @@ pub enum ValueError {
     OutOfRange {
         /// Kind of the value.
         kind: &'static str,
+    },
+    /// A message of the server lacks a field the value is built from.
+    #[error("{kind} is missing")]
+    Missing {
+        /// Kind of the value.
+        kind: &'static str,
+    },
+    /// A range of time ends before it starts.
+    #[error("range from {from} ends before it starts, at {to}")]
+    InvertedRange {
+        /// Start of the range, in milliseconds since the Unix epoch.
+        from: i64,
+        /// End of the range, in milliseconds since the Unix epoch.
+        to: i64,
     },
 }
 

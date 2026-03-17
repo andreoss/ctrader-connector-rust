@@ -6,24 +6,29 @@ use std::time::Duration;
 
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, ValueError};
 use ctrader_connector::common::ids::{AccountId, SymbolId};
-use ctrader_connector::common::time::Timestamp;
+use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
-    ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaLightSymbol, ProtoOaSpotEvent,
-    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeSpotsReq,
-    ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
-    ProtoOaSymbolsListRes, ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
+    ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
+    ProtoOaLightSymbol, ProtoOaSpotEvent, ProtoOaSubscribeDepthQuotesReq,
+    ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeLiveTrendbarReq,
+    ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq, ProtoOaSymbol, ProtoOaSymbolByIdReq,
+    ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes, ProtoOaTrendbar,
+    ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
+    ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
     ProtoOaUnsubscribeSpotsReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{SymbolsParams, TradingMode};
 use ctrader_connector::open_api::transport::Plain;
+use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message as _;
 use support::{
-    ACCESS_TOKEN, Answer, CLIENT_ID, CLIENT_SECRET, HOST, MockOptions, MockServer, REFRESH_TOKEN,
-    Responder, SPOT_EVENT, SUBSCRIBE_SPOTS_REQ, UNSUBSCRIBE_SPOTS_REQ, answer, envelope, refuse,
+    ACCESS_TOKEN, ACCOUNT_AUTH_REQ, APPLICATION_AUTH_REQ, Answer, CLIENT_ID, CLIENT_SECRET, HOST,
+    MockOptions, MockServer, REFRESH_TOKEN, Responder, SPOT_EVENT, SUBSCRIBE_SPOTS_REQ,
+    UNSUBSCRIBE_SPOTS_REQ, answer, envelope, refuse,
 };
 use tokio::time::timeout;
 
@@ -59,7 +64,7 @@ async fn session(responder: impl Fn(u32, &[u8]) -> Answer + Send + Sync + 'stati
         .reconnect_delay(Duration::from_millis(40))
         .build()
         .expect("configuration");
-    let options = ConnectionOptions::from(&configuration);
+    let options = ConnectionOptions::from(&configuration).historical_limit(50);
     let client = OpenApiClient::connect_with(configuration, Plain, options)
         .await
         .expect("client");
@@ -530,5 +535,311 @@ async fn depth_updates_build_a_book_that_starts_again_after_a_reconnection() {
     .await;
     assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
     assert_eq!(server.count(SUBSCRIBE_DEPTH_REQ), 3);
+    client.shutdown().await;
+}
+
+const SUBSCRIBE_LIVE_TRENDBAR_REQ: u32 = 2135;
+const UNSUBSCRIBE_LIVE_TRENDBAR_REQ: u32 = 2136;
+const GET_TRENDBARS_REQ: u32 = 2137;
+const GET_TRENDBARS_RES: u32 = 2138;
+const SUBSCRIBE_LIVE_TRENDBAR_RES: u32 = 2165;
+const UNSUBSCRIBE_LIVE_TRENDBAR_RES: u32 = 2166;
+const MINUTE: i64 = 60_000;
+const BARS_PER_RESPONSE: usize = 4;
+const OLD_BARS: std::ops::Range<u32> = 1_000..1_010;
+const NEW_BARS: std::ops::Range<u32> = 200_000..200_006;
+
+fn history_bar(minute: u32) -> ProtoOaTrendbar {
+    ProtoOaTrendbar {
+        volume: i64::from(minute),
+        period: None,
+        low: Some(100_000 + i64::from(minute)),
+        delta_open: Some(5),
+        delta_close: Some(7),
+        delta_high: Some(10),
+        utc_timestamp_in_minutes: Some(minute),
+    }
+}
+
+fn trendbar_data(payload_type: u32, payload: &[u8]) -> Answer {
+    match payload_type {
+        GET_TRENDBARS_REQ => {
+            let request = ProtoOaGetTrendbarsReq::decode(payload).ok()?;
+            if request.symbol_id == 666 {
+                return refuse("SYMBOL_NOT_FOUND", "unknown symbol");
+            }
+            let mut bars: Vec<ProtoOaTrendbar> = OLD_BARS
+                .chain(NEW_BARS)
+                .filter(|minute| {
+                    let opened = i64::from(*minute) * MINUTE;
+                    opened + MINUTE > request.from_timestamp && opened <= request.to_timestamp
+                })
+                .map(history_bar)
+                .collect();
+            let surplus = bars.len().saturating_sub(BARS_PER_RESPONSE);
+            bars.drain(..surplus);
+            if request.symbol_id == 13 {
+                bars = vec![ProtoOaTrendbar {
+                    low: None,
+                    ..history_bar(5)
+                }];
+            }
+            answer(
+                GET_TRENDBARS_RES,
+                &ProtoOaGetTrendbarsRes {
+                    payload_type: None,
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                    period: request.period,
+                    timestamp: request.to_timestamp,
+                    trendbar: bars,
+                    symbol_id: Some(request.symbol_id),
+                },
+            )
+        }
+        SUBSCRIBE_LIVE_TRENDBAR_REQ => {
+            let request = ProtoOaSubscribeLiveTrendbarReq::decode(payload).ok()?;
+            if request.symbol_id == 666 {
+                return refuse("INVALID_REQUEST", "no such symbol");
+            }
+            answer(
+                SUBSCRIBE_LIVE_TRENDBAR_RES,
+                &ProtoOaSubscribeLiveTrendbarRes {
+                    payload_type: None,
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                },
+            )
+        }
+        UNSUBSCRIBE_LIVE_TRENDBAR_REQ => {
+            let request = ProtoOaUnsubscribeLiveTrendbarReq::decode(payload).ok()?;
+            answer(
+                UNSUBSCRIBE_LIVE_TRENDBAR_RES,
+                &ProtoOaUnsubscribeLiveTrendbarRes {
+                    payload_type: None,
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+fn minutes(range: std::ops::RangeInclusive<i64>) -> TimeRange {
+    let at = |minute: i64| Timestamp::from_millis(minute * MINUTE).expect("timestamp");
+    TimeRange::new(at(*range.start()), at(*range.end())).expect("range")
+}
+
+#[tokio::test]
+async fn long_trendbar_ranges_are_fetched_in_parts_and_returned_in_order() {
+    let Session { server, client } = session(trendbar_data).await;
+    let whole = TrendbarsParams::new(account(101), symbol(1), Period::M1, minutes(0..=200_010));
+    let bars = client.trendbars(&whole).await.expect("bars");
+    let opened: Vec<i64> = bars.iter().map(|bar| bar.timestamp.as_millis()).collect();
+    let expected: Vec<i64> = OLD_BARS
+        .chain(NEW_BARS)
+        .map(|minute| i64::from(minute) * MINUTE)
+        .collect();
+    assert_eq!(opened, expected);
+    assert!(
+        bars.iter()
+            .all(|bar| bar.low <= bar.open && bar.open <= bar.close && bar.close <= bar.high)
+    );
+    assert_eq!(bars[0].low.to_string(), "1.01000");
+    assert_eq!(bars[0].volume, 1_000);
+    assert_eq!(bars[0].period, Period::M1);
+    let requests: Vec<ProtoOaGetTrendbarsReq> = server
+        .received()
+        .iter()
+        .filter(|message| message.payload_type == GET_TRENDBARS_REQ)
+        .map(|message| ProtoOaGetTrendbarsReq::decode(message.payload.as_slice()).expect("request"))
+        .collect();
+    assert_eq!(requests.len(), 9);
+    assert_eq!(requests[0].to_timestamp, 200_010 * MINUTE);
+    assert_eq!(requests[0].from_timestamp, 200_010 * MINUTE - 3_024_000_000);
+    assert_eq!(requests[1].to_timestamp, 200_002 * MINUTE - 1);
+    assert_eq!(requests[0].period, 1);
+    assert_eq!(requests[0].count, None);
+    assert!(requests.iter().all(|request| {
+        request.from_timestamp >= 0
+            && request.from_timestamp <= request.to_timestamp
+            && request.to_timestamp - request.from_timestamp <= 3_024_000_000
+    }));
+    assert!(
+        requests
+            .windows(2)
+            .all(|pair| pair[1].to_timestamp < pair[0].to_timestamp)
+    );
+    let latest = client.trendbars(&whole.count(5)).await.expect("bars");
+    assert_eq!(
+        latest
+            .iter()
+            .map(|bar| bar.timestamp.as_millis() / MINUTE)
+            .collect::<Vec<_>>(),
+        (200_001..200_006).collect::<Vec<_>>()
+    );
+    assert_eq!(server.count(GET_TRENDBARS_REQ), 11);
+    let inside = TrendbarsParams::new(account(101), symbol(1), Period::M1, minutes(1_003..=1_004));
+    assert_eq!(client.trendbars(&inside).await.expect("bars").len(), 2);
+    assert_eq!(server.count(GET_TRENDBARS_REQ), 12);
+    let nothing = TrendbarsParams::new(account(101), symbol(1), Period::M1, minutes(0..=0));
+    assert!(
+        client
+            .trendbars(&nothing.count(0))
+            .await
+            .expect("bars")
+            .is_empty()
+    );
+    assert_eq!(server.count(GET_TRENDBARS_REQ), 12);
+    assert!(client.trendbars(&nothing).await.expect("bars").is_empty());
+    assert_eq!(server.count(GET_TRENDBARS_REQ), 13);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_and_malformed_trendbars_yield_typed_errors() {
+    let Session {
+        server: _server,
+        client,
+    } = session(trendbar_data).await;
+    let params = |id| TrendbarsParams::new(account(101), symbol(id), Period::H1, minutes(0..=10));
+    assert_eq!(
+        server_code(client.trendbars(&params(666)).await),
+        Some(ErrorCode::SymbolNotFound)
+    );
+    assert_eq!(
+        client.trendbars(&params(13)).await,
+        Err(ConnectorError::Value(ValueError::Missing {
+            kind: "trendbar low"
+        }))
+    );
+    assert_eq!(
+        server_code(
+            client
+                .subscribe_live_trendbars(account(101), symbol(666), Period::M1)
+                .await
+        ),
+        Some(ErrorCode::InvalidRequest)
+    );
+    client.shutdown().await;
+}
+
+fn live_bar(period: i32, low: i64) -> ProtoOaTrendbar {
+    ProtoOaTrendbar {
+        volume: 3,
+        period: Some(period),
+        low: Some(low),
+        delta_open: Some(1),
+        delta_close: None,
+        delta_high: Some(20),
+        utc_timestamp_in_minutes: Some(10),
+    }
+}
+
+fn spot_with_bars(symbol: i64, bid: Option<u64>, bars: Vec<ProtoOaTrendbar>) -> ProtoMessage {
+    envelope(
+        SPOT_EVENT,
+        &ProtoOaSpotEvent {
+            ctid_trader_account_id: 101,
+            symbol_id: symbol,
+            bid,
+            ask: bid.is_none().then_some(1),
+            trendbar: bars,
+            ..ProtoOaSpotEvent::default()
+        },
+        None,
+    )
+}
+
+async fn reconnected(server: &MockServer, client: &OpenApiClient) {
+    let mut events = client.events();
+    server.drop_connections();
+    soon("reconnection", async {
+        while !matches!(events.recv().await, Ok(Event::Reconnected { .. })) {}
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn live_trendbars_follow_the_spot_subscription_and_close_at_the_last_bid() {
+    let Session { server, client } = session(trendbar_data).await;
+    let mut one = client
+        .subscribe_live_trendbars(account(101), symbol(1), Period::M1)
+        .await
+        .expect("subscription");
+    let mut five = client
+        .subscribe_live_trendbars(account(101), symbol(1), Period::M5)
+        .await
+        .expect("subscription");
+    assert_eq!(
+        (one.account(), one.symbol(), one.period()),
+        (account(101), symbol(1), Period::M1)
+    );
+    assert_eq!(
+        server.types_on(1)[2..],
+        [
+            SUBSCRIBE_SPOTS_REQ,
+            SUBSCRIBE_LIVE_TRENDBAR_REQ,
+            SUBSCRIBE_LIVE_TRENDBAR_REQ
+        ]
+    );
+    server.push(spot_with_bars(1, None, vec![live_bar(1, 100_000)]));
+    server.push(spot_with_bars(2, Some(7), vec![live_bar(1, 1)]));
+    server.push(spot(102, 1, Some(7), None, None));
+    server.push(spot_with_bars(1, Some(100_008), vec![live_bar(1, 100_001)]));
+    server.push(spot_with_bars(1, Some(100_009), Vec::new()));
+    server.push(spot_with_bars(
+        1,
+        None,
+        vec![live_bar(5, 100_002), live_bar(1, 100_003)],
+    ));
+    let first = soon("first live bar", one.next()).await.expect("bar");
+    assert_eq!(first.period, Period::M1);
+    assert_eq!(first.timestamp.as_millis(), 10 * MINUTE);
+    assert_eq!(
+        [first.open, first.high, first.low, first.close].map(|price| price.to_string()),
+        ["1.00002", "1.00021", "1.00001", "1.00008"]
+    );
+    let second = soon("second live bar", one.next()).await.expect("bar");
+    assert_eq!(second.low.to_string(), "1.00003");
+    assert_eq!(second.close.to_string(), "1.00009");
+    let other = soon("bar of the other period", five.next())
+        .await
+        .expect("bar");
+    assert_eq!(other.period, Period::M5);
+    assert_eq!(other.low.to_string(), "1.00002");
+    assert_eq!(other.close.to_string(), "1.00009");
+    reconnected(&server, &client).await;
+    assert_eq!(
+        server.types_on(2),
+        [
+            APPLICATION_AUTH_REQ,
+            ACCOUNT_AUTH_REQ,
+            SUBSCRIBE_SPOTS_REQ,
+            SUBSCRIBE_LIVE_TRENDBAR_REQ,
+            SUBSCRIBE_LIVE_TRENDBAR_REQ
+        ]
+    );
+    one.unsubscribe().await.expect("end of subscription");
+    let ended: ProtoOaUnsubscribeLiveTrendbarReq =
+        last_request(&server, UNSUBSCRIBE_LIVE_TRENDBAR_REQ);
+    assert_eq!((ended.symbol_id, ended.period), (1, 1));
+    reconnected(&server, &client).await;
+    let replayed: ProtoOaSubscribeLiveTrendbarReq =
+        last_request(&server, SUBSCRIBE_LIVE_TRENDBAR_REQ);
+    assert_eq!(replayed.period, 5);
+    assert_eq!(server.types_on(3).len(), 4);
+    client
+        .unsubscribe_spots(account(101), &[symbol(1)])
+        .await
+        .expect("end of spot subscription");
+    reconnected(&server, &client).await;
+    assert_eq!(server.types_on(4), [APPLICATION_AUTH_REQ, ACCOUNT_AUTH_REQ]);
+    client
+        .subscribe_live_trendbars(account(101), symbol(1), Period::M5)
+        .await
+        .expect("subscription");
+    assert_eq!(
+        server.types_on(4)[2..],
+        [SUBSCRIBE_SPOTS_REQ, SUBSCRIBE_LIVE_TRENDBAR_REQ]
+    );
     client.shutdown().await;
 }

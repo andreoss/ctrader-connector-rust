@@ -15,7 +15,7 @@ use ctrader_connector::common::config::{
 };
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
 use ctrader_connector::common::ids::SymbolId;
-use ctrader_connector::common::time::Timestamp;
+use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
@@ -24,6 +24,7 @@ use ctrader_connector::open_api::messages::{
 };
 use ctrader_connector::open_api::symbols::SymbolsParams;
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
+use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
@@ -697,5 +698,89 @@ async fn live_depth_updates_rebuild_a_book_with_bids_below_asks() {
     assert!(bids.windows(2).all(|pair| pair[0].price >= pair[1].price));
     assert!(asks.windows(2).all(|pair| pair[0].price <= pair[1].price));
     depth.unsubscribe().await.expect("end of subscription");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let now = Timestamp::now();
+    let recent = TimeRange::ending_at(now, Duration::from_secs(600));
+    let mut quoting = None;
+    for (id, name) in candidates(&client, &account).await {
+        let params = TrendbarsParams::new(account.id, id, Period::M1, recent);
+        if !client
+            .trendbars(&params)
+            .await
+            .expect("recent bars")
+            .is_empty()
+        {
+            quoting = Some((id, name));
+            break;
+        }
+    }
+    let (symbol, name) = quoting.unwrap_or_else(|| {
+        panic!("none of {QUOTING_CANDIDATES:?} has a one minute bar in the last ten minutes; the markets may be closed")
+    });
+    let range = TimeRange::ending_at(now, Duration::from_secs(6 * 3_600));
+    let params = TrendbarsParams::new(account.id, symbol, Period::M1, range);
+    let bars = client.trendbars(&params).await.expect("history");
+    assert!(bars.len() > 60, "only {} bars in six hours", bars.len());
+    assert!(
+        bars.windows(2)
+            .all(|pair| pair[0].timestamp < pair[1].timestamp)
+    );
+    for bar in &bars {
+        assert!(
+            bar.low <= bar.open && bar.low <= bar.close,
+            "low above the body: {bar:?}"
+        );
+        assert!(
+            bar.open <= bar.high && bar.close <= bar.high,
+            "high below the body: {bar:?}"
+        );
+        assert_eq!((bar.symbol, bar.period), (symbol, Period::M1));
+        assert!(
+            bar.timestamp.as_millis() + 60_000 > range.from().as_millis()
+                && bar.timestamp <= range.to(),
+            "bar outside the range: {bar:?}"
+        );
+    }
+    let latest = client.trendbars(&params.count(10)).await.expect("history");
+    assert_eq!(latest.as_slice(), &bars[bars.len() - 10..]);
+    let (first, last) = (&bars[0], &bars[bars.len() - 1]);
+    println!(
+        "live trendbars: {} M1 bars of {name} ({symbol}) from {} to {}; last bar open {} high {} low {} close {} volume {}",
+        bars.len(),
+        first.timestamp,
+        last.timestamp,
+        last.open,
+        last.high,
+        last.low,
+        last.close,
+        last.volume,
+    );
+    let mut stream = client
+        .subscribe_live_trendbars(account.id, symbol, Period::M1)
+        .await
+        .expect("live trendbar subscription");
+    let bar = timeout(Duration::from_secs(90), stream.next())
+        .await
+        .unwrap_or_else(|_| panic!("no live M1 bar of {name} in 90 s; the market may be closed"))
+        .expect("live bar");
+    println!(
+        "live trendbar: {name} ({symbol}) M1 at {} open {} high {} low {} close {} volume {}",
+        bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume,
+    );
+    assert_eq!((bar.symbol, bar.period), (symbol, Period::M1));
+    assert!(bar.low <= bar.open && bar.open <= bar.high);
+    assert!(bar.low <= bar.close && bar.close <= bar.high);
+    assert!(bar.timestamp >= last.timestamp);
+    stream.unsubscribe().await.expect("end of subscription");
+    client
+        .unsubscribe_spots(account.id, &[symbol])
+        .await
+        .expect("end of spot subscription");
     client.shutdown().await;
 }

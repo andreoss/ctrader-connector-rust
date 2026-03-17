@@ -12,9 +12,11 @@ use crate::open_api::messages::{
     ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetAccountListByAccessTokenRes,
     ProtoOaGetTickDataReq, ProtoOaGetTickDataRes, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
     ProtoOaPayloadType, ProtoOaRefreshTokenReq, ProtoOaRefreshTokenRes, ProtoOaSpotEvent,
-    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeSpotsReq,
+    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
+    ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
     ProtoOaSubscribeSpotsRes, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
     ProtoOaSymbolsListRes, ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
+    ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
     ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes, ProtoOaVersionReq, ProtoOaVersionRes,
     ProtoPayloadType,
 };
@@ -125,6 +127,10 @@ payloads! {
     ProtoOaAccountDisconnectEvent => ProtoOaPayloadType::ProtoOaAccountDisconnectEvent,
     ProtoOaRefreshTokenReq => ProtoOaPayloadType::ProtoOaRefreshTokenReq,
     ProtoOaRefreshTokenRes => ProtoOaPayloadType::ProtoOaRefreshTokenRes,
+    ProtoOaSubscribeLiveTrendbarReq => ProtoOaPayloadType::ProtoOaSubscribeLiveTrendbarReq,
+    ProtoOaSubscribeLiveTrendbarRes => ProtoOaPayloadType::ProtoOaSubscribeLiveTrendbarRes,
+    ProtoOaUnsubscribeLiveTrendbarReq => ProtoOaPayloadType::ProtoOaUnsubscribeLiveTrendbarReq,
+    ProtoOaUnsubscribeLiveTrendbarRes => ProtoOaPayloadType::ProtoOaUnsubscribeLiveTrendbarRes,
     ProtoOaDepthEvent => ProtoOaPayloadType::ProtoOaDepthEvent,
     ProtoOaSubscribeDepthQuotesReq => ProtoOaPayloadType::ProtoOaSubscribeDepthQuotesReq,
     ProtoOaSubscribeDepthQuotesRes => ProtoOaPayloadType::ProtoOaSubscribeDepthQuotesRes,
@@ -146,6 +152,8 @@ requests! {
     ProtoOaUnsubscribeSpotsReq => ProtoOaUnsubscribeSpotsRes, false;
     ProtoOaGetAccountListByAccessTokenReq => ProtoOaGetAccountListByAccessTokenRes, false;
     ProtoOaRefreshTokenReq => ProtoOaRefreshTokenRes, false;
+    ProtoOaSubscribeLiveTrendbarReq => ProtoOaSubscribeLiveTrendbarRes, false;
+    ProtoOaUnsubscribeLiveTrendbarReq => ProtoOaUnsubscribeLiveTrendbarRes, false;
     ProtoOaSubscribeDepthQuotesReq => ProtoOaSubscribeDepthQuotesRes, false;
     ProtoOaUnsubscribeDepthQuotesReq => ProtoOaUnsubscribeDepthQuotesRes, false;
     ProtoOaAssetListReq => ProtoOaAssetListRes, false;
@@ -169,7 +177,7 @@ mod tests {
     #[test]
     fn declared_payload_types_match_the_defaults_in_the_proto_files() {
         let declared = declared();
-        assert_eq!(declared.len(), 40);
+        assert_eq!(declared.len(), 44);
         for (name, constant, default) in declared {
             assert_eq!(i64::from(constant), i64::from(default), "{name}");
         }

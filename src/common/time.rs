@@ -102,14 +102,92 @@ impl fmt::Display for Timestamp {
     }
 }
 
+/// Span of time between two moments, both included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimeRange {
+    from: Timestamp,
+    to: Timestamp,
+}
+
+impl TimeRange {
+    /// Builds the range that starts at `from` and ends at `to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::InvertedRange`] when `to` lies before `from`.
+    pub const fn new(from: Timestamp, to: Timestamp) -> Result<Self, ValueError> {
+        if to.0 < from.0 {
+            Err(ValueError::InvertedRange {
+                from: from.0,
+                to: to.0,
+            })
+        } else {
+            Ok(Self { from, to })
+        }
+    }
+
+    /// Builds the range of the given length that ends at `to`; it starts at the Unix epoch when
+    /// the length reaches further back.
+    #[must_use]
+    pub fn ending_at(to: Timestamp, length: Duration) -> Self {
+        Self {
+            from: to.checked_sub(length).unwrap_or(Timestamp::EPOCH),
+            to,
+        }
+    }
+
+    /// Returns the first moment of the range.
+    #[must_use]
+    pub const fn from(&self) -> Timestamp {
+        self.from
+    }
+
+    /// Returns the last moment of the range.
+    #[must_use]
+    pub const fn to(&self) -> Timestamp {
+        self.to
+    }
+
+    /// Tells whether the moment lies inside the range.
+    #[must_use]
+    pub const fn contains(&self, moment: Timestamp) -> bool {
+        self.from.0 <= moment.0 && moment.0 <= self.to.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::Timestamp;
+    use super::{TimeRange, Timestamp};
     use crate::common::errors::ValueError;
 
     const OUT_OF_RANGE: ValueError = ValueError::OutOfRange { kind: "timestamp" };
+
+    #[test]
+    fn range_keeps_its_ends_in_order() {
+        let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
+        let range = TimeRange::new(at(10), at(20)).expect("range");
+        assert_eq!((range.from(), range.to()), (at(10), at(20)));
+        assert!(range.contains(at(10)) && range.contains(at(20)));
+        assert!(!range.contains(at(9)) && !range.contains(at(21)));
+        assert!(TimeRange::new(at(10), at(10)).is_ok());
+        let inverted = TimeRange::new(at(20), at(10));
+        assert_eq!(
+            inverted,
+            Err(ValueError::InvertedRange { from: 20, to: 10 })
+        );
+        assert_eq!(
+            inverted.map_err(|error| error.to_string()),
+            Err("range from 20 ends before it starts, at 10".to_owned())
+        );
+        let tail = TimeRange::ending_at(at(5_000), Duration::from_secs(2));
+        assert_eq!((tail.from(), tail.to()), (at(3_000), at(5_000)));
+        assert_eq!(
+            TimeRange::ending_at(at(5_000), Duration::from_secs(9)).from(),
+            Timestamp::EPOCH
+        );
+    }
 
     #[test]
     fn milliseconds_round_trip_and_negative_ones_are_rejected() {

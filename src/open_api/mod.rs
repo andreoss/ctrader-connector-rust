@@ -15,6 +15,7 @@ mod stream;
 pub mod symbols;
 pub mod token;
 pub mod transport;
+pub mod trendbars;
 
 #[cfg(test)]
 mod messages_tests;

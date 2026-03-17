@@ -16,7 +16,7 @@
 //! ```
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::broadcast;
 
@@ -31,6 +31,7 @@ use crate::open_api::messages::{
 };
 use crate::open_api::token::{TokenPair, refresh_over_http};
 use crate::open_api::transport::{Connect, Tls};
+use crate::open_api::trendbars::{Period, trendbar_key};
 
 /// Trading account an access token grants access to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,12 +80,19 @@ struct Tokens {
     accounts: BTreeSet<AccountId>,
 }
 
+#[derive(Debug, Default)]
+struct Subscriptions {
+    spots: BTreeSet<(AccountId, SymbolId)>,
+    trendbars: BTreeSet<(AccountId, SymbolId, Period)>,
+}
+
 /// Cloneable client of the Open API.
 #[derive(Debug, Clone)]
 pub struct OpenApiClient {
     connection: Connection,
     configuration: Arc<ConfigurationOpenApi>,
     tokens: Arc<Mutex<Tokens>>,
+    subscriptions: Arc<Mutex<Subscriptions>>,
 }
 
 impl OpenApiClient {
@@ -122,6 +130,7 @@ impl OpenApiClient {
                 refresh: configuration.refresh_token().cloned(),
                 accounts: BTreeSet::new(),
             })),
+            subscriptions: Arc::default(),
             configuration: Arc::new(configuration),
         })
     }
@@ -319,6 +328,9 @@ impl OpenApiClient {
                 .register_replay(spot_key(account, *symbol), &request(&[*symbol]))
                 .await?;
         }
+        self.subscriptions()
+            .spots
+            .extend(symbols.iter().map(|symbol| (account, *symbol)));
         Ok(())
     }
 
@@ -344,7 +356,56 @@ impl OpenApiClient {
                 .remove_replay(spot_key(account, *symbol))
                 .await?;
         }
+        let dropped: Vec<(SymbolId, Period)> = {
+            let mut subscriptions = self.subscriptions();
+            for symbol in symbols {
+                subscriptions.spots.remove(&(account, *symbol));
+            }
+            let dropped = subscriptions
+                .trendbars
+                .iter()
+                .filter(|(owner, symbol, _)| *owner == account && symbols.contains(symbol))
+                .map(|(_, symbol, period)| (*symbol, *period))
+                .collect();
+            subscriptions
+                .trendbars
+                .retain(|(owner, symbol, _)| *owner != account || !symbols.contains(symbol));
+            dropped
+        };
+        for (symbol, period) in dropped {
+            self.connection
+                .remove_replay(trendbar_key(account, symbol, period))
+                .await?;
+        }
         Ok(())
+    }
+
+    fn subscriptions(&self) -> MutexGuard<'_, Subscriptions> {
+        self.subscriptions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Tells whether this client holds the spot subscription of the symbol.
+    pub(crate) fn has_spots(&self, account: AccountId, symbol: SymbolId) -> bool {
+        self.subscriptions().spots.contains(&(account, symbol))
+    }
+
+    /// Records that the live bars of the symbol and period are subscribed, or no longer are.
+    pub(crate) fn track_trendbars(
+        &self,
+        account: AccountId,
+        symbol: SymbolId,
+        period: Period,
+        active: bool,
+    ) {
+        let key = (account, symbol, period);
+        let mut subscriptions = self.subscriptions();
+        if active {
+            subscriptions.trendbars.insert(key);
+        } else {
+            subscriptions.trendbars.remove(&key);
+        }
     }
 
     /// Asks the server for the version of the protocol it speaks.
