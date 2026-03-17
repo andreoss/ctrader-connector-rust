@@ -22,7 +22,9 @@ use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes,
     ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaVersionReq,
 };
+use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::SymbolsParams;
+use ctrader_connector::open_api::ticks::TickDataParams;
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
 use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message;
@@ -723,7 +725,8 @@ async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
     let (symbol, name) = quoting.unwrap_or_else(|| {
         panic!("none of {QUOTING_CANDIDATES:?} has a one minute bar in the last ten minutes; the markets may be closed")
     });
-    let range = TimeRange::ending_at(now, Duration::from_secs(6 * 3_600));
+    let settled = now.checked_sub(Duration::from_secs(120)).expect("moment");
+    let range = TimeRange::ending_at(settled, Duration::from_secs(6 * 3_600));
     let params = TrendbarsParams::new(account.id, symbol, Period::M1, range);
     let bars = client.trendbars(&params).await.expect("history");
     assert!(bars.len() > 60, "only {} bars in six hours", bars.len());
@@ -782,5 +785,61 @@ async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
         .unsubscribe_spots(account.id, &[symbol])
         .await
         .expect("end of spot subscription");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_tick_history_of_both_sides_falls_inside_the_range() {
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let range = TimeRange::ending_at(Timestamp::now(), Duration::from_secs(4 * 3_600));
+    let mut evidence = None;
+    for (symbol, name) in candidates(&client, &account).await {
+        let mut sides = Vec::new();
+        for side in [QuoteSide::Bid, QuoteSide::Ask] {
+            let params = TickDataParams::new(account.id, symbol, side, range);
+            let ticks = client.tick_data(&params).await.expect("tick history");
+            for tick in &ticks {
+                assert!(
+                    range.contains(tick.timestamp),
+                    "{side:?} tick outside {range:?}: {tick:?}"
+                );
+            }
+            assert!(
+                ticks
+                    .windows(2)
+                    .all(|pair| pair[0].timestamp <= pair[1].timestamp)
+            );
+            let latest = client.tick_data(&params.limit(25)).await.expect("ticks");
+            assert_eq!(
+                latest.as_slice(),
+                &ticks[ticks.len().saturating_sub(25)..],
+                "the latest ticks differ from the end of the whole range"
+            );
+            sides.push((side, ticks));
+        }
+        if sides.iter().all(|(_, ticks)| !ticks.is_empty()) {
+            evidence = Some((symbol, name, sides));
+            break;
+        }
+    }
+    let (symbol, name, sides) = evidence.unwrap_or_else(|| {
+        panic!("none of {QUOTING_CANDIDATES:?} has bid and ask ticks in the last four hours; the markets may be closed")
+    });
+    for (side, ticks) in &sides {
+        let (first, last) = (&ticks[0], &ticks[ticks.len() - 1]);
+        println!(
+            "live ticks: {} {side:?} ticks of {name} ({symbol}) in {}..{}; first {} at {}, last {} at {}",
+            ticks.len(),
+            range.from(),
+            range.to(),
+            first.price,
+            first.timestamp,
+            last.price,
+            last.timestamp,
+        );
+    }
+    let (bids, asks) = (&sides[0].1, &sides[1].1);
+    assert!(bids[bids.len() - 1].price < asks[asks.len() - 1].price);
     client.shutdown().await;
 }

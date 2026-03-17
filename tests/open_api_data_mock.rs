@@ -11,17 +11,18 @@ use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
-    ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
-    ProtoOaLightSymbol, ProtoOaSpotEvent, ProtoOaSubscribeDepthQuotesReq,
-    ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeLiveTrendbarReq,
-    ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq, ProtoOaSymbol, ProtoOaSymbolByIdReq,
-    ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes, ProtoOaTrendbar,
-    ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
-    ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
-    ProtoOaUnsubscribeSpotsReq,
+    ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
+    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaLightSymbol, ProtoOaSpotEvent,
+    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
+    ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
+    ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
+    ProtoOaSymbolsListRes, ProtoOaTickData, ProtoOaTrendbar, ProtoOaUnsubscribeDepthQuotesReq,
+    ProtoOaUnsubscribeDepthQuotesRes, ProtoOaUnsubscribeLiveTrendbarReq,
+    ProtoOaUnsubscribeLiveTrendbarRes, ProtoOaUnsubscribeSpotsReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{SymbolsParams, TradingMode};
+use ctrader_connector::open_api::ticks::TickDataParams;
 use ctrader_connector::open_api::transport::Plain;
 use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message as _;
@@ -841,5 +842,202 @@ async fn live_trendbars_follow_the_spot_subscription_and_close_at_the_last_bid()
         server.types_on(4)[2..],
         [SUBSCRIBE_SPOTS_REQ, SUBSCRIBE_LIVE_TRENDBAR_REQ]
     );
+    client.shutdown().await;
+}
+
+const GET_TICKDATA_REQ: u32 = 2145;
+const GET_TICKDATA_RES: u32 = 2146;
+const WEEK: i64 = 604_800_000;
+const TICKS_PER_RESPONSE: usize = 3;
+const TICK_TIMES: [i64; 9] = [
+    1_000,
+    2_000,
+    2_000,
+    3_000,
+    4_000,
+    5_000,
+    WEEK + 6_000,
+    3 * WEEK,
+    3 * WEEK + 500,
+];
+
+fn tick_price(side: i32, at: i64) -> i64 {
+    100_000 + i64::from(side) * 1_000 + (at / 500) % 50
+}
+
+fn tick_data(payload_type: u32, payload: &[u8]) -> Answer {
+    if payload_type != GET_TICKDATA_REQ {
+        return None;
+    }
+    let request = ProtoOaGetTickDataReq::decode(payload).ok()?;
+    if request.to_timestamp - request.from_timestamp > WEEK {
+        return refuse("INCORRECT_BOUNDARIES", "range too long");
+    }
+    let page = match request.symbol_id {
+        666 => return refuse("SYMBOL_NOT_FOUND", "unknown symbol"),
+        13 => vec![
+            ProtoOaTickData {
+                timestamp: 5,
+                tick: 1,
+            },
+            ProtoOaTickData {
+                timestamp: 0,
+                tick: -2,
+            },
+        ],
+        14 => {
+            return answer(
+                GET_TICKDATA_RES,
+                &ProtoOaGetTickDataRes {
+                    payload_type: None,
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                    tick_data: vec![ProtoOaTickData {
+                        timestamp: request.to_timestamp,
+                        tick: 7,
+                    }],
+                    has_more: true,
+                },
+            );
+        }
+        _ => Vec::new(),
+    };
+    if !page.is_empty() {
+        return answer(
+            GET_TICKDATA_RES,
+            &ProtoOaGetTickDataRes {
+                payload_type: None,
+                ctid_trader_account_id: request.ctid_trader_account_id,
+                tick_data: page,
+                has_more: false,
+            },
+        );
+    }
+    let matching: Vec<i64> = TICK_TIMES
+        .iter()
+        .rev()
+        .copied()
+        .filter(|at| *at >= request.from_timestamp && *at <= request.to_timestamp)
+        .collect();
+    let mut previous = (0, 0);
+    let tick_data = matching
+        .iter()
+        .take(TICKS_PER_RESPONSE)
+        .map(|at| {
+            let price = tick_price(request.r#type, *at);
+            let wire = ProtoOaTickData {
+                timestamp: at - previous.0,
+                tick: price - previous.1,
+            };
+            previous = (*at, price);
+            wire
+        })
+        .collect();
+    answer(
+        GET_TICKDATA_RES,
+        &ProtoOaGetTickDataRes {
+            payload_type: None,
+            ctid_trader_account_id: request.ctid_trader_account_id,
+            tick_data,
+            has_more: matching.len() > TICKS_PER_RESPONSE,
+        },
+    )
+}
+
+fn millis(from: i64, to: i64) -> TimeRange {
+    let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
+    TimeRange::new(at(from), at(to)).expect("range")
+}
+
+fn tick_requests(server: &MockServer) -> Vec<ProtoOaGetTickDataReq> {
+    server
+        .received()
+        .iter()
+        .filter(|message| message.payload_type == GET_TICKDATA_REQ)
+        .map(|message| ProtoOaGetTickDataReq::decode(message.payload.as_slice()).expect("request"))
+        .collect()
+}
+
+#[tokio::test]
+async fn tick_history_is_paged_split_by_week_and_decoded_in_order() {
+    let Session { server, client } = session(tick_data).await;
+    let range = millis(1_500, 3 * WEEK + 100);
+    let bids = TickDataParams::new(account(101), symbol(1), QuoteSide::Bid, range);
+    let ticks = client.tick_data(&bids).await.expect("ticks");
+    let seen: Vec<(i64, String)> = ticks
+        .iter()
+        .map(|tick| (tick.timestamp.as_millis(), tick.price.to_string()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (2_000, "1.01004".to_owned()),
+            (2_000, "1.01004".to_owned()),
+            (3_000, "1.01006".to_owned()),
+            (4_000, "1.01008".to_owned()),
+            (5_000, "1.01010".to_owned()),
+            (WEEK + 6_000, "1.01012".to_owned()),
+            (3 * WEEK, "1.01000".to_owned()),
+        ]
+    );
+    let requests = tick_requests(&server);
+    let spans: Vec<(i64, i64)> = requests
+        .iter()
+        .map(|request| (request.from_timestamp, request.to_timestamp))
+        .collect();
+    assert_eq!(
+        spans,
+        [
+            (2 * WEEK + 100, 3 * WEEK + 100),
+            (WEEK + 100, 2 * WEEK + 100),
+            (100 + 1_400, WEEK + 100),
+            (1_500, 3_000),
+        ]
+    );
+    assert!(requests.iter().all(|request| request.r#type == 1));
+    let asks = TickDataParams::new(account(101), symbol(1), QuoteSide::Ask, range).limit(2);
+    let latest = client.tick_data(&asks).await.expect("ticks");
+    assert_eq!(
+        latest
+            .iter()
+            .map(|tick| (tick.timestamp.as_millis(), tick.price.to_string()))
+            .collect::<Vec<_>>(),
+        [
+            (WEEK + 6_000, "1.02012".to_owned()),
+            (3 * WEEK, "1.02000".to_owned())
+        ]
+    );
+    let requests = tick_requests(&server);
+    assert_eq!(requests.len(), 6);
+    assert_eq!(requests[5].r#type, 2);
+    let none = TickDataParams::new(account(101), symbol(1), QuoteSide::Bid, range).limit(0);
+    assert!(client.tick_data(&none).await.expect("ticks").is_empty());
+    assert_eq!(server.count(GET_TICKDATA_REQ), 6);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_malformed_and_endless_tick_answers_end_the_request() {
+    let Session { server, client } = session(tick_data).await;
+    let params =
+        |id| TickDataParams::new(account(101), symbol(id), QuoteSide::Bid, millis(100, 200));
+    assert_eq!(
+        server_code(client.tick_data(&params(666)).await),
+        Some(ErrorCode::SymbolNotFound)
+    );
+    assert_eq!(
+        client.tick_data(&params(13)).await,
+        Err(ConnectorError::Value(ValueError::OutOfRange {
+            kind: "tick price"
+        }))
+    );
+    let stuck = client.tick_data(&params(14)).await.expect("ticks");
+    assert_eq!(
+        stuck
+            .iter()
+            .map(|tick| tick.timestamp.as_millis())
+            .collect::<Vec<_>>(),
+        [200]
+    );
+    assert_eq!(server.count(GET_TICKDATA_REQ), 4);
     client.shutdown().await;
 }
