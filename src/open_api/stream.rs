@@ -36,18 +36,19 @@ impl Feed {
         }
     }
 
-    /// Waits for the next event; events skipped by a reader that fell behind are passed over.
+    /// Waits for the next event.
+    ///
+    /// A reader that fell so far behind that events were dropped unread is told so once, with
+    /// [`ConnectorError::Lagged`], and then goes on with the oldest event still held.
     pub(crate) async fn next(&mut self) -> Result<Event, ConnectorError> {
-        loop {
-            tokio::select! {
-                biased;
-                event = self.events.recv() => match event {
-                    Ok(event) => return Ok(event),
-                    Err(RecvError::Lagged(_)) => {}
-                    Err(RecvError::Closed) => return Err(ConnectorError::Closed),
-                },
-                () = self.connection.closed() => return Err(ConnectorError::Closed),
-            }
+        tokio::select! {
+            biased;
+            event = self.events.recv() => match event {
+                Ok(event) => Ok(event),
+                Err(RecvError::Lagged(skipped)) => Err(ConnectorError::Lagged { skipped }),
+                Err(RecvError::Closed) => Err(ConnectorError::Closed),
+            },
+            () = self.connection.closed() => Err(ConnectorError::Closed),
         }
     }
 }

@@ -307,6 +307,13 @@ fn span_millis(span: Duration) -> i64 {
 /// The subscription behind the stream is restored after a reconnection. The last bid the stream
 /// has seen is forgotten the moment the loss of the connection is reported, so a bar from after
 /// the loss never closes at a bid from before it.
+///
+/// A stream that is read too slowly loses events: the connection holds a limited number of
+/// them, set with
+/// [`ConnectionOptions::event_capacity`](crate::open_api::connection::ConnectionOptions::event_capacity).
+/// The loss is reported once by [`TrendbarStream::next`] with [`ConnectorError::Lagged`] and
+/// the last bid is forgotten, so no bar closes at a bid older than the loss. The stream stays
+/// usable.
 #[derive(Debug)]
 pub struct TrendbarStream {
     client: OpenApiClient,
@@ -344,12 +351,21 @@ impl TrendbarStream {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectorError::Closed`] when the connection is shut down and
-    /// [`ConnectorError::Value`] when the server sends a value out of range.
+    /// Returns [`ConnectorError::Closed`] when the connection is shut down,
+    /// [`ConnectorError::Lagged`] when events were dropped because the stream was read too
+    /// slowly, and [`ConnectorError::Value`] when the server sends a value out of range.
     pub async fn next(&mut self) -> Result<Trendbar, ConnectorError> {
         let period = i32::from(self.period.wire());
         loop {
-            let event = self.feed.next().await?;
+            let event = match self.feed.next().await {
+                Ok(event) => event,
+                Err(error) => {
+                    if matches!(error, ConnectorError::Lagged { .. }) {
+                        self.bid = None;
+                    }
+                    return Err(error);
+                }
+            };
             if starts_replay(&event) {
                 self.bid = None;
                 continue;

@@ -32,6 +32,7 @@ use support::{
     MockOptions, MockServer, REFRESH_TOKEN, Responder, SPOT_EVENT, SUBSCRIBE_SPOTS_REQ,
     UNSUBSCRIBE_SPOTS_REQ, answer, envelope, refuse,
 };
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
 const ASSET_LIST_REQ: u32 = 2112;
@@ -50,6 +51,13 @@ fn symbol(id: i64) -> SymbolId {
 }
 
 async fn session(responder: impl Fn(u32, &[u8]) -> Answer + Send + Sync + 'static) -> Session {
+    session_with(responder, |options| options).await
+}
+
+async fn session_with(
+    responder: impl Fn(u32, &[u8]) -> Answer + Send + Sync + 'static,
+    adjust: impl FnOnce(ConnectionOptions) -> ConnectionOptions,
+) -> Session {
     let server = MockServer::start(MockOptions {
         responder: Some(Responder::new(responder)),
         ..MockOptions::default()
@@ -66,7 +74,7 @@ async fn session(responder: impl Fn(u32, &[u8]) -> Answer + Send + Sync + 'stati
         .reconnect_delay(Duration::from_millis(40))
         .build()
         .expect("configuration");
-    let options = ConnectionOptions::from(&configuration).historical_limit(50);
+    let options = adjust(ConnectionOptions::from(&configuration).historical_limit(50));
     let client = OpenApiClient::connect_with(configuration, Plain, options)
         .await
         .expect("client");
@@ -940,6 +948,146 @@ async fn live_trendbars_follow_the_spot_subscription_and_close_at_the_last_bid()
         server.types_on(4)[2..],
         [SUBSCRIBE_SPOTS_REQ, SUBSCRIBE_LIVE_TRENDBAR_REQ]
     );
+    client.shutdown().await;
+}
+
+const EVENT_CAPACITY: usize = 8;
+const FLOOD: u64 = 24;
+
+async fn flooded(server: &MockServer, client: &OpenApiClient, tail: [ProtoMessage; 2]) {
+    let mut watch = client.events();
+    for id in 0..FLOOD - 2 {
+        server.push(depth(
+            101,
+            1,
+            vec![level(100 + id, Some(108_400), None)],
+            Vec::new(),
+        ));
+    }
+    for message in tail {
+        server.push(message);
+    }
+    let mut seen = 0_u64;
+    soon("the flood reaches the client", async {
+        while seen < FLOOD {
+            match watch.recv().await {
+                Ok(_) => seen += 1,
+                Err(RecvError::Lagged(skipped)) => seen += skipped,
+                Err(RecvError::Closed) => panic!("connection closed"),
+            }
+        }
+    })
+    .await;
+}
+
+fn skipped<T: std::fmt::Debug>(outcome: Result<T, ConnectorError>) -> u64 {
+    match outcome {
+        Err(ConnectorError::Lagged { skipped }) => skipped,
+        other => panic!("expected the loss to be reported, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reader_that_falls_behind_is_told_and_its_stream_drops_what_it_knew() {
+    let Session { server, client } = session_with(
+        |payload_type, payload| {
+            depth_subscriptions(payload_type, payload)
+                .or_else(|| trendbar_data(payload_type, payload))
+        },
+        |options| options.event_capacity(EVENT_CAPACITY),
+    )
+    .await;
+    let mut quotes = client
+        .subscribe_quotes(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    let mut book = client
+        .subscribe_depth(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    let mut bars = client
+        .subscribe_live_trendbars(account(101), symbol(1), Period::M1)
+        .await
+        .expect("subscription");
+    let mut raw = client.events();
+    server.push(depth(
+        101,
+        1,
+        vec![level(1, None, Some(108_520)), level(2, Some(108_500), None)],
+        Vec::new(),
+    ));
+    server.push(spot_with_bars(1, Some(100_008), vec![live_bar(1, 100_001)]));
+    let known = soon("quote", quotes.next()).await.expect("quote");
+    assert_eq!(known.bid, "1.00008".parse().ok());
+    soon("update", book.next()).await.expect("update");
+    assert_eq!(book.book(symbol(1)).map(DepthBook::len), Some(2));
+    let bar = soon("bar", bars.next()).await.expect("bar");
+    assert_eq!(bar.close.to_string(), "1.00008");
+    let late = FLOOD - u64::try_from(EVENT_CAPACITY).expect("capacity");
+    flooded(
+        &server,
+        &client,
+        [
+            depth(101, 1, Vec::new(), vec![1]),
+            spot_with_bars(1, None, vec![live_bar(1, 100_004)]),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        raw.recv().await,
+        Err(RecvError::Lagged(lost)) if lost == late + 2
+    ));
+    assert!(raw.recv().await.is_ok());
+
+    assert_eq!(skipped(soon("lag", quotes.next()).await), late);
+    assert_eq!(quotes.last(symbol(1)), None);
+    let partial = soon("quote after the lag", quotes.next())
+        .await
+        .expect("quote");
+    assert_eq!((partial.bid, partial.ask), (None, "0.00001".parse().ok()));
+
+    assert_eq!(skipped(soon("lag", bars.next()).await), late);
+    server.push(spot_with_bars(1, Some(100_030), vec![live_bar(1, 100_005)]));
+    let bar = soon("bar after the lag", bars.next()).await.expect("bar");
+    assert_eq!(bar.low.to_string(), "1.00005");
+    assert_eq!(bar.close.to_string(), "1.00030");
+
+    assert_eq!(skipped(soon("lag", book.next()).await), late + 2);
+    assert!(book.is_stale());
+    assert!(book.book(symbol(1)).is_none());
+    let unapplied = soon("change after the lag", book.next())
+        .await
+        .expect("update");
+    assert_eq!(unapplied.new_quotes.len(), 1);
+    assert!(book.book(symbol(1)).is_none());
+    server.precede(
+        SUBSCRIBE_DEPTH_REQ,
+        vec![depth(
+            101,
+            1,
+            vec![level(7, Some(108_490), None), level(8, None, Some(108_510))],
+            Vec::new(),
+        )],
+    );
+    let sent = (
+        server.count(UNSUBSCRIBE_DEPTH_REQ),
+        server.count(SUBSCRIBE_DEPTH_REQ),
+    );
+    book.resync().await.expect("fresh subscription");
+    assert_eq!(
+        (
+            server.count(UNSUBSCRIBE_DEPTH_REQ),
+            server.count(SUBSCRIBE_DEPTH_REQ)
+        ),
+        (sent.0 + 1, sent.1 + 1)
+    );
+    assert!(!book.is_stale());
+    let snapshot = soon("fresh depth", book.next()).await.expect("update");
+    assert_eq!(snapshot.new_quotes.len(), 2);
+    let fresh = book.book(symbol(1)).expect("book");
+    assert_eq!(fresh.len(), 2);
+    assert_eq!(fresh.best_bid(), "1.08490".parse().ok());
+    assert_eq!(fresh.best_ask(), "1.08510".parse().ok());
     client.shutdown().await;
 }
 

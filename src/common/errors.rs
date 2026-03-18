@@ -413,6 +413,12 @@ pub enum ConnectorError {
     /// The connection is shut down and accepts no further requests.
     #[error("connection is shut down")]
     Closed,
+    /// A reader of the events of the connection fell behind and events were dropped unread.
+    #[error("{skipped} events were dropped because their reader fell behind")]
+    Lagged {
+        /// Number of events dropped unread.
+        skipped: u64,
+    },
     /// The server answered with a message of another type than the request calls for.
     #[error("expected payload type {expected}, received {received}")]
     UnexpectedResponse {
@@ -570,6 +576,10 @@ mod tests {
         assert_eq!(
             TransportError::Closed.to_string(),
             "connection closed by the peer"
+        );
+        assert_eq!(
+            ConnectorError::Lagged { skipped: 3 }.to_string(),
+            "3 events were dropped because their reader fell behind"
         );
     }
 }

@@ -216,6 +216,15 @@ fn depth_key(account: AccountId, symbol: SymbolId) -> ReplayKey {
 /// the moment the loss of the connection is reported, which is before anything the server sends
 /// for the restored subscription, so the whole depth the server then sends anew builds them
 /// afresh.
+///
+/// A stream that is read too slowly loses events: the connection holds a limited number of
+/// them, set with
+/// [`ConnectionOptions::event_capacity`](crate::open_api::connection::ConnectionOptions::event_capacity).
+/// A book that missed a change is wrong and cannot be repaired from later changes, so the loss
+/// is reported once by [`DepthStream::next`] with [`ConnectorError::Lagged`] and the books are
+/// dropped. From then on [`DepthStream::book`] returns nothing and the changes the stream goes
+/// on to deliver are not applied, until the server sends the whole depth anew: after
+/// [`DepthStream::resync`], or after a reconnection the stream has read from its start.
 #[derive(Debug)]
 pub struct DepthStream {
     client: OpenApiClient,
@@ -223,6 +232,7 @@ pub struct DepthStream {
     account: AccountId,
     symbols: BTreeSet<SymbolId>,
     books: BTreeMap<SymbolId, DepthBook>,
+    stale: bool,
 }
 
 impl DepthStream {
@@ -238,9 +248,44 @@ impl DepthStream {
     }
 
     /// Returns the book of the symbol as of the last change the stream delivered.
+    ///
+    /// Returns nothing before the first change of the symbol, and for every symbol from the
+    /// moment [`DepthStream::next`] reports [`ConnectorError::Lagged`] until the whole depth has
+    /// been sent anew.
     #[must_use]
     pub fn book(&self, symbol: SymbolId) -> Option<&DepthBook> {
         self.books.get(&symbol)
+    }
+
+    /// Tells whether the books are withheld because changes were lost; see
+    /// [`DepthStream::resync`].
+    #[must_use]
+    pub const fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Subscribes to the depth of the symbols of the stream anew, so that the server sends the
+    /// whole depth again and the books are valid from the first change delivered afterwards.
+    ///
+    /// The subscription is ended and requested again, and the changes that were waiting to be
+    /// read are discarded. Meant to be called after [`DepthStream::next`] has reported
+    /// [`ConnectorError::Lagged`].
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`OpenApiClient::unsubscribe_depth`] and [`OpenApiClient::subscribe_depth`];
+    /// the books stay withheld then.
+    pub async fn resync(&mut self) -> Result<(), ConnectorError> {
+        let symbols: Vec<SymbolId> = self.symbols.iter().copied().collect();
+        self.stale = true;
+        self.books.clear();
+        self.client
+            .unsubscribe_depth(self.account, &symbols)
+            .await?;
+        self.feed = Feed::new(self.client.connection());
+        self.client.request_depth(self.account, &symbols).await?;
+        self.stale = false;
+        Ok(())
     }
 
     /// Waits for the next change of the depth of one of the symbols and applies it to the book
@@ -248,13 +293,24 @@ impl DepthStream {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectorError::Closed`] when the connection is shut down and
-    /// [`ConnectorError::Value`] when the server sends a value out of range.
+    /// Returns [`ConnectorError::Closed`] when the connection is shut down,
+    /// [`ConnectorError::Lagged`] when changes were dropped because the stream was read too
+    /// slowly, and [`ConnectorError::Value`] when the server sends a value out of range.
     pub async fn next(&mut self) -> Result<DepthUpdate, ConnectorError> {
         loop {
-            let event = self.feed.next().await?;
+            let event = match self.feed.next().await {
+                Ok(event) => event,
+                Err(error) => {
+                    if matches!(error, ConnectorError::Lagged { .. }) {
+                        self.books.clear();
+                        self.stale = true;
+                    }
+                    return Err(error);
+                }
+            };
             if starts_replay(&event) {
                 self.books.clear();
+                self.stale = false;
                 continue;
             }
             let Some(depth) = event.decode::<ProtoOaDepthEvent>() else {
@@ -272,7 +328,9 @@ impl DepthStream {
                 continue;
             };
             let update = DepthUpdate::parse(symbol, depth)?;
-            self.books.entry(symbol).or_default().apply(&update);
+            if !self.stale {
+                self.books.entry(symbol).or_default().apply(&update);
+            }
             return Ok(update);
         }
     }
@@ -311,7 +369,17 @@ impl OpenApiClient {
             account,
             symbols: symbols.iter().copied().collect(),
             books: BTreeMap::new(),
+            stale: false,
         };
+        self.request_depth(account, symbols).await?;
+        Ok(stream)
+    }
+
+    async fn request_depth(
+        &self,
+        account: AccountId,
+        symbols: &[SymbolId],
+    ) -> Result<(), ConnectorError> {
         let request = |symbols: &[SymbolId]| ProtoOaSubscribeDepthQuotesReq {
             payload_type: None,
             ctid_trader_account_id: account.get(),
@@ -323,7 +391,7 @@ impl OpenApiClient {
                 .register_replay(depth_key(account, *symbol), &request(&[*symbol]))
                 .await?;
         }
-        Ok(stream)
+        Ok(())
     }
 
     /// Ends the subscription to the market depth of the given symbols.

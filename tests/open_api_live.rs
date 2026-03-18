@@ -19,7 +19,7 @@ use ctrader_connector::common::ids::SymbolId;
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
-use ctrader_connector::open_api::depth::DepthUpdate;
+use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
     ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaVersionReq,
@@ -701,8 +701,36 @@ async fn live_depth_updates_rebuild_a_book_with_bids_below_asks() {
     assert!(book.best_bid() < book.best_ask(), "crossed book: {book:?}");
     assert!(bids.windows(2).all(|pair| pair[0].price >= pair[1].price));
     assert!(asks.windows(2).all(|pair| pair[0].price <= pair[1].price));
+    depth.resync().await.expect("fresh subscription");
+    fresh_depth(&mut depth).await;
     depth.unsubscribe().await.expect("end of subscription");
     client.shutdown().await;
+}
+
+async fn fresh_depth(depth: &mut DepthStream) {
+    let window = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut seen = BTreeSet::new();
+    loop {
+        let first = tokio::time::timeout_at(window, depth.next())
+            .await
+            .expect("whole depth of a symbol within 30 s of the fresh subscription")
+            .expect("depth update");
+        if !seen.insert(first.symbol) {
+            continue;
+        }
+        let entries = depth.book(first.symbol).map_or(0, DepthBook::len);
+        println!(
+            "live depth resync: the first update of {} carries {} new and {} deleted quotes; its book holds {entries} entries",
+            first.symbol,
+            first.new_quotes.len(),
+            first.deleted_quotes.len(),
+        );
+        assert!(first.deleted_quotes.is_empty());
+        assert_eq!(entries, first.new_quotes.len());
+        if entries > 0 {
+            break;
+        }
+    }
 }
 
 #[tokio::test]

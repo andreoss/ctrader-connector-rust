@@ -92,6 +92,13 @@ impl Quote {
 /// without further calls. The last known prices are forgotten the moment the loss of the
 /// connection is reported, so a price from before the loss is never combined with one from
 /// after it.
+///
+/// A stream that is read too slowly loses events: the connection holds a limited number of
+/// them, set with
+/// [`ConnectionOptions::event_capacity`](crate::open_api::connection::ConnectionOptions::event_capacity).
+/// The loss is reported once by [`QuoteStream::next`] with [`ConnectorError::Lagged`] and the
+/// last known prices are forgotten, so a quote delivered afterwards carries only sides the
+/// server has sent since. The stream stays usable.
 #[derive(Debug)]
 pub struct QuoteStream {
     client: OpenApiClient,
@@ -133,11 +140,20 @@ impl QuoteStream {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectorError::Closed`] when the connection is shut down and
-    /// [`ConnectorError::Value`] when the server sends a value out of range.
+    /// Returns [`ConnectorError::Closed`] when the connection is shut down,
+    /// [`ConnectorError::Lagged`] when events were dropped because the stream was read too
+    /// slowly, and [`ConnectorError::Value`] when the server sends a value out of range.
     pub async fn next(&mut self) -> Result<Quote, ConnectorError> {
         loop {
-            let event = self.feed.next().await?;
+            let event = match self.feed.next().await {
+                Ok(event) => event,
+                Err(error) => {
+                    if matches!(error, ConnectorError::Lagged { .. }) {
+                        self.last.clear();
+                    }
+                    return Err(error);
+                }
+            };
             if starts_replay(&event) {
                 self.last.clear();
                 continue;
