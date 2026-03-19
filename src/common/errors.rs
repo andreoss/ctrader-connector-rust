@@ -338,6 +338,12 @@ pub enum TransportError {
     /// The connection was not established in time.
     #[error("connecting timed out after {0:?}")]
     ConnectTimeout(Duration),
+    /// A write to the socket did not complete in time.
+    #[error("writing timed out after {0:?}")]
+    WriteTimeout(Duration),
+    /// The peer sent nothing, not even a heartbeat, for the time allowed.
+    #[error("nothing was received for {0:?}")]
+    Idle(Duration),
     /// A frame is longer than the limit.
     #[error("frame of {length} bytes exceeds the limit of {limit} bytes")]
     FrameTooLong {
@@ -576,6 +582,14 @@ mod tests {
         assert_eq!(
             TransportError::Closed.to_string(),
             "connection closed by the peer"
+        );
+        assert_eq!(
+            TransportError::WriteTimeout(Duration::from_secs(10)).to_string(),
+            "writing timed out after 10s"
+        );
+        assert_eq!(
+            TransportError::Idle(Duration::from_secs(40)).to_string(),
+            "nothing was received for 40s"
         );
         assert_eq!(
             ConnectorError::Lagged { skipped: 3 }.to_string(),

@@ -216,6 +216,145 @@ async fn heartbeats_are_sent_while_the_connection_is_idle() {
     .await;
 }
 
+const SILENCE: Duration = Duration::from_millis(300);
+
+async fn beating(server: &MockServer, options: ConnectionOptions) -> Connection {
+    let connection = open(
+        server,
+        options.heartbeat_interval(Duration::from_millis(40)),
+    )
+    .await;
+    let application = application_auth(CLIENT_SECRET);
+    connection.request(&application).await.expect("application");
+    connection
+        .register_replay(key(ReplayStage::Application, "application"), &application)
+        .await
+        .expect("registration");
+    connection
+}
+
+#[tokio::test]
+async fn a_peer_that_goes_silent_is_given_up_and_the_connection_is_restored() {
+    let server = MockServer::start(MockOptions {
+        echo_heartbeats: true,
+        ..MockOptions::default()
+    })
+    .await;
+    let connection = beating(&server, options().inbound_timeout(SILENCE)).await;
+    let mut events = connection.events();
+    tokio::time::sleep(SILENCE * 2).await;
+    assert!(connection.stats().heartbeats_received >= 3);
+    assert_eq!(connection.stats().reconnects, 0);
+    assert!(events.try_recv().is_err());
+    server.stall();
+    let stalled = tokio::time::Instant::now();
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Idle(SILENCE))
+    );
+    assert!(stalled.elapsed() < SILENCE * 3);
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    connection
+        .request(&ProtoOaVersionReq::default())
+        .await
+        .expect("request on the restored connection");
+    assert_eq!(server.connections(), 2);
+    server.stall();
+    timeout(Duration::from_secs(2), connection.shutdown())
+        .await
+        .expect("shutdown in time");
+}
+
+#[tokio::test]
+async fn a_peer_that_never_speaks_is_given_up_after_the_default_period() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let brief = Duration::from_millis(100);
+    let connection = open(
+        &server,
+        options()
+            .timeout(brief)
+            .heartbeat_interval(Duration::from_millis(40)),
+    )
+    .await;
+    let mut events = connection.events();
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Idle(Duration::from_millis(220)))
+    );
+    connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_write_to_a_peer_that_stopped_reading_times_out_and_shutdown_completes() {
+    let server = MockServer::start(MockOptions {
+        echo_heartbeats: true,
+        ..MockOptions::default()
+    })
+    .await;
+    let limit = Duration::from_millis(300);
+    let connection = beating(
+        &server,
+        options()
+            .timeout(limit)
+            .inbound_timeout(Duration::from_secs(30)),
+    )
+    .await;
+    let mut events = connection.events();
+    server.stall();
+    let writes = flood(&connection);
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::WriteTimeout(limit))
+    );
+    let outcomes = finished(writes).await;
+    assert!(outcomes.iter().all(Result::is_err));
+    assert!(outcomes.contains(&Err(ConnectorError::Transport(
+        TransportError::WriteTimeout(limit)
+    ))));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    connection
+        .request(&ProtoOaVersionReq::default())
+        .await
+        .expect("request on the restored connection");
+    server.stall();
+    let writes = flood(&connection);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    timeout(Duration::from_secs(2), connection.shutdown())
+        .await
+        .expect("shutdown in time");
+    assert!(finished(writes).await.iter().all(Result::is_err));
+}
+
+type Write = tokio::task::JoinHandle<Result<(), ConnectorError>>;
+
+fn flood(connection: &Connection) -> Vec<Write> {
+    (0..6)
+        .map(|_| {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .request_message(VERSION_REQ, vec![0; 8 << 20])
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .collect()
+}
+
+async fn finished(writes: Vec<Write>) -> Vec<Result<(), ConnectorError>> {
+    let mut outcomes = Vec::with_capacity(writes.len());
+    for write in writes {
+        outcomes.push(write.await.expect("write task"));
+    }
+    outcomes
+}
+
 #[tokio::test]
 async fn unanswered_request_times_out() {
     let server = MockServer::start(MockOptions {

@@ -204,16 +204,21 @@ async fn live_concurrent_requests_and_heartbeats_over_an_idle_period() {
     println!("live concurrent requests: versions {versions:?} account counts {counts:?}");
     assert!(versions.iter().all(|text| !text.is_empty()));
     assert!(counts.iter().all(|count| *count == counts[0] && *count > 0));
-    let idle = Duration::from_secs(33);
+    let idle = Duration::from_secs(45);
     tokio::time::sleep(idle).await;
     let stats = connection.stats();
+    assert!(stats.heartbeats_received >= 1);
+    assert_eq!(
+        stats.reconnects, 0,
+        "an idle connection must outlast the period of silence allowed by default"
+    );
     let after = timeout(STEP, connection.request(&version))
         .await
         .expect("reply in time")
         .expect("request after idling");
     println!(
-        "live idle {idle:?}: heartbeats sent {} received {} then version {}",
-        stats.heartbeats_sent, stats.heartbeats_received, after.version
+        "live idle {idle:?}: heartbeats sent {} received {} reconnects {} then version {}",
+        stats.heartbeats_sent, stats.heartbeats_received, stats.reconnects, after.version
     );
     assert!(stats.heartbeats_sent >= 3);
     connection.shutdown().await;

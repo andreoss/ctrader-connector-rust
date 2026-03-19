@@ -6,6 +6,12 @@
 //! [`Event`]s. The task sends a heartbeat whenever nothing was written for the heartbeat
 //! interval, which keeps the server from closing an idle connection.
 //!
+//! Deadlines: nothing the task waits for on the socket is open-ended. A write that does not
+//! complete within the time allowed for a response fails with
+//! [`TransportError::WriteTimeout`], and a server that sends nothing at all, not even a
+//! heartbeat, for the period set with [`ConnectionOptions::inbound_timeout`] fails the
+//! connection with [`TransportError::Idle`]. Both count as a loss of the connection.
+//!
 //! Backpressure: the command channel is bounded, so callers wait while the task is busy, and the
 //! event stream is a bounded broadcast, so a subscriber that falls behind skips the oldest
 //! events instead of stalling the task.
@@ -68,6 +74,8 @@ pub const RECONNECT_DELAY_LIMIT: Duration = Duration::from_secs(60);
 
 const SHORTEST_INTERVAL: Duration = Duration::from_millis(1);
 
+const SILENT_INTERVALS: u32 = 3;
+
 macro_rules! log_debug {
     ($($argument:tt)*) => {{
         #[cfg(feature = "logging")]
@@ -89,6 +97,7 @@ pub struct ConnectionOptions {
     historical_limit: u32,
     retries: u32,
     backoff: Duration,
+    inbound_timeout: Option<Duration>,
 }
 
 impl Default for ConnectionOptions {
@@ -104,6 +113,7 @@ impl Default for ConnectionOptions {
             historical_limit: HISTORICAL_LIMIT,
             retries: DEFAULT_RETRIES,
             backoff: DEFAULT_BACKOFF,
+            inbound_timeout: None,
         }
     }
 }
@@ -195,6 +205,29 @@ impl ConnectionOptions {
     pub fn backoff(mut self, backoff: Duration) -> Self {
         self.backoff = backoff.max(SHORTEST_INTERVAL);
         self
+    }
+
+    /// Sets how long the server may stay silent before the connection counts as lost.
+    ///
+    /// Every frame the server sends, heartbeats included, starts the period anew. When it runs
+    /// out the task reports [`Event::Disconnected`] with [`TransportError::Idle`] and connects
+    /// again. Left unset, the period is three heartbeat intervals plus the time allowed for a
+    /// response, 40 seconds with the defaults: the server sends a heartbeat of its own every
+    /// 30 seconds on a connection that is otherwise quiet, so a shorter period would give up
+    /// connections that are in order.
+    ///
+    /// A duration below one millisecond is raised to one millisecond.
+    pub fn inbound_timeout(mut self, period: Duration) -> Self {
+        self.inbound_timeout = Some(period.max(SHORTEST_INTERVAL));
+        self
+    }
+
+    fn silence(&self) -> Duration {
+        self.inbound_timeout.unwrap_or_else(|| {
+            self.heartbeat_interval
+                .saturating_mul(SILENT_INTERVALS)
+                .saturating_add(self.timeout)
+        })
     }
 }
 
@@ -371,6 +404,7 @@ impl Connection {
             host: host.to_owned(),
             port,
             heartbeat_at: Instant::now() + options.heartbeat_interval,
+            silent_at: Instant::now() + options.silence(),
             options,
             commands: receiver,
             events: events.clone(),
@@ -555,6 +589,7 @@ struct Actor<C: Connect> {
     send_at: Option<Instant>,
     next_id: u64,
     heartbeat_at: Instant,
+    silent_at: Instant,
 }
 
 impl<C: Connect> Actor<C> {
@@ -564,7 +599,7 @@ impl<C: Connect> Actor<C> {
                 Exit::Shutdown => break ConnectorError::Closed,
                 Exit::Lost(reason) => {
                     log_debug!(%reason, "connection lost");
-                    framed.close().await;
+                    close(&mut framed, self.options.timeout).await;
                     self.fail_in_flight(&ConnectorError::Transport(reason.clone()));
                     let _ = self.events.send(Event::Disconnected(reason.clone()));
                     match self.reconnect(reason).await {
@@ -575,7 +610,7 @@ impl<C: Connect> Actor<C> {
             }
         };
         self.fail_all(&error);
-        framed.close().await;
+        close(&mut framed, self.options.timeout).await;
     }
 
     async fn reconnect(
@@ -625,6 +660,7 @@ impl<C: Connect> Actor<C> {
                             .extend(std::iter::repeat_n(Instant::now(), seeded));
                     }
                     self.heartbeat_at = Instant::now() + self.options.heartbeat_interval;
+                    self.silent_at = Instant::now() + self.options.silence();
                     let _ = self.events.send(Event::Reconnected { attempt });
                     return Ok(framed);
                 }
@@ -649,7 +685,7 @@ impl<C: Connect> Actor<C> {
             let capacity = self.options.command_capacity;
             tokio::select! {
                 incoming = framed.receive() => match incoming {
-                    Ok(message) => self.dispatch(message),
+                    Ok(message) => self.heard(message),
                     Err(reason) => return Exit::Lost(reason),
                 },
                 command = self.commands.recv(), if self.queue.len() < capacity => match command {
@@ -667,8 +703,13 @@ impl<C: Connect> Actor<C> {
         }
     }
 
+    fn heard(&mut self, message: ProtoMessage) {
+        self.silent_at = Instant::now() + self.options.silence();
+        self.dispatch(message);
+    }
+
     fn next_wake(&self) -> Instant {
-        let mut wake = self.heartbeat_at;
+        let mut wake = self.heartbeat_at.min(self.silent_at);
         if let Some((deadline, _)) = self.deadlines.front() {
             wake = wake.min(*deadline);
         }
@@ -726,7 +767,7 @@ impl<C: Connect> Actor<C> {
                 payload: Some(outbound.payload.clone()),
                 client_msg_id: Some(id.clone()),
             };
-            match framed.send(&message).await {
+            match write(framed, &message, self.options.timeout).await {
                 Ok(()) => {
                     bump(&self.counters.requests_sent);
                     if let Some(throttle) = self.throttles.get_mut(usize::from(outbound.historical))
@@ -762,10 +803,16 @@ impl<C: Connect> Actor<C> {
                     .send(Err(ConnectorError::Timeout(self.options.timeout)));
             }
         }
+        if now >= self.silent_at {
+            let silence = self.options.silence();
+            let late = timeout(Duration::ZERO, framed.receive())
+                .await
+                .unwrap_or(Err(TransportError::Idle(silence)));
+            self.heard(late?);
+        }
         if now >= self.heartbeat_at {
-            framed
-                .send(&ProtoHeartbeatEvent::default().to_message(None))
-                .await?;
+            let beat = ProtoHeartbeatEvent::default().to_message(None);
+            write(framed, &beat, self.options.timeout).await?;
             bump(&self.counters.heartbeats_sent);
             self.heartbeat_at = Instant::now() + self.options.heartbeat_interval;
         }
@@ -875,6 +922,20 @@ fn store(replays: &mut Replays, key: ReplayKey, stored: Option<Stored>) {
     }
 }
 
+async fn write<S: AsyncRead + AsyncWrite + Unpin>(
+    framed: &mut Framed<S>,
+    message: &ProtoMessage,
+    limit: Duration,
+) -> Result<(), TransportError> {
+    timeout(limit, framed.send(message))
+        .await
+        .unwrap_or(Err(TransportError::WriteTimeout(limit)))
+}
+
+async fn close<S: AsyncRead + AsyncWrite + Unpin>(framed: &mut Framed<S>, limit: Duration) {
+    let _ = timeout(limit, framed.close()).await;
+}
+
 async fn hold<F: Future>(
     commands: &mut mpsc::Receiver<Command>,
     replays: &mut Replays,
@@ -914,7 +975,7 @@ async fn restore<C: Connect>(
             payload: Some(stored.payload),
             client_msg_id: Some(id.clone()),
         };
-        framed.send(&message).await?;
+        write(&mut framed, &message, limit).await?;
         let failure = match timeout(limit, answer_to(&mut framed, &id, events)).await {
             Ok(answer) => outcome(answer?).err(),
             Err(_) => Some(ConnectorError::Timeout(limit)),
@@ -992,6 +1053,23 @@ mod tests {
                 .reconnect_delay(Duration::from_secs(2))
                 .retries(7)
                 .backoff(Duration::from_millis(250))
+        );
+    }
+
+    #[test]
+    fn silence_allowed_follows_the_heartbeat_interval_unless_it_is_set() {
+        assert_eq!(ConnectionOptions::new().silence(), Duration::from_secs(40));
+        let quick = ConnectionOptions::new()
+            .heartbeat_interval(Duration::from_secs(2))
+            .timeout(Duration::from_secs(1));
+        assert_eq!(quick.silence(), Duration::from_secs(7));
+        assert_eq!(
+            quick.clone().inbound_timeout(Duration::ZERO).silence(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            quick.inbound_timeout(Duration::from_secs(90)).silence(),
+            Duration::from_secs(90)
         );
     }
 

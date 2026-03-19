@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ctrader_connector::open_api::messages::{
-    ProtoErrorRes, ProtoMessage, ProtoOaAccountAuthReq, ProtoOaAccountAuthRes,
+    ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaAccountAuthReq, ProtoOaAccountAuthRes,
     ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaCtidTraderAccount,
     ProtoOaErrorRes, ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetAccountListByAccessTokenRes,
     ProtoOaRefreshTokenReq, ProtoOaRefreshTokenRes, ProtoOaSpotEvent, ProtoOaSubscribeSpotsReq,
@@ -56,6 +56,7 @@ pub struct MockOptions {
     pub reverse_batch: usize,
     pub silent: Vec<u32>,
     pub responder: Option<Responder>,
+    pub echo_heartbeats: bool,
 }
 
 impl Default for MockOptions {
@@ -66,6 +67,7 @@ impl Default for MockOptions {
             reverse_batch: 0,
             silent: Vec::new(),
             responder: None,
+            echo_heartbeats: false,
         }
     }
 }
@@ -114,6 +116,7 @@ pub struct Received {
 enum Control {
     Drop,
     Push(ProtoMessage),
+    Stall,
 }
 
 #[derive(Debug)]
@@ -262,6 +265,12 @@ impl MockServer {
         let _ = self.controls.send(Control::Drop);
     }
 
+    /// Makes the connections open now stop reading and writing while their sockets stay open;
+    /// connections accepted afterwards are served as usual.
+    pub fn stall(&self) {
+        let _ = self.controls.send(Control::Stall);
+    }
+
     pub fn push(&self, message: ProtoMessage) {
         let _ = self.controls.send(Control::Push(message));
     }
@@ -333,6 +342,10 @@ async fn serve(
                         break;
                     }
                 }
+                Ok(Control::Stall) => {
+                    while matches!(controls.recv().await, Ok(Control::Push(_) | Control::Stall)) {}
+                    break;
+                }
                 Ok(Control::Drop) | Err(_) => break,
             },
         }
@@ -375,6 +388,9 @@ impl State {
             payload_type: message.payload_type,
             payload: payload.clone(),
         });
+        if message.payload_type == HEARTBEAT && self.options.echo_heartbeats {
+            return vec![envelope(HEARTBEAT, &ProtoHeartbeatEvent::default(), None)];
+        }
         if message.payload_type == HEARTBEAT || self.options.silent.contains(&message.payload_type)
         {
             return Vec::new();
