@@ -1042,6 +1042,72 @@ async fn refused_and_unanswered_replays_are_reported_and_removed_ones_are_not_se
 }
 
 #[tokio::test]
+async fn a_replay_removed_while_the_connection_is_restored_is_not_sent() {
+    let server = MockServer::start(MockOptions {
+        silent: vec![VERSION_REQ],
+        ..MockOptions::default()
+    })
+    .await;
+    let limit = Duration::from_millis(300);
+    let connection = open(&server, options().timeout(limit)).await;
+    let application = application_auth(CLIENT_SECRET);
+    connection.request(&application).await.expect("application");
+    let slow = key(ReplayStage::Subscription, "a-slow");
+    let removed = key(ReplayStage::Subscription, "b-removed");
+    let added = key(ReplayStage::Subscription, "c-added");
+    connection
+        .register_replay(key(ReplayStage::Application, "application"), &application)
+        .await
+        .expect("registration");
+    connection
+        .register_replay(slow.clone(), &ProtoOaVersionReq::default())
+        .await
+        .expect("registration");
+    connection
+        .register_replay(removed.clone(), &account_list())
+        .await
+        .expect("registration");
+    let mut events = connection.events();
+    connection.force_reconnect().await.expect("reconnection");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    eventually("the slow replay under way", || {
+        server.types_on(2).contains(&VERSION_REQ)
+    })
+    .await;
+    connection.remove_replay(removed).await.expect("removal");
+    connection
+        .register_replay(
+            added,
+            &ProtoOaSubscribeSpotsReq {
+                ctid_trader_account_id: 101,
+                symbol_id: vec![1],
+                ..ProtoOaSubscribeSpotsReq::default()
+            },
+        )
+        .await
+        .expect("registration");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ReplayFailed {
+            key: slow,
+            error: ConnectorError::Timeout(limit),
+        }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    assert_eq!(
+        server.types_on(2),
+        vec![APPLICATION_AUTH_REQ, VERSION_REQ, SUBSCRIBE_SPOTS_REQ]
+    );
+    connection.shutdown().await;
+}
+
+#[tokio::test]
 async fn accounts_are_authorised_with_the_refreshed_token_after_a_reconnection() {
     let server = MockServer::start(MockOptions::default()).await;
     let client = client(builder(&server)).await;

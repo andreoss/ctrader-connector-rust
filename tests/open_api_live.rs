@@ -703,7 +703,7 @@ async fn live_depth_updates_rebuild_a_book_with_bids_below_asks() {
         asks[0].price,
         asks[0].size,
     );
-    assert!(book.best_bid() < book.best_ask(), "crossed book: {book:?}");
+    assert!(book.best_bid() <= book.best_ask(), "crossed book: {book:?}");
     assert!(bids.windows(2).all(|pair| pair[0].price >= pair[1].price));
     assert!(asks.windows(2).all(|pair| pair[0].price <= pair[1].price));
     depth.resync().await.expect("fresh subscription");

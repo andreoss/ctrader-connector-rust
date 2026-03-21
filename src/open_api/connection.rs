@@ -25,8 +25,9 @@
 //! [`Event::Disconnected`] and connects again, waiting twice as long before every further
 //! attempt. Once connected it sends the registered requests again in the order of their
 //! [`ReplayStage`] (application, accounts, subscriptions) and then reports
-//! [`Event::Reconnected`]. Requests made while the connection is down fail at once with the
-//! reason of the loss.
+//! [`Event::Reconnected`]. The registered requests are read one at a time, each just before it
+//! is sent, so a registration removed meanwhile is not replayed and one added meanwhile is.
+//! Requests made while the connection is down fail at once with the reason of the loss.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -344,7 +345,7 @@ impl ReplayKey {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Stored {
     payload_type: u32,
     payload: Vec<u8>,
@@ -480,7 +481,9 @@ impl Connection {
 
     /// Registers a request to be sent again, under `key`, after every reconnection.
     ///
-    /// The request is not sent now. Requests are replayed in the order of their keys.
+    /// The request is not sent now. Requests are replayed in the order of their keys. A request
+    /// registered or replaced while the connection is being restored is replayed before
+    /// [`Event::Reconnected`] is reported.
     ///
     /// # Errors
     ///
@@ -498,6 +501,12 @@ impl Connection {
     }
 
     /// Forgets the request registered under `key`.
+    ///
+    /// While the connection is being restored the registered requests are looked up one at a
+    /// time, each just before it is sent, so a request removed before its turn is not replayed.
+    /// A request that was replayed already stays in force on the server: the task knows no
+    /// request that would withdraw it, which is left to the caller once
+    /// [`Event::Reconnected`] is reported.
     ///
     /// # Errors
     ///
@@ -632,24 +641,8 @@ impl<C: Connect> Actor<C> {
             attempt = attempt.saturating_add(1);
             hold(&mut self.commands, &mut self.replays, &last, sleep(delay)).await?;
             delay = delay.saturating_mul(2).min(longest);
-            let replays: Vec<(ReplayKey, Stored)> = self
-                .replays
-                .iter()
-                .map(|(key, stored)| (key.clone(), stored.clone()))
-                .collect();
-            let replays_sent = replays.len();
-            let spacing = LIMIT_WINDOW / self.options.request_limit;
-            let work = restore(
-                &self.connector,
-                &self.host,
-                self.port,
-                self.options.timeout,
-                spacing,
-                replays,
-                &self.events,
-            );
-            match hold(&mut self.commands, &mut self.replays, &last, work).await? {
-                Ok(framed) => {
+            match self.restore(&last).await? {
+                Ok((framed, replays_sent)) => {
                     log_debug!(attempt, "reconnected");
                     bump(&self.counters.reconnects);
                     let seeded = replays_sent
@@ -673,6 +666,43 @@ impl<C: Connect> Actor<C> {
                     last = reason;
                 }
             }
+        }
+    }
+
+    async fn restore(
+        &mut self,
+        reason: &TransportError,
+    ) -> Result<Result<(Framed<C::Stream>, usize), TransportError>, ConnectorError> {
+        let limit = self.options.timeout;
+        let spacing = LIMIT_WINDOW / self.options.request_limit;
+        let connect = self.connector.connect(&self.host, self.port);
+        let mut framed = match hold(&mut self.commands, &mut self.replays, reason, connect).await? {
+            Ok(stream) => Framed::new(stream),
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let mut sent = Replays::new();
+        loop {
+            let next = self
+                .replays
+                .iter()
+                .find(|(key, stored)| sent.get(*key) != Some(*stored))
+                .map(|(key, stored)| (key.clone(), stored.clone()));
+            let Some((key, stored)) = next else {
+                return Ok(Ok((framed, sent.len())));
+            };
+            sent.insert(key.clone(), stored.clone());
+            let id = format!("replay-{}", sent.len());
+            let step = Box::pin(replay(&mut framed, id, key, stored, limit, &self.events));
+            if let Err(reason) = hold(&mut self.commands, &mut self.replays, reason, step).await? {
+                return Ok(Err(reason));
+            }
+            hold(
+                &mut self.commands,
+                &mut self.replays,
+                reason,
+                sleep(spacing),
+            )
+            .await?;
         }
     }
 
@@ -958,35 +988,29 @@ async fn hold<F: Future>(
     }
 }
 
-async fn restore<C: Connect>(
-    connector: &C,
-    host: &str,
-    port: u16,
+async fn replay<S: AsyncRead + AsyncWrite + Unpin>(
+    framed: &mut Framed<S>,
+    id: String,
+    key: ReplayKey,
+    stored: Stored,
     limit: Duration,
-    spacing: Duration,
-    replays: Vec<(ReplayKey, Stored)>,
     events: &broadcast::Sender<Event>,
-) -> Result<Framed<C::Stream>, TransportError> {
-    let mut framed = Framed::new(connector.connect(host, port).await?);
-    for (index, (key, stored)) in replays.into_iter().enumerate() {
-        let id = format!("replay-{index}");
-        let message = ProtoMessage {
-            payload_type: stored.payload_type,
-            payload: Some(stored.payload),
-            client_msg_id: Some(id.clone()),
-        };
-        write(&mut framed, &message, limit).await?;
-        let failure = match timeout(limit, answer_to(&mut framed, &id, events)).await {
-            Ok(answer) => outcome(answer?).err(),
-            Err(_) => Some(ConnectorError::Timeout(limit)),
-        };
-        if let Some(error) = failure {
-            log_debug!(%error, "replayed request failed");
-            let _ = events.send(Event::ReplayFailed { key, error });
-        }
-        sleep(spacing).await;
+) -> Result<(), TransportError> {
+    let message = ProtoMessage {
+        payload_type: stored.payload_type,
+        payload: Some(stored.payload),
+        client_msg_id: Some(id.clone()),
+    };
+    write(framed, &message, limit).await?;
+    let failure = match timeout(limit, answer_to(framed, &id, events)).await {
+        Ok(answer) => outcome(answer?).err(),
+        Err(_) => Some(ConnectorError::Timeout(limit)),
+    };
+    if let Some(error) = failure {
+        log_debug!(%error, "replayed request failed");
+        let _ = events.send(Event::ReplayFailed { key, error });
     }
-    Ok(framed)
+    Ok(())
 }
 
 async fn answer_to<S: AsyncRead + AsyncWrite + Unpin>(
