@@ -1107,6 +1107,8 @@ const TICK_TIMES: [i64; 9] = [
     3 * WEEK + 500,
 ];
 
+const CROWDED_TICK_TIMES: [i64; 9] = [900, 1_000, 1_000, 1_000, 1_000, 1_000, 1_100, 1_200, 1_300];
+
 fn tick_price(side: i32, at: i64) -> i64 {
     100_000 + i64::from(side) * 1_000 + (at / 500) % 50
 }
@@ -1145,6 +1147,17 @@ fn tick_data(payload_type: u32, payload: &[u8]) -> Answer {
                 },
             );
         }
+        16 => {
+            return answer(
+                GET_TICKDATA_RES,
+                &ProtoOaGetTickDataRes {
+                    payload_type: None,
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                    tick_data: Vec::new(),
+                    has_more: true,
+                },
+            );
+        }
         _ => Vec::new(),
     };
     if !page.is_empty() {
@@ -1158,7 +1171,12 @@ fn tick_data(payload_type: u32, payload: &[u8]) -> Answer {
             },
         );
     }
-    let matching: Vec<i64> = TICK_TIMES
+    let times: &[i64] = if request.symbol_id == 15 {
+        &CROWDED_TICK_TIMES
+    } else {
+        &TICK_TIMES
+    };
+    let matching: Vec<i64> = times
         .iter()
         .rev()
         .copied()
@@ -1276,14 +1294,54 @@ async fn refused_malformed_and_endless_tick_answers_end_the_request() {
             kind: "tick price"
         }))
     );
-    let stuck = client.tick_data(&params(14)).await.expect("ticks");
+    let brief = TickDataParams::new(account(101), symbol(14), QuoteSide::Bid, millis(100, 102));
+    let stuck = client.tick_data(&brief).await.expect("ticks");
     assert_eq!(
         stuck
             .iter()
             .map(|tick| tick.timestamp.as_millis())
             .collect::<Vec<_>>(),
-        [200]
+        [100, 101, 102]
     );
-    assert_eq!(server.count(GET_TICKDATA_REQ), 4);
+    assert_eq!(server.count(GET_TICKDATA_REQ), 7);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn ticks_older_than_a_crowded_millisecond_are_still_fetched() {
+    let Session { server, client } = session(tick_data).await;
+    let crowded = TickDataParams::new(account(101), symbol(15), QuoteSide::Bid, millis(500, 2_000));
+    let ticks = client.tick_data(&crowded).await.expect("ticks");
+    assert_eq!(
+        ticks
+            .iter()
+            .map(|tick| tick.timestamp.as_millis())
+            .collect::<Vec<_>>(),
+        [900, 1_000, 1_000, 1_100, 1_200, 1_300]
+    );
+    let spans: Vec<(i64, i64)> = tick_requests(&server)
+        .iter()
+        .map(|request| (request.from_timestamp, request.to_timestamp))
+        .collect();
+    assert_eq!(
+        spans,
+        [(500, 2_000), (500, 1_100), (500, 1_000), (500, 999)]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn more_ticks_announced_but_never_sent_are_a_typed_error() {
+    let Session { server, client } = session(tick_data).await;
+    let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
+    let hollow = TickDataParams::new(account(101), symbol(16), QuoteSide::Bid, millis(500, 2_000));
+    assert_eq!(
+        client.tick_data(&hollow).await,
+        Err(ConnectorError::Incomplete {
+            from: at(500),
+            to: at(2_000)
+        })
+    );
+    assert_eq!(server.count(GET_TICKDATA_REQ), 1);
     client.shutdown().await;
 }

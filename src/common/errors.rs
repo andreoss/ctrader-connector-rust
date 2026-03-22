@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 
 use crate::common::ids::AccountId;
+use crate::common::time::Timestamp;
 
 /// Reasons a configuration is rejected before any connection is attempted.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -425,6 +426,15 @@ pub enum ConnectorError {
         /// Number of events dropped unread.
         skipped: u64,
     },
+    /// The server announced more historical data than it sent and sent none of the rest when
+    /// asked, so the data between the two moments, both included, is missing.
+    #[error("the server announced more data between {from} and {to} but sent none")]
+    Incomplete {
+        /// Start of the part that is missing.
+        from: Timestamp,
+        /// End of the part that is missing.
+        to: Timestamp,
+    },
     /// The server answered with a message of another type than the request calls for.
     #[error("expected payload type {expected}, received {received}")]
     UnexpectedResponse {
@@ -444,6 +454,7 @@ mod tests {
 
     use super::{ConfigError, ConnectorError, ErrorCode, ServerError, TransportError, ValueError};
     use crate::common::ids::AccountId;
+    use crate::common::time::Timestamp;
     use crate::proto_text;
 
     fn proto_codes(name: &str) -> Vec<String> {
@@ -590,6 +601,15 @@ mod tests {
         assert_eq!(
             TransportError::Idle(Duration::from_secs(40)).to_string(),
             "nothing was received for 40s"
+        );
+        let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
+        assert_eq!(
+            ConnectorError::Incomplete {
+                from: at(5),
+                to: at(9)
+            }
+            .to_string(),
+            "the server announced more data between 5 and 9 but sent none"
         );
         assert_eq!(
             ConnectorError::Lagged { skipped: 3 }.to_string(),

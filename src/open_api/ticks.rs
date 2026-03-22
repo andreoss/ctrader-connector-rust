@@ -153,12 +153,16 @@ impl OpenApiClient {
     /// [`TickDataParams::MAX_RANGE`] per request. A longer or busier range is fetched with
     /// several requests, latest part first, each of which counts against the limit for
     /// historical data. Of several ticks that share the millisecond at which one answer ends
-    /// and the next begins, only those of the later answer are returned.
+    /// and the next begins, only those of the later answer are returned. When such a
+    /// millisecond holds so many ticks that an answer brings nothing older, the next request
+    /// ends one millisecond earlier, so the older ticks of the range are fetched all the same.
     ///
     /// # Errors
     ///
     /// Returns [`ConnectorError::Server`] when the server refuses a request,
-    /// [`ConnectorError::Value`] when a tick carries a value out of range, and the errors of
+    /// [`ConnectorError::Value`] when a tick carries a value out of range,
+    /// [`ConnectorError::Incomplete`] when the server announces more ticks but sends none of
+    /// them, in which case no part of the range is returned, and the errors of
     /// [`Connection::request`](crate::open_api::connection::Connection::request) otherwise.
     pub async fn tick_data(&self, params: &TickDataParams) -> Result<Vec<Tick>, ConnectorError> {
         let from = params.range.from().as_millis();
@@ -166,8 +170,13 @@ impl OpenApiClient {
         let wanted = params.limit.unwrap_or(usize::MAX);
         let mut bound = to.saturating_add(1);
         let mut ticks: Vec<Tick> = Vec::new();
+        let mut stepped = false;
         while bound > from && ticks.len() < wanted {
-            let end = bound.min(to);
+            let end = if stepped {
+                bound.saturating_sub(1)
+            } else {
+                bound.min(to)
+            };
             let start = end.saturating_sub(MAX_RANGE_MILLIS).max(from);
             let request = ProtoOaGetTickDataReq {
                 payload_type: None,
@@ -187,11 +196,20 @@ impl OpenApiClient {
                     ticks.push(tick);
                 }
             }
-            bound = if response.has_more && ticks.len() > known {
-                oldest
+            if !response.has_more {
+                bound = start;
+                stepped = false;
+            } else if ticks.len() > known {
+                bound = oldest;
+                stepped = false;
+            } else if end == bound {
+                stepped = true;
             } else {
-                start
-            };
+                return Err(ConnectorError::Incomplete {
+                    from: Timestamp::from_millis(start)?,
+                    to: Timestamp::from_millis(end)?,
+                });
+            }
         }
         ticks.sort_by_key(|tick| std::cmp::Reverse(tick.timestamp));
         ticks.truncate(wanted);
