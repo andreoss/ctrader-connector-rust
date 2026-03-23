@@ -78,7 +78,13 @@ pub const RECONNECT_DELAY_LIMIT: Duration = Duration::from_secs(60);
 
 const SHORTEST_INTERVAL: Duration = Duration::from_millis(1);
 
-const SILENT_INTERVALS: u32 = 3;
+/// Pause between two heartbeats the server sends on a connection that is otherwise quiet.
+pub const SERVER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Silence of the server after which the connection counts as lost unless another period is
+/// set: two and a half times [`SERVER_HEARTBEAT_INTERVAL`], so one heartbeat of the server may
+/// go missing, and the next one be late by half an interval, before a connection is given up.
+pub const DEFAULT_INBOUND_TIMEOUT: Duration = Duration::from_secs(75);
 
 const LONGEST_WAIT: Duration = Duration::from_secs(30 * 365 * 86_400);
 
@@ -217,10 +223,12 @@ impl ConnectionOptions {
     ///
     /// Every frame the server sends, heartbeats included, starts the period anew. When it runs
     /// out the task reports [`Event::Disconnected`] with [`TransportError::Idle`] and connects
-    /// again. Left unset, the period is three heartbeat intervals plus the time allowed for a
-    /// response, 40 seconds with the defaults: the server sends a heartbeat of its own every
-    /// 30 seconds on a connection that is otherwise quiet, so a shorter period would give up
-    /// connections that are in order.
+    /// again. Left unset, the period is [`DEFAULT_INBOUND_TIMEOUT`]. It follows from the pace of
+    /// the server alone, which sends a heartbeat of its own every
+    /// [`SERVER_HEARTBEAT_INTERVAL`] on a connection that is otherwise quiet, and from nothing
+    /// the client is set to do: neither the heartbeat interval nor the time allowed for a
+    /// response changes it. A period shorter than the pace of the server gives up connections
+    /// that are in order.
     ///
     /// A duration below one millisecond is raised to one millisecond. [`Duration::MAX`] turns
     /// the watch off: the server may then stay silent for as long as it likes.
@@ -230,11 +238,7 @@ impl ConnectionOptions {
     }
 
     fn silence(&self) -> Duration {
-        self.inbound_timeout.unwrap_or_else(|| {
-            self.heartbeat_interval
-                .saturating_mul(SILENT_INTERVALS)
-                .saturating_add(self.timeout)
-        })
+        self.inbound_timeout.unwrap_or(DEFAULT_INBOUND_TIMEOUT)
     }
 }
 
@@ -1058,8 +1062,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectionOptions, Event, LIMIT_WINDOW, LONGEST_WAIT, ReplayKey, ReplayStage, Throttle,
-        after, outcome, over_limit,
+        ConnectionOptions, DEFAULT_INBOUND_TIMEOUT, Event, LIMIT_WINDOW, LONGEST_WAIT, ReplayKey,
+        ReplayStage, SERVER_HEARTBEAT_INTERVAL, Throttle, after, outcome, over_limit,
     };
     use crate::common::config::ConfigurationOpenApi;
     use crate::common::errors::{ConnectorError, ErrorCode, TransportError};
@@ -1093,12 +1097,14 @@ mod tests {
     }
 
     #[test]
-    fn silence_allowed_follows_the_heartbeat_interval_unless_it_is_set() {
-        assert_eq!(ConnectionOptions::new().silence(), Duration::from_secs(40));
+    fn silence_allowed_follows_the_pace_of_the_server_unless_it_is_set() {
+        assert_eq!(DEFAULT_INBOUND_TIMEOUT, Duration::from_secs(75));
+        assert!(DEFAULT_INBOUND_TIMEOUT >= SERVER_HEARTBEAT_INTERVAL * 2);
+        assert_eq!(ConnectionOptions::new().silence(), DEFAULT_INBOUND_TIMEOUT);
         let quick = ConnectionOptions::new()
             .heartbeat_interval(Duration::from_secs(2))
             .timeout(Duration::from_secs(1));
-        assert_eq!(quick.silence(), Duration::from_secs(7));
+        assert_eq!(quick.silence(), DEFAULT_INBOUND_TIMEOUT);
         assert_eq!(
             quick.clone().inbound_timeout(Duration::ZERO).silence(),
             Duration::from_millis(1)
@@ -1237,7 +1243,7 @@ mod tests {
         let options = ConnectionOptions::new()
             .timeout(Duration::MAX)
             .heartbeat_interval(Duration::MAX);
-        assert_eq!(options.silence(), Duration::MAX);
+        assert_eq!(options.silence(), DEFAULT_INBOUND_TIMEOUT);
         assert_eq!(
             options.inbound_timeout(Duration::MAX).silence(),
             Duration::MAX

@@ -9,7 +9,8 @@ use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError, T
 use ctrader_connector::common::ids::{AccountId, SymbolId};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{
-    Connection, ConnectionOptions, Event, ReplayKey, ReplayStage,
+    Connection, ConnectionOptions, DEFAULT_INBOUND_TIMEOUT, Event, ReplayKey, ReplayStage,
+    SERVER_HEARTBEAT_INTERVAL,
 };
 use ctrader_connector::open_api::messages::{
     ProtoHeartbeatEvent, ProtoOaAccountAuthReq, ProtoOaApplicationAuthReq,
@@ -269,21 +270,63 @@ async fn a_peer_that_goes_silent_is_given_up_and_the_connection_is_restored() {
 }
 
 #[tokio::test]
+async fn a_quiet_server_beating_every_thirty_seconds_is_kept_whatever_the_client_sends() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(&server, options()).await;
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application");
+    let mut events = connection.events();
+    tokio::time::pause();
+    for beat in 1..=6_u64 {
+        tokio::time::sleep(SERVER_HEARTBEAT_INTERVAL).await;
+        server.push(envelope(HEARTBEAT, &ProtoHeartbeatEvent::default(), None));
+        eventually("server heartbeat counted", || {
+            connection.stats().heartbeats_received == beat
+        })
+        .await;
+    }
+    let stats = connection.stats();
+    assert!(stats.heartbeats_sent >= 30, "{stats:?}");
+    assert_eq!(stats.reconnects, 0);
+    assert!(events.try_recv().is_err());
+    assert_eq!(server.connections(), 1);
+    tokio::time::sleep(DEFAULT_INBOUND_TIMEOUT - Duration::from_secs(1)).await;
+    assert!(events.try_recv().is_err());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        events.try_recv(),
+        Ok(Event::Disconnected(TransportError::Idle(
+            DEFAULT_INBOUND_TIMEOUT
+        )))
+    );
+    tokio::time::resume();
+    connection.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_peer_that_never_speaks_is_given_up_after_the_default_period() {
     let server = MockServer::start(MockOptions::default()).await;
-    let brief = Duration::from_millis(100);
     let connection = open(
         &server,
         options()
-            .timeout(brief)
-            .heartbeat_interval(Duration::from_millis(40)),
+            .timeout(Duration::from_millis(100))
+            .heartbeat_interval(Duration::from_secs(1)),
     )
     .await;
     let mut events = connection.events();
+    tokio::time::pause();
+    tokio::time::sleep(DEFAULT_INBOUND_TIMEOUT - Duration::from_secs(1)).await;
+    assert!(events.try_recv().is_err());
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
-        next_event(&mut events).await,
-        Event::Disconnected(TransportError::Idle(Duration::from_millis(220)))
+        events.try_recv(),
+        Ok(Event::Disconnected(TransportError::Idle(
+            DEFAULT_INBOUND_TIMEOUT
+        )))
     );
+    tokio::time::resume();
     connection.shutdown().await;
 }
 
