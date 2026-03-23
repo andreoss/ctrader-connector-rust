@@ -149,66 +149,69 @@ fn decode(page: &[ProtoOaTickData]) -> Result<Vec<Tick>, ValueError> {
 impl OpenApiClient {
     /// Fetches the ticks of one side of a symbol inside a range of time, oldest first.
     ///
-    /// The server answers with a limited number of ticks per request and accepts at most
-    /// [`TickDataParams::MAX_RANGE`] per request. A longer or busier range is fetched with
-    /// several requests, latest part first, each of which counts against the limit for
-    /// historical data. Of several ticks that share the millisecond at which one answer ends
-    /// and the next begins, only those of the later answer are returned. When such a
-    /// millisecond holds so many ticks that an answer brings nothing older, the next request
-    /// ends one millisecond earlier, so the older ticks of the range are fetched all the same.
+    /// Both ends of the range are included. On the wire a request covers the milliseconds from
+    /// `fromTimestamp` up to, but not including, `toTimestamp`, so every request ends one
+    /// millisecond after the last one it asks for.
+    ///
+    /// The server answers with a limited number of ticks per request, latest first, and accepts
+    /// at most [`TickDataParams::MAX_RANGE`] per request. A longer or busier range is fetched
+    /// with several requests, latest part first, each of which counts against the limit for
+    /// historical data. An answer that announces more ticks may have cut its oldest
+    /// millisecond short, so the ticks it brought of that millisecond are set aside and the
+    /// next request ends with that millisecond, which is then taken whole from the answer to
+    /// it. Every tick of the range is thus returned, and returned once. With a limit the
+    /// latest ticks are returned; which of several ticks sharing the oldest millisecond
+    /// returned are left out is not defined.
     ///
     /// # Errors
     ///
     /// Returns [`ConnectorError::Server`] when the server refuses a request,
-    /// [`ConnectorError::Value`] when a tick carries a value out of range,
-    /// [`ConnectorError::Incomplete`] when the server announces more ticks but sends none of
-    /// them, in which case no part of the range is returned, and the errors of
+    /// [`ConnectorError::Value`] when a tick carries a value out of range or the range ends at
+    /// the last moment a timestamp can name, [`ConnectorError::Incomplete`] when the server
+    /// announces more ticks than it sends and the rest cannot be asked for, either because the
+    /// answer is empty or because all of it lies inside the millisecond the request ends with,
+    /// in which case no part of the range is returned, and the errors of
     /// [`Connection::request`](crate::open_api::connection::Connection::request) otherwise.
     pub async fn tick_data(&self, params: &TickDataParams) -> Result<Vec<Tick>, ConnectorError> {
         let from = params.range.from().as_millis();
-        let to = params.range.to().as_millis();
         let wanted = params.limit.unwrap_or(usize::MAX);
-        let mut bound = to.saturating_add(1);
+        let mut end = params.range.to().as_millis();
         let mut ticks: Vec<Tick> = Vec::new();
-        let mut stepped = false;
-        while bound > from && ticks.len() < wanted {
-            let end = if stepped {
-                bound.saturating_sub(1)
-            } else {
-                bound.min(to)
-            };
-            let start = end.saturating_sub(MAX_RANGE_MILLIS).max(from);
+        while ticks.len() < wanted {
+            let start = end.saturating_sub(MAX_RANGE_MILLIS - 1).max(from);
             let request = ProtoOaGetTickDataReq {
                 payload_type: None,
                 ctid_trader_account_id: params.account.get(),
                 symbol_id: params.symbol.get(),
                 r#type: i32::from(wire_side(params.side)),
                 from_timestamp: start,
-                to_timestamp: end,
+                to_timestamp: end.checked_add(1).ok_or(ValueError::OutOfRange {
+                    kind: TICK_TIMESTAMP,
+                })?,
             };
             let response = self.connection().request(&request).await?;
-            let known = ticks.len();
-            let mut oldest = bound;
-            for tick in decode(&response.tick_data)? {
-                let millis = tick.timestamp.as_millis();
-                if millis >= from && millis < bound {
-                    oldest = oldest.min(millis);
-                    ticks.push(tick);
-                }
-            }
-            if !response.has_more {
-                bound = start;
-                stepped = false;
-            } else if ticks.len() > known {
-                bound = oldest;
-                stepped = false;
-            } else if end == bound {
-                stepped = true;
+            let mut page = decode(&response.tick_data)?;
+            page.retain(|tick| (start..=end).contains(&tick.timestamp.as_millis()));
+            let last = if response.has_more {
+                let oldest = page.iter().map(|tick| tick.timestamp.as_millis()).min();
+                let Some(oldest) = oldest.filter(|oldest| *oldest < end) else {
+                    return Err(ConnectorError::Incomplete {
+                        from: Timestamp::from_millis(start)?,
+                        to: Timestamp::from_millis(end)?,
+                    });
+                };
+                page.retain(|tick| tick.timestamp.as_millis() > oldest);
+                end = oldest;
+                false
+            } else if start > from {
+                end = start.saturating_sub(1);
+                false
             } else {
-                return Err(ConnectorError::Incomplete {
-                    from: Timestamp::from_millis(start)?,
-                    to: Timestamp::from_millis(end)?,
-                });
+                true
+            };
+            ticks.append(&mut page);
+            if last {
+                break;
             }
         }
         ticks.sort_by_key(|tick| std::cmp::Reverse(tick.timestamp));

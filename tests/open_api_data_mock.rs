@@ -23,7 +23,7 @@ use ctrader_connector::open_api::messages::{
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{SymbolsParams, TradingMode};
-use ctrader_connector::open_api::ticks::TickDataParams;
+use ctrader_connector::open_api::ticks::{Tick, TickDataParams};
 use ctrader_connector::open_api::transport::Plain;
 use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message as _;
@@ -1109,6 +1109,8 @@ const TICK_TIMES: [i64; 9] = [
 
 const CROWDED_TICK_TIMES: [i64; 9] = [900, 1_000, 1_000, 1_000, 1_000, 1_000, 1_100, 1_200, 1_300];
 
+const SPLIT_TICK_TIMES: [i64; 5] = [900, 1_000, 1_000, 1_100, 1_200];
+
 fn tick_price(side: i32, at: i64) -> i64 {
     100_000 + i64::from(side) * 1_000 + (at / 500) % 50
 }
@@ -1140,7 +1142,7 @@ fn tick_data(payload_type: u32, payload: &[u8]) -> Answer {
                     payload_type: None,
                     ctid_trader_account_id: request.ctid_trader_account_id,
                     tick_data: vec![ProtoOaTickData {
-                        timestamp: request.to_timestamp,
+                        timestamp: request.to_timestamp - 1,
                         tick: 7,
                     }],
                     has_more: true,
@@ -1171,16 +1173,16 @@ fn tick_data(payload_type: u32, payload: &[u8]) -> Answer {
             },
         );
     }
-    let times: &[i64] = if request.symbol_id == 15 {
-        &CROWDED_TICK_TIMES
-    } else {
-        &TICK_TIMES
+    let times: &[i64] = match request.symbol_id {
+        15 => &CROWDED_TICK_TIMES,
+        17 => &SPLIT_TICK_TIMES,
+        _ => &TICK_TIMES,
     };
     let matching: Vec<i64> = times
         .iter()
         .rev()
         .copied()
-        .filter(|at| *at >= request.from_timestamp && *at <= request.to_timestamp)
+        .filter(|at| *at >= request.from_timestamp && *at < request.to_timestamp)
         .collect();
     let mut previous = (0, 0);
     let tick_data = matching
@@ -1251,10 +1253,10 @@ async fn tick_history_is_paged_split_by_week_and_decoded_in_order() {
     assert_eq!(
         spans,
         [
-            (2 * WEEK + 100, 3 * WEEK + 100),
-            (WEEK + 100, 2 * WEEK + 100),
-            (100 + 1_400, WEEK + 100),
-            (1_500, 3_000),
+            (2 * WEEK + 101, 3 * WEEK + 101),
+            (WEEK + 101, 2 * WEEK + 101),
+            (1_500, WEEK + 101),
+            (1_500, 3_001),
         ]
     );
     assert!(requests.iter().all(|request| request.r#type == 1));
@@ -1282,6 +1284,7 @@ async fn tick_history_is_paged_split_by_week_and_decoded_in_order() {
 #[tokio::test]
 async fn refused_malformed_and_endless_tick_answers_end_the_request() {
     let Session { server, client } = session(tick_data).await;
+    let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
     let params =
         |id| TickDataParams::new(account(101), symbol(id), QuoteSide::Bid, millis(100, 200));
     assert_eq!(
@@ -1295,37 +1298,76 @@ async fn refused_malformed_and_endless_tick_answers_end_the_request() {
         }))
     );
     let brief = TickDataParams::new(account(101), symbol(14), QuoteSide::Bid, millis(100, 102));
-    let stuck = client.tick_data(&brief).await.expect("ticks");
     assert_eq!(
-        stuck
-            .iter()
-            .map(|tick| tick.timestamp.as_millis())
-            .collect::<Vec<_>>(),
-        [100, 101, 102]
+        client.tick_data(&brief).await,
+        Err(ConnectorError::Incomplete {
+            from: at(100),
+            to: at(102)
+        })
     );
-    assert_eq!(server.count(GET_TICKDATA_REQ), 7);
+    assert_eq!(server.count(GET_TICKDATA_REQ), 3);
+    let endless = millis(i64::MAX - 5, i64::MAX);
+    let last = TickDataParams::new(account(101), symbol(1), QuoteSide::Bid, endless);
+    assert_eq!(
+        client.tick_data(&last).await,
+        Err(ConnectorError::Value(ValueError::OutOfRange {
+            kind: "tick timestamp"
+        }))
+    );
+    assert_eq!(server.count(GET_TICKDATA_REQ), 3);
+    client.shutdown().await;
+}
+
+fn tick_times(ticks: &[Tick]) -> Vec<i64> {
+    ticks
+        .iter()
+        .map(|tick| tick.timestamp.as_millis())
+        .collect()
+}
+
+fn tick_spans(server: &MockServer) -> Vec<(i64, i64)> {
+    tick_requests(server)
+        .iter()
+        .map(|request| (request.from_timestamp, request.to_timestamp))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_millisecond_split_between_two_answers_is_returned_whole_and_once() {
+    let Session { server, client } = session(tick_data).await;
+    let split = TickDataParams::new(account(101), symbol(17), QuoteSide::Bid, millis(500, 2_000));
+    let ticks = client.tick_data(&split).await.expect("ticks");
+    assert_eq!(tick_times(&ticks), SPLIT_TICK_TIMES);
+    assert_eq!(tick_spans(&server), [(500, 2_001), (500, 1_001)]);
+    let edges = TickDataParams::new(
+        account(101),
+        symbol(17),
+        QuoteSide::Bid,
+        millis(1_000, 1_200),
+    );
+    let ticks = client.tick_data(&edges).await.expect("ticks");
+    assert_eq!(tick_times(&ticks), [1_000, 1_000, 1_100, 1_200]);
+    assert_eq!(tick_spans(&server)[2..], [(1_000, 1_201), (1_000, 1_001)]);
+    let latest = client.tick_data(&split.limit(3)).await.expect("ticks");
+    assert_eq!(tick_times(&latest), [1_000, 1_100, 1_200]);
     client.shutdown().await;
 }
 
 #[tokio::test]
-async fn ticks_older_than_a_crowded_millisecond_are_still_fetched() {
+async fn a_millisecond_holding_more_ticks_than_an_answer_is_a_typed_error() {
     let Session { server, client } = session(tick_data).await;
+    let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
     let crowded = TickDataParams::new(account(101), symbol(15), QuoteSide::Bid, millis(500, 2_000));
-    let ticks = client.tick_data(&crowded).await.expect("ticks");
     assert_eq!(
-        ticks
-            .iter()
-            .map(|tick| tick.timestamp.as_millis())
-            .collect::<Vec<_>>(),
-        [900, 1_000, 1_000, 1_100, 1_200, 1_300]
+        client.tick_data(&crowded).await,
+        Err(ConnectorError::Incomplete {
+            from: at(500),
+            to: at(1_000)
+        })
     );
-    let spans: Vec<(i64, i64)> = tick_requests(&server)
-        .iter()
-        .map(|request| (request.from_timestamp, request.to_timestamp))
-        .collect();
     assert_eq!(
-        spans,
-        [(500, 2_000), (500, 1_100), (500, 1_000), (500, 999)]
+        tick_spans(&server),
+        [(500, 2_001), (500, 1_101), (500, 1_001)]
     );
     client.shutdown().await;
 }

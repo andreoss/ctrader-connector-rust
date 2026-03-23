@@ -22,7 +22,8 @@ use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Eve
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaSpotEvent, ProtoOaVersionReq,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq, ProtoOaSpotEvent,
+    ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::SymbolsParams;
@@ -848,9 +849,13 @@ async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
 
 #[tokio::test]
 async fn live_tick_history_of_both_sides_falls_inside_the_range() {
+    const PART_MILLIS: i64 = 1_200_000;
     let _guard = LIVE.lock().await;
     let (client, account) = authorised().await;
-    let range = TimeRange::ending_at(Timestamp::now(), Duration::from_secs(4 * 3_600));
+    let settled = Timestamp::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("a clock past the epoch");
+    let range = TimeRange::ending_at(settled, Duration::from_secs(4 * 3_600));
     let mut evidence = None;
     for (symbol, name) in candidates(&client, &account).await {
         let mut sides = Vec::new();
@@ -873,6 +878,22 @@ async fn live_tick_history_of_both_sides_falls_inside_the_range() {
                 latest.as_slice(),
                 &ticks[ticks.len().saturating_sub(25)..],
                 "the latest ticks differ from the end of the whole range"
+            );
+            let mut parts = Vec::new();
+            let mut first = range.from().as_millis();
+            while first <= range.to().as_millis() {
+                let last = (first + PART_MILLIS - 1).min(range.to().as_millis());
+                let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
+                let part = TimeRange::new(at(first), at(last)).expect("range");
+                let params = TickDataParams::new(account.id, symbol, side, part);
+                parts.extend(client.tick_data(&params).await.expect("part of the ticks"));
+                first = last + 1;
+            }
+            assert!(
+                parts == ticks,
+                "{side:?}: {} ticks fetched in one piece, {} fetched in parts",
+                ticks.len(),
+                parts.len()
             );
             sides.push((side, ticks));
         }
@@ -899,6 +920,91 @@ async fn live_tick_history_of_both_sides_falls_inside_the_range() {
     }
     let (bids, asks) = (&sides[0].1, &sides[1].1);
     assert!(bids[bids.len() - 1].price < asks[asks.len() - 1].price);
+    client.shutdown().await;
+}
+
+async fn raw_ticks(
+    client: &OpenApiClient,
+    account: &Account,
+    symbol: SymbolId,
+    span: (i64, i64),
+) -> (Vec<i64>, bool) {
+    let request = ProtoOaGetTickDataReq {
+        payload_type: None,
+        ctid_trader_account_id: account.id.get(),
+        symbol_id: symbol.get(),
+        r#type: 1,
+        from_timestamp: span.0,
+        to_timestamp: span.1,
+    };
+    let response = client
+        .connection()
+        .request(&request)
+        .await
+        .expect("tick data");
+    let mut at = 0_i64;
+    let times = response
+        .tick_data
+        .iter()
+        .map(|tick| {
+            at += tick.timestamp;
+            at
+        })
+        .collect();
+    (times, response.has_more)
+}
+
+#[tokio::test]
+async fn live_tick_requests_end_before_the_millisecond_named_as_their_end() {
+    const MINUTE: i64 = 60_000;
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let now = Timestamp::now().as_millis();
+    let mut observed = false;
+    for (symbol, name) in candidates(&client, &account).await {
+        let span = (now - 240 * MINUTE, now);
+        let (page, more) = raw_ticks(&client, &account, symbol, span).await;
+        if page.len() < 3 {
+            continue;
+        }
+        assert!(
+            page.windows(2).all(|pair| pair[0] >= pair[1]),
+            "an answer does not start with its latest tick"
+        );
+        assert!(page.iter().all(|at| span.0 <= *at && *at < span.1));
+        let probe = page[page.len() / 2];
+        assert!(
+            probe > page[page.len() - 1],
+            "one millisecond fills half an answer"
+        );
+        let held = page.iter().filter(|at| **at == probe).count();
+        let (short, _) = raw_ticks(&client, &account, symbol, (probe - MINUTE, probe)).await;
+        assert!(
+            short.iter().all(|at| *at < probe),
+            "a request includes the millisecond named as its end"
+        );
+        let (ending, _) = raw_ticks(&client, &account, symbol, (probe - MINUTE, probe + 1)).await;
+        assert_eq!(ending[..held], vec![probe; held]);
+        assert_eq!(ending[held..], short);
+        let (single, _) = raw_ticks(&client, &account, symbol, (probe, probe + 1)).await;
+        assert_eq!(single, vec![probe; held]);
+        let moment = Timestamp::from_millis(probe).expect("timestamp");
+        let range = TimeRange::new(moment, moment).expect("range");
+        let params = TickDataParams::new(account.id, symbol, QuoteSide::Bid, range);
+        let ticks = client.tick_data(&params).await.expect("tick history");
+        assert_eq!(ticks.len(), held);
+        assert!(ticks.iter().all(|tick| tick.timestamp == moment));
+        println!(
+            "live tick bounds: {name} ({symbol}) answer of {} ticks, more announced: {more}; fromTimestamp {probe} toTimestamp {probe} + 1 returned the {held} tick(s) of that millisecond, toTimestamp {probe} none of them",
+            page.len()
+        );
+        observed = true;
+        break;
+    }
+    assert!(
+        observed,
+        "none of {QUOTING_CANDIDATES:?} has three bid ticks in the last four hours; the markets may be closed"
+    );
     client.shutdown().await;
 }
 

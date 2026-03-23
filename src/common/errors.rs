@@ -426,9 +426,9 @@ pub enum ConnectorError {
         /// Number of events dropped unread.
         skipped: u64,
     },
-    /// The server announced more historical data than it sent and sent none of the rest when
-    /// asked, so the data between the two moments, both included, is missing.
-    #[error("the server announced more data between {from} and {to} but sent none")]
+    /// The server announced more historical data than it sent and the rest cannot be asked for,
+    /// so data between the two moments, both included, is missing.
+    #[error("the server announced more data between {from} and {to} than it sent")]
     Incomplete {
         /// Start of the part that is missing.
         from: Timestamp,
@@ -609,7 +609,7 @@ mod tests {
                 to: at(9)
             }
             .to_string(),
-            "the server announced more data between 5 and 9 but sent none"
+            "the server announced more data between 5 and 9 than it sent"
         );
         assert_eq!(
             ConnectorError::Lagged { skipped: 3 }.to_string(),
