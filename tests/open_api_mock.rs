@@ -1151,6 +1151,68 @@ async fn a_replay_removed_while_the_connection_is_restored_is_not_sent() {
 }
 
 #[tokio::test]
+async fn a_replay_replaced_while_it_waits_is_sent_under_an_id_never_used_before() {
+    let server = MockServer::start(MockOptions {
+        silent: vec![VERSION_REQ],
+        ..MockOptions::default()
+    })
+    .await;
+    let limit = Duration::from_millis(300);
+    let connection = open(&server, options().timeout(limit)).await;
+    let application = application_auth(CLIENT_SECRET);
+    connection.request(&application).await.expect("application");
+    let slow = key(ReplayStage::Subscription, "slow");
+    connection
+        .register_replay(key(ReplayStage::Application, "application"), &application)
+        .await
+        .expect("registration");
+    connection
+        .register_replay(slow.clone(), &ProtoOaVersionReq::default())
+        .await
+        .expect("registration");
+    let mut events = connection.events();
+    connection.force_reconnect().await.expect("reconnection");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    eventually("the slow replay under way", || {
+        server.types_on(2).contains(&VERSION_REQ)
+    })
+    .await;
+    connection
+        .register_replay(slow.clone(), &account_list())
+        .await
+        .expect("replacement");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ReplayFailed {
+            key: slow,
+            error: ConnectorError::Timeout(limit),
+        }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    connection.request(&account_list()).await.expect("accounts");
+    assert_eq!(
+        server.types_on(2),
+        vec![
+            APPLICATION_AUTH_REQ,
+            VERSION_REQ,
+            ACCOUNT_LIST_REQ,
+            ACCOUNT_LIST_REQ
+        ]
+    );
+    let ids: Vec<String> = server.ids().into_iter().flatten().collect();
+    assert_eq!(ids.len(), 5, "a request went out without an id: {ids:?}");
+    let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "an id was used twice: {ids:?}");
+    connection.shutdown().await;
+}
+
+#[tokio::test]
 async fn accounts_are_authorised_with_the_refreshed_token_after_a_reconnection() {
     let server = MockServer::start(MockOptions::default()).await;
     let client = client(builder(&server)).await;

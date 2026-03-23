@@ -110,6 +110,7 @@ pub struct Received {
     pub connection: usize,
     pub payload_type: u32,
     pub payload: Vec<u8>,
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,15 @@ impl MockServer {
             .filter(|received| received.connection == connection)
             .map(|received| received.payload_type)
             .filter(|payload_type| *payload_type != HEARTBEAT)
+            .collect()
+    }
+
+    pub fn ids(&self) -> Vec<Option<String>> {
+        lock(&self.state)
+            .received
+            .iter()
+            .filter(|received| received.payload_type != HEARTBEAT)
+            .map(|received| received.id.clone())
             .collect()
     }
 
@@ -387,6 +397,7 @@ impl State {
             connection,
             payload_type: message.payload_type,
             payload: payload.clone(),
+            id: id.clone(),
         });
         if message.payload_type == HEARTBEAT && self.options.echo_heartbeats {
             return vec![envelope(HEARTBEAT, &ProtoHeartbeatEvent::default(), None)];

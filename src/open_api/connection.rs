@@ -2,9 +2,12 @@
 //!
 //! One task owns the socket. Callers hold a cloneable [`Connection`]; a request travels over a
 //! bounded command channel, is framed with a fresh `clientMsgId` and resolves when the response
-//! carrying the same id arrives. Messages the server pushes on its own are fanned out as
-//! [`Event`]s. The task sends a heartbeat whenever nothing was written for the heartbeat
-//! interval, which keeps the server from closing an idle connection.
+//! carrying the same id arrives. Every id comes from one counter that requests and replayed
+//! requests share and that only ever grows, so no id is used twice on a connection and a late
+//! answer to a request given up is never taken for the answer to another one. Messages the
+//! server pushes on its own are fanned out as [`Event`]s. The task sends a heartbeat whenever
+//! nothing was written for the heartbeat interval, which keeps the server from closing an idle
+//! connection.
 //!
 //! Deadlines: nothing the task waits for on the socket is open-ended. A write that does not
 //! complete within the time allowed for a response fails with
@@ -701,7 +704,7 @@ impl<C: Connect> Actor<C> {
                 return Ok(Ok((framed, sent.len())));
             };
             sent.insert(key.clone(), stored.clone());
-            let id = format!("replay-{}", sent.len());
+            let id = self.fresh_id();
             let step = Box::pin(replay(&mut framed, id, key, stored, limit, &self.events));
             if let Err(reason) = hold(&mut self.commands, &mut self.replays, reason, step).await? {
                 return Ok(Err(reason));
@@ -741,6 +744,11 @@ impl<C: Connect> Actor<C> {
                 }
             }
         }
+    }
+
+    fn fresh_id(&mut self) -> String {
+        self.next_id = self.next_id.saturating_add(1);
+        self.next_id.to_string()
     }
 
     fn heard(&mut self, message: ProtoMessage) {
@@ -800,8 +808,7 @@ impl<C: Connect> Actor<C> {
             if outbound.reply.is_closed() {
                 continue;
             }
-            self.next_id += 1;
-            let id = self.next_id.to_string();
+            let id = self.fresh_id();
             let message = ProtoMessage {
                 payload_type: outbound.payload_type,
                 payload: Some(outbound.payload.clone()),
