@@ -40,7 +40,7 @@ missing_panics_doc = "deny"
 [dev-dependencies]
 prost-build = "0.14.5"
 protox = "0.10.0"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [[test]]
 name = "open_api_mock"

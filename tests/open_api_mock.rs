@@ -1293,3 +1293,94 @@ async fn historical_requests_wait_for_their_own_limit_only() {
     assert!(started.elapsed() >= Duration::from_secs(1));
     connection.shutdown().await;
 }
+
+#[tokio::test]
+async fn maximal_durations_open_a_connection_and_turn_the_watchdog_off() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(
+        &server,
+        ConnectionOptions::new()
+            .timeout(Duration::MAX)
+            .heartbeat_interval(Duration::MAX)
+            .reconnect_delay(Duration::MAX)
+            .backoff(Duration::MAX)
+            .inbound_timeout(Duration::MAX),
+    )
+    .await;
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application");
+    let mut events = connection.events();
+    tokio::time::pause();
+    tokio::time::sleep(Duration::from_secs(365 * 86_400)).await;
+    tokio::time::resume();
+    assert!(events.try_recv().is_err());
+    assert_eq!(connection.stats().heartbeats_sent, 0);
+    assert_eq!(connection.stats().reconnects, 0);
+    connection
+        .request(&ProtoOaVersionReq::default())
+        .await
+        .expect("request after a silent year");
+    assert_eq!(server.connections(), 1);
+    timeout(Duration::from_secs(2), connection.shutdown())
+        .await
+        .expect("shutdown in time");
+}
+
+#[tokio::test]
+async fn a_maximal_backoff_and_delay_hold_work_back_without_ending_the_task() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let connection = open(
+        &server,
+        options()
+            .request_limit(100)
+            .retries(1)
+            .backoff(Duration::MAX)
+            .reconnect_delay(Duration::MAX),
+    )
+    .await;
+    connection
+        .request(&application_auth(CLIENT_SECRET))
+        .await
+        .expect("application");
+    server.set_limit(Some(1));
+    connection
+        .request(&ProtoOaVersionReq::default())
+        .await
+        .expect("request within the limit");
+    let held = {
+        let connection = connection.clone();
+        tokio::spawn(async move { connection.request(&ProtoOaVersionReq::default()).await })
+    };
+    eventually("the limit error answered with a pause", || {
+        connection.stats().throttle_retries == 1
+    })
+    .await;
+    assert!(
+        timeout(Duration::from_millis(200), connection.closed())
+            .await
+            .is_err(),
+        "the connection task ended"
+    );
+    assert!(!held.is_finished());
+    let mut events = connection.events();
+    connection.force_reconnect().await.expect("reconnection");
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    assert!(matches!(
+        held.await.expect("task"),
+        Err(ConnectorError::Transport(TransportError::Closed))
+    ));
+    assert!(
+        timeout(Duration::from_millis(200), connection.closed())
+            .await
+            .is_err(),
+        "the connection task ended"
+    );
+    timeout(Duration::from_secs(2), connection.shutdown())
+        .await
+        .expect("shutdown in time");
+}

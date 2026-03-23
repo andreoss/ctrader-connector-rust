@@ -11,6 +11,9 @@
 //! [`TransportError::WriteTimeout`], and a server that sends nothing at all, not even a
 //! heartbeat, for the period set with [`ConnectionOptions::inbound_timeout`] fails the
 //! connection with [`TransportError::Idle`]. Both count as a loss of the connection.
+//! Every duration an option carries is added to the clock without overflow: a wait that would
+//! end more than thirty years ahead ends thirty years ahead, so [`Duration::MAX`] stands for
+//! never and turns the wait it is given to off.
 //!
 //! Backpressure: the command channel is bounded, so callers wait while the task is busy, and the
 //! event stream is a bounded broadcast, so a subscriber that falls behind skips the oldest
@@ -76,6 +79,8 @@ pub const RECONNECT_DELAY_LIMIT: Duration = Duration::from_secs(60);
 const SHORTEST_INTERVAL: Duration = Duration::from_millis(1);
 
 const SILENT_INTERVALS: u32 = 3;
+
+const LONGEST_WAIT: Duration = Duration::from_secs(30 * 365 * 86_400);
 
 macro_rules! log_debug {
     ($($argument:tt)*) => {{
@@ -217,7 +222,8 @@ impl ConnectionOptions {
     /// 30 seconds on a connection that is otherwise quiet, so a shorter period would give up
     /// connections that are in order.
     ///
-    /// A duration below one millisecond is raised to one millisecond.
+    /// A duration below one millisecond is raised to one millisecond. [`Duration::MAX`] turns
+    /// the watch off: the server may then stay silent for as long as it likes.
     pub fn inbound_timeout(mut self, period: Duration) -> Self {
         self.inbound_timeout = Some(period.max(SHORTEST_INTERVAL));
         self
@@ -404,8 +410,8 @@ impl Connection {
             connector,
             host: host.to_owned(),
             port,
-            heartbeat_at: Instant::now() + options.heartbeat_interval,
-            silent_at: Instant::now() + options.silence(),
+            heartbeat_at: after(Instant::now(), options.heartbeat_interval),
+            silent_at: after(Instant::now(), options.silence()),
             options,
             commands: receiver,
             events: events.clone(),
@@ -652,8 +658,8 @@ impl<C: Connect> Actor<C> {
                             .sent
                             .extend(std::iter::repeat_n(Instant::now(), seeded));
                     }
-                    self.heartbeat_at = Instant::now() + self.options.heartbeat_interval;
-                    self.silent_at = Instant::now() + self.options.silence();
+                    self.heartbeat_at = after(Instant::now(), self.options.heartbeat_interval);
+                    self.silent_at = after(Instant::now(), self.options.silence());
                     let _ = self.events.send(Event::Reconnected { attempt });
                     return Ok(framed);
                 }
@@ -734,7 +740,7 @@ impl<C: Connect> Actor<C> {
     }
 
     fn heard(&mut self, message: ProtoMessage) {
-        self.silent_at = Instant::now() + self.options.silence();
+        self.silent_at = after(Instant::now(), self.options.silence());
         self.dispatch(message);
     }
 
@@ -804,9 +810,9 @@ impl<C: Connect> Actor<C> {
                     {
                         throttle.sent.push_back(now);
                     }
-                    self.heartbeat_at = now + self.options.heartbeat_interval;
+                    self.heartbeat_at = after(now, self.options.heartbeat_interval);
                     self.deadlines
-                        .push_back((now + self.options.timeout, id.clone()));
+                        .push_back((after(now, self.options.timeout), id.clone()));
                     self.pending.insert(id, outbound);
                 }
                 Err(error @ TransportError::FrameTooLong { .. }) => {
@@ -844,7 +850,7 @@ impl<C: Connect> Actor<C> {
             let beat = ProtoHeartbeatEvent::default().to_message(None);
             write(framed, &beat, self.options.timeout).await?;
             bump(&self.counters.heartbeats_sent);
-            self.heartbeat_at = Instant::now() + self.options.heartbeat_interval;
+            self.heartbeat_at = after(Instant::now(), self.options.heartbeat_interval);
         }
         Ok(())
     }
@@ -869,7 +875,7 @@ impl<C: Connect> Actor<C> {
                 .backoff
                 .saturating_mul(1 << outbound.attempts.min(16))
                 .min(BACKOFF_LIMIT.max(self.options.backoff));
-            let until = Instant::now() + pause;
+            let until = after(Instant::now(), pause);
             log_debug!(
                 payload_type = outbound.payload_type,
                 ?pause,
@@ -927,8 +933,14 @@ impl Throttle {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let excess = (self.sent.len() + 1).checked_sub(limit)?;
         let blocking = excess.checked_sub(1)?;
-        self.sent.get(blocking).map(|sent| *sent + LIMIT_WINDOW)
+        self.sent
+            .get(blocking)
+            .map(|sent| after(*sent, LIMIT_WINDOW))
     }
+}
+
+fn after(start: Instant, period: Duration) -> Instant {
+    start.checked_add(period.min(LONGEST_WAIT)).unwrap_or(start)
 }
 
 fn over_limit(result: &Result<ProtoMessage, ConnectorError>) -> bool {
@@ -1046,8 +1058,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectionOptions, Event, LIMIT_WINDOW, ReplayKey, ReplayStage, Throttle, outcome,
-        over_limit,
+        ConnectionOptions, Event, LIMIT_WINDOW, LONGEST_WAIT, ReplayKey, ReplayStage, Throttle,
+        after, outcome, over_limit,
     };
     use crate::common::config::ConfigurationOpenApi;
     use crate::common::errors::{ConnectorError, ErrorCode, TransportError};
@@ -1211,6 +1223,28 @@ mod tests {
         let later = start + LIMIT_WINDOW + Duration::from_millis(10);
         assert_eq!(throttle.ready_at(later, 2), None);
         assert_eq!(throttle.sent.len(), 1);
+    }
+
+    #[test]
+    fn waits_too_long_for_the_clock_end_at_the_longest_wait() {
+        let start = Instant::now();
+        let brief = Duration::from_secs(90);
+        assert_eq!(after(start, brief), start + brief);
+        assert_eq!(after(start, LONGEST_WAIT), start + LONGEST_WAIT);
+        assert_eq!(after(start, Duration::MAX), start + LONGEST_WAIT);
+        let far = after(start, Duration::MAX);
+        assert_eq!(after(far, Duration::MAX), far + LONGEST_WAIT);
+        let options = ConnectionOptions::new()
+            .timeout(Duration::MAX)
+            .heartbeat_interval(Duration::MAX);
+        assert_eq!(options.silence(), Duration::MAX);
+        assert_eq!(
+            options.inbound_timeout(Duration::MAX).silence(),
+            Duration::MAX
+        );
+        let mut throttle = Throttle::default();
+        throttle.sent.push_back(far);
+        assert_eq!(throttle.ready_at(far, 1), Some(far + LIMIT_WINDOW));
     }
 
     #[test]
