@@ -352,6 +352,10 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
             .map_or_else(ToString::to_string, |()| "authorised".to_owned())
     );
     assert!(persisted, "the stored pair differs from the pair received");
+    assert!(
+        rotated,
+        "the refresh returned a token of the pair it was asked to replace"
+    );
     assert!(pair.expires_in > Duration::from_secs(60));
     assert!(
         authorised.is_ok(),
@@ -486,17 +490,36 @@ async fn live_burst_above_the_limit_completes_without_a_limit_error() {
     for task in tasks {
         match task.await.expect("task") {
             Ok(_) => answered += 1,
-            Err(error) => failures.push(error.to_string()),
+            Err(error) => failures.push(error),
         }
     }
     let elapsed = started.elapsed();
     let stats = client.connection().stats();
+    let limited = failures
+        .iter()
+        .filter(|error| {
+            matches!(
+                error,
+                ConnectorError::Server(refusal) if matches!(
+                    refusal.code,
+                    ErrorCode::RequestFrequencyExceeded | ErrorCode::BlockedPayloadType
+                )
+            )
+        })
+        .count();
     println!(
-        "live burst: {answered} of {BURST} version requests answered in {elapsed:.1?}, failures {failures:?}, requests sent {}, throttle retries {}",
+        "live burst: {answered} of {BURST} version requests answered in {elapsed:.1?}, failures {failures:?}, limit errors {limited}, requests sent {}, throttle retries {}",
         stats.requests_sent, stats.throttle_retries
     );
+    assert_eq!(limited, 0, "a limit error reached the caller: {failures:?}");
     assert!(failures.is_empty(), "{failures:?}");
-    assert_eq!(answered, BURST);
+    assert_eq!(answered, BURST, "{answered} of {BURST} requests answered");
+    let burst = u64::try_from(BURST).expect("burst size");
+    assert_eq!(
+        stats.requests_sent,
+        burst + 1 + stats.throttle_retries,
+        "every request is sent once, and once more for each retry after a limit error"
+    );
     assert!(elapsed >= Duration::from_secs(2));
     client.shutdown().await;
 }
