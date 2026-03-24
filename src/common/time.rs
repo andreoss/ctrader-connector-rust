@@ -90,9 +90,13 @@ impl TryFrom<SystemTime> for Timestamp {
     }
 }
 
-impl From<Timestamp> for SystemTime {
-    fn from(timestamp: Timestamp) -> Self {
-        UNIX_EPOCH + Duration::from_millis(timestamp.0.unsigned_abs())
+impl TryFrom<Timestamp> for SystemTime {
+    type Error = ValueError;
+
+    fn try_from(timestamp: Timestamp) -> Result<Self, Self::Error> {
+        UNIX_EPOCH
+            .checked_add(Duration::from_millis(timestamp.0.unsigned_abs()))
+            .ok_or(ValueError::OutOfRange { kind: TIMESTAMP })
     }
 }
 
@@ -228,7 +232,12 @@ mod tests {
         let time = UNIX_EPOCH + Duration::from_millis(42);
         let timestamp = Timestamp::try_from(time).expect("timestamp");
         assert_eq!(timestamp.as_millis(), 42);
-        assert_eq!(SystemTime::from(timestamp), time);
+        assert_eq!(SystemTime::try_from(timestamp), Ok(time));
+        let last = Timestamp::from_millis(i64::MAX).expect("timestamp");
+        match SystemTime::try_from(last) {
+            Ok(time) => assert_eq!(Timestamp::try_from(time), Ok(last)),
+            Err(error) => assert_eq!(error, OUT_OF_RANGE),
+        }
         assert_eq!(
             Timestamp::try_from(UNIX_EPOCH - Duration::from_secs(1)),
             Err(OUT_OF_RANGE)

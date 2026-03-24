@@ -9,8 +9,8 @@ use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError, T
 use ctrader_connector::common::ids::{AccountId, SymbolId};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{
-    Connection, ConnectionOptions, DEFAULT_INBOUND_TIMEOUT, Event, ReplayKey, ReplayStage,
-    SERVER_HEARTBEAT_INTERVAL,
+    Connection, ConnectionOptions, DEFAULT_INBOUND_TIMEOUT, Event, MAX_COMMAND_CAPACITY,
+    MAX_EVENT_CAPACITY, ReplayKey, ReplayStage, SERVER_HEARTBEAT_INTERVAL,
 };
 use ctrader_connector::open_api::messages::{
     ProtoHeartbeatEvent, ProtoOaAccountAuthReq, ProtoOaApplicationAuthReq,
@@ -1397,6 +1397,33 @@ async fn historical_requests_wait_for_their_own_limit_only() {
     assert_eq!(server.count(ProtoOaGetTrendbarsReq::PAYLOAD_TYPE), 3);
     assert!(started.elapsed() >= Duration::from_secs(1));
     connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn maximal_capacities_open_a_connection_and_are_clamped() {
+    let server = MockServer::start(MockOptions::default()).await;
+    for adjusted in [
+        options().command_capacity(usize::MAX),
+        options().event_capacity(usize::MAX),
+        options()
+            .command_capacity(usize::MAX)
+            .event_capacity(usize::MAX),
+    ] {
+        let connection = open(&server, adjusted).await;
+        connection
+            .request(&application_auth(CLIENT_SECRET))
+            .await
+            .expect("application");
+        connection.shutdown().await;
+    }
+    assert_eq!(
+        options()
+            .command_capacity(usize::MAX)
+            .event_capacity(usize::MAX),
+        options()
+            .command_capacity(MAX_COMMAND_CAPACITY)
+            .event_capacity(MAX_EVENT_CAPACITY)
+    );
 }
 
 #[tokio::test]

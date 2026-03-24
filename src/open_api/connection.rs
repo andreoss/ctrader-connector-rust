@@ -65,6 +65,14 @@ pub const DEFAULT_COMMAND_CAPACITY: usize = 64;
 /// Number of events kept for a subscriber that falls behind.
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
+/// Largest number of requests that may wait in the command channel; a larger number asked for
+/// is lowered to it.
+pub const MAX_COMMAND_CAPACITY: usize = 65_536;
+
+/// Largest number of events kept for a subscriber that falls behind; a larger number asked for
+/// is lowered to it, because the room for the events is set aside when the connection opens.
+pub const MAX_EVENT_CAPACITY: usize = 65_536;
+
 /// Requests the server accepts per second on one connection, historical data excluded.
 pub const REQUEST_LIMIT: u32 = 50;
 
@@ -165,15 +173,19 @@ impl ConnectionOptions {
         self
     }
 
-    /// Sets the number of requests that may wait in the command channel; at least one.
+    /// Sets the number of requests that may wait in the command channel.
+    ///
+    /// Zero is raised to one and a number above [`MAX_COMMAND_CAPACITY`] is lowered to it.
     pub fn command_capacity(mut self, capacity: usize) -> Self {
-        self.command_capacity = capacity.max(1);
+        self.command_capacity = capacity.clamp(1, MAX_COMMAND_CAPACITY);
         self
     }
 
-    /// Sets the number of events kept for a subscriber that falls behind; at least one.
+    /// Sets the number of events kept for a subscriber that falls behind.
+    ///
+    /// Zero is raised to one and a number above [`MAX_EVENT_CAPACITY`] is lowered to it.
     pub fn event_capacity(mut self, capacity: usize) -> Self {
-        self.event_capacity = capacity.max(1);
+        self.event_capacity = capacity.clamp(1, MAX_EVENT_CAPACITY);
         self
     }
 
@@ -1069,8 +1081,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectionOptions, DEFAULT_INBOUND_TIMEOUT, Event, LIMIT_WINDOW, LONGEST_WAIT, ReplayKey,
-        ReplayStage, SERVER_HEARTBEAT_INTERVAL, Throttle, after, outcome, over_limit,
+        ConnectionOptions, DEFAULT_INBOUND_TIMEOUT, Event, LIMIT_WINDOW, LONGEST_WAIT,
+        MAX_COMMAND_CAPACITY, MAX_EVENT_CAPACITY, ReplayKey, ReplayStage,
+        SERVER_HEARTBEAT_INTERVAL, Throttle, after, outcome, over_limit,
     };
     use crate::common::config::ConfigurationOpenApi;
     use crate::common::errors::{ConnectorError, ErrorCode, TransportError};
@@ -1139,6 +1152,11 @@ mod tests {
         assert_eq!(options.heartbeat_interval, Duration::from_millis(1));
         assert_eq!(options.command_capacity, 1);
         assert_eq!(options.event_capacity, 1);
+        let largest = ConnectionOptions::new()
+            .command_capacity(usize::MAX)
+            .event_capacity(usize::MAX);
+        assert_eq!(largest.command_capacity, MAX_COMMAND_CAPACITY);
+        assert_eq!(largest.event_capacity, MAX_EVENT_CAPACITY);
         assert_eq!(options.reconnect_delay, Duration::from_millis(1));
         assert_eq!(options.reconnect_attempts, Some(4));
         assert_eq!(options.request_limit, 1);
