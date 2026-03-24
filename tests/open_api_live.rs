@@ -14,20 +14,27 @@ use std::time::Duration;
 use ctrader_connector::common::config::{
     ConfigurationOpenApi, ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN, Environment,
 };
+use ctrader_connector::common::decimals::Volume;
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
-use ctrader_connector::common::ids::SymbolId;
+use ctrader_connector::common::ids::{OrderId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::messages::{
-    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq, ProtoOaSpotEvent,
-    ProtoOaVersionReq,
+    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaCancelOrderReq,
+    ProtoOaClosePositionReq, ProtoOaDepthEvent, ProtoOaExecutionEvent,
+    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq, ProtoOaReconcileReq,
+    ProtoOaSpotEvent, ProtoOaVersionReq,
 };
+use ctrader_connector::open_api::payload::Payload;
 use ctrader_connector::open_api::quotes::QuoteSide;
-use ctrader_connector::open_api::symbols::SymbolsParams;
+use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
 use ctrader_connector::open_api::ticks::TickDataParams;
+use ctrader_connector::open_api::trading::{
+    Comment, DealStatus, Execution, ExecutionType, Label, NewOrder, Order, OrderType, Position,
+    PositionStatus, TradeSide,
+};
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
 use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message;
@@ -1150,4 +1157,232 @@ async fn live_depth_book_holds_the_replayed_depth_after_a_forced_reconnect() {
     assert!(entries > 0, "the books are empty after the reconnection");
     depth.unsubscribe().await.expect("end of subscription");
     client.shutdown().await;
+}
+
+const TRADED: &str = "BTCUSD";
+
+const SWEEP_ROUNDS: usize = 10;
+
+#[derive(Clone)]
+struct Desk {
+    client: OpenApiClient,
+    account: Account,
+    symbol: Symbol,
+    label: String,
+}
+
+impl Desk {
+    fn label(&self) -> Label {
+        Label::new(self.label.clone()).expect("label")
+    }
+
+    fn smallest(&self) -> Volume {
+        self.symbol
+            .min_volume
+            .expect("the traded symbol states its smallest volume")
+    }
+
+    async fn own(&self) -> (Vec<Position>, Vec<Order>) {
+        let reconciled = self
+            .client
+            .connection()
+            .request(&ProtoOaReconcileReq {
+                payload_type: None,
+                ctid_trader_account_id: self.account.id.get(),
+                return_protection_orders: Some(true),
+            })
+            .await
+            .expect("reconcile");
+        let label = Some(self.label.as_str());
+        let positions = reconciled
+            .position
+            .into_iter()
+            .filter(|position| position.trade_data.label.as_deref() == label)
+            .map(|position| Position::try_from(position).expect("position"))
+            .collect();
+        let orders = reconciled
+            .order
+            .into_iter()
+            .filter(|order| order.trade_data.label.as_deref() == label)
+            .map(|order| Order::try_from(order).expect("order"))
+            .collect();
+        (positions, orders)
+    }
+
+    async fn sweep(&self) -> Result<(), String> {
+        let mut left = String::new();
+        for _ in 0..SWEEP_ROUNDS {
+            let (positions, orders) = self.own().await;
+            if positions.is_empty() && orders.is_empty() {
+                return Ok(());
+            }
+            left = format!(
+                "{} positions and {} orders labelled {}",
+                positions.len(),
+                orders.len(),
+                self.label
+            );
+            for order in orders.iter().filter(|order| !order.closing) {
+                let cancel = ProtoOaCancelOrderReq {
+                    payload_type: None,
+                    ctid_trader_account_id: self.account.id.get(),
+                    order_id: order.id.get(),
+                };
+                let outcome = self
+                    .client
+                    .connection()
+                    .request_once(ProtoOaCancelOrderReq::PAYLOAD_TYPE, cancel.encode_to_vec())
+                    .await;
+                println!(
+                    "live sweep: cancel order {} answered {:?}",
+                    order.id,
+                    outcome.map(|message| message.payload_type)
+                );
+            }
+            for position in &positions {
+                let close = ProtoOaClosePositionReq {
+                    payload_type: None,
+                    ctid_trader_account_id: self.account.id.get(),
+                    position_id: position.id.get(),
+                    volume: position.volume.to_wire().expect("volume"),
+                };
+                let outcome = self
+                    .client
+                    .connection()
+                    .request_once(ProtoOaClosePositionReq::PAYLOAD_TYPE, close.encode_to_vec())
+                    .await;
+                println!(
+                    "live sweep: close position {} answered {:?}",
+                    position.id,
+                    outcome.map(|message| message.payload_type)
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Err(left)
+    }
+}
+
+async fn trading<B, F>(item: &str, body: B)
+where
+    B: FnOnce(Desk) -> F,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let list = client
+        .symbols(SymbolsParams::new(account.id))
+        .await
+        .expect("symbols");
+    let traded = list
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name.as_deref() == Some(TRADED))
+        .unwrap_or_else(|| panic!("the demo account lists no symbol named {TRADED}"))
+        .id;
+    let symbol = client
+        .symbol_details(account.id, &[traded])
+        .await
+        .expect("symbol details")
+        .pop()
+        .expect("details of the traded symbol");
+    let desk = Desk {
+        client,
+        account,
+        symbol,
+        label: format!("{item}-{}", Timestamp::now().as_millis()),
+    };
+    let outcome = tokio::spawn(body(desk.clone())).await;
+    let swept = desk.sweep().await;
+    desk.client.shutdown().await;
+    if let Err(failure) = outcome {
+        std::panic::resume_unwind(failure.into_panic());
+    }
+    assert_eq!(swept, Ok(()), "the test left orders or positions behind");
+}
+
+async fn next_execution(events: &mut broadcast::Receiver<Event>, order: OrderId) -> Execution {
+    timeout(STEP, async {
+        loop {
+            let event = events.recv().await.expect("event");
+            let Event::Message(message) = event else {
+                continue;
+            };
+            if message.payload_type != ProtoOaExecutionEvent::PAYLOAD_TYPE {
+                continue;
+            }
+            let execution = Execution::try_from(
+                ProtoOaExecutionEvent::from_message(&message).expect("execution event"),
+            )
+            .expect("execution");
+            if execution.order.as_ref().map(|order| order.id) == Some(order) {
+                return execution;
+            }
+        }
+    })
+    .await
+    .expect("execution event in time")
+}
+
+#[tokio::test]
+async fn live_market_order_opens_a_position_that_reconcile_reads_back() {
+    trading("ct18", |desk| async move {
+        let mut events = desk.client.events();
+        let volume = desk.smallest();
+        let order = NewOrder::market(desk.account.id, desk.symbol.id, TradeSide::Buy, volume)
+            .label(desk.label())
+            .comment(Comment::new("market order").expect("comment"));
+        let accepted = desk
+            .client
+            .place_order(&order, &desk.symbol)
+            .await
+            .expect("market order");
+        let placed = accepted.order.clone().expect("accepted order");
+        assert_eq!(accepted.kind, ExecutionType::Accepted);
+        assert_eq!(placed.kind, OrderType::Market);
+        assert_eq!(placed.side, TradeSide::Buy);
+        assert_eq!(placed.symbol, desk.symbol.id);
+        assert_eq!(placed.volume, volume);
+        assert_eq!(placed.label.as_deref(), Some(desk.label.as_str()));
+        let first = next_execution(&mut events, placed.id).await;
+        assert_eq!(first.kind, ExecutionType::Accepted);
+        let filled = next_execution(&mut events, placed.id).await;
+        assert_eq!(filled.kind, ExecutionType::Filled);
+        let deal = filled.deal.expect("deal of the fill");
+        assert_eq!(deal.order, placed.id);
+        assert_eq!(deal.filled_volume, volume);
+        assert_eq!(deal.status, DealStatus::Filled);
+        assert!(deal.execution_price.is_some());
+        let (positions, orders) = desk.own().await;
+        println!(
+            "live market order: order {} deal {} position {:?}, reconcile lists {} own positions ({:?}) and {} own orders",
+            placed.id,
+            deal.id,
+            filled.position.as_ref().map(|position| position.id),
+            positions.len(),
+            positions
+                .iter()
+                .map(|position| (
+                    position.side,
+                    position.symbol,
+                    position.volume.to_string(),
+                    position.status,
+                    position.price.map(|price| price.to_string()),
+                ))
+                .collect::<Vec<_>>(),
+            orders.len(),
+        );
+        assert_eq!(positions.len(), 1);
+        assert!(orders.is_empty());
+        let position = &positions[0];
+        assert_eq!(position.id, deal.position);
+        assert_eq!(position.side, TradeSide::Buy);
+        assert_eq!(position.symbol, desk.symbol.id);
+        assert_eq!(position.volume, volume);
+        assert_eq!(position.status, PositionStatus::Open);
+        assert_eq!(position.price, deal.execution_price);
+        assert_eq!(position.label.as_deref(), Some(desk.label.as_str()));
+        assert_eq!(position.comment.as_deref(), Some("market order"));
+    })
+    .await;
 }

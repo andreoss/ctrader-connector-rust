@@ -34,6 +34,11 @@
 //! [`Event::Reconnected`]. The registered requests are read one at a time, each just before it
 //! is sent, so a registration removed meanwhile is not replayed and one added meanwhile is.
 //! Requests made while the connection is down fail at once with the reason of the loss.
+//!
+//! Requests that must not arrive twice: a request made with [`Connection::request_once`], an
+//! order for one, is written at most once. It is neither sent again after a limit error nor
+//! replayed, and when the connection fails or the time allowed runs out after it was written
+//! the caller is told that its outcome is unknown, with [`ConnectorError::OutcomeUnknown`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,7 +54,7 @@ use crate::common::config::{
     ConfigurationOpenApi, DEFAULT_BACKOFF, DEFAULT_RECONNECT_DELAY, DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
 };
-use crate::common::errors::{ConnectorError, ErrorCode, ServerError, TransportError};
+use crate::common::errors::{ConnectorError, ErrorCode, Interruption, ServerError, TransportError};
 use crate::open_api::messages::{
     ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaErrorRes,
 };
@@ -384,8 +389,22 @@ struct Outbound {
     payload_type: u32,
     payload: Vec<u8>,
     historical: bool,
+    once: bool,
     attempts: u32,
     reply: Reply,
+}
+
+impl Outbound {
+    fn interrupted(&self, by: Interruption) -> ConnectorError {
+        if self.once {
+            ConnectorError::OutcomeUnknown(by)
+        } else {
+            match by {
+                Interruption::Timeout(limit) => ConnectorError::Timeout(limit),
+                Interruption::Transport(reason) => ConnectorError::Transport(reason),
+            }
+        }
+    }
 }
 
 enum Command {
@@ -464,7 +483,12 @@ impl Connection {
     /// [`ConnectorError::Closed`] when the connection is shut down.
     pub async fn request<R: Request>(&self, request: &R) -> Result<R::Response, ConnectorError> {
         let message = self
-            .send(R::PAYLOAD_TYPE, request.encode_to_vec(), R::HISTORICAL)
+            .send(
+                R::PAYLOAD_TYPE,
+                request.encode_to_vec(),
+                R::HISTORICAL,
+                false,
+            )
             .await?;
         R::Response::from_message(&message)
     }
@@ -479,7 +503,35 @@ impl Connection {
         payload_type: u32,
         payload: Vec<u8>,
     ) -> Result<ProtoMessage, ConnectorError> {
-        self.send(payload_type, payload, is_historical(payload_type))
+        self.send(payload_type, payload, is_historical(payload_type), false)
+            .await
+    }
+
+    /// Sends an already encoded request that the server must not receive twice, such as an
+    /// order, and waits for the envelope of the first message that answers it.
+    ///
+    /// The request is written to the socket at most once. It is not sent again when the server
+    /// answers that a limit was exceeded, which is handed to the caller as the refusal it is,
+    /// and it is never replayed after a reconnection. The answer is also reported to the
+    /// subscribers of [`Connection::events`] as an [`Event::Message`], ahead of the messages
+    /// the server sends after it, so that a reader of the events sees all the server said about
+    /// the request in the order it was said.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::OutcomeUnknown`] when the request was written and the
+    /// connection failed or the time allowed ran out before an answer arrived, in which case
+    /// the server may or may not have acted on it. [`ConnectorError::Transport`] means the
+    /// request was not written: the connection was down when it was made or was lost while it
+    /// waited its turn. [`ConnectorError::Closed`] is returned when the connection is shut down
+    /// from this side, also while the answer is awaited. Fails like
+    /// [`Connection::request_message`] otherwise.
+    pub async fn request_once(
+        &self,
+        payload_type: u32,
+        payload: Vec<u8>,
+    ) -> Result<ProtoMessage, ConnectorError> {
+        self.send(payload_type, payload, is_historical(payload_type), true)
             .await
     }
 
@@ -488,6 +540,7 @@ impl Connection {
         payload_type: u32,
         payload: Vec<u8>,
         historical: bool,
+        once: bool,
     ) -> Result<ProtoMessage, ConnectorError> {
         let (reply, response) = oneshot::channel();
         let outbound = Outbound {
@@ -495,6 +548,7 @@ impl Connection {
             payload,
             reply,
             historical,
+            once,
             attempts: 0,
         };
         self.commands
@@ -634,7 +688,7 @@ impl<C: Connect> Actor<C> {
                 Exit::Lost(reason) => {
                     log_debug!(%reason, "connection lost");
                     close(&mut framed, self.options.timeout).await;
-                    self.fail_in_flight(&ConnectorError::Transport(reason.clone()));
+                    self.fail_in_flight(&reason);
                     let _ = self.events.send(Event::Disconnected(reason.clone()));
                     match self.reconnect(reason).await {
                         Ok(fresh) => framed = fresh,
@@ -842,7 +896,8 @@ impl<C: Connect> Actor<C> {
                     let _ = outbound.reply.send(Err(error.into()));
                 }
                 Err(reason) => {
-                    let _ = outbound.reply.send(Err(reason.clone().into()));
+                    let error = outbound.interrupted(Interruption::Transport(reason.clone()));
+                    let _ = outbound.reply.send(Err(error));
                     return Err(reason);
                 }
             }
@@ -857,9 +912,8 @@ impl<C: Connect> Actor<C> {
                 break;
             }
             if let Some(outbound) = self.pending.remove(&id) {
-                let _ = outbound
-                    .reply
-                    .send(Err(ConnectorError::Timeout(self.options.timeout)));
+                let error = outbound.interrupted(Interruption::Timeout(self.options.timeout));
+                let _ = outbound.reply.send(Err(error));
             }
         }
         if now >= self.silent_at {
@@ -891,8 +945,11 @@ impl<C: Connect> Actor<C> {
             let _ = self.events.send(Event::Message(message));
             return;
         };
+        if outbound.once {
+            let _ = self.events.send(Event::Message(message.clone()));
+        }
         let result = outcome(message);
-        if over_limit(&result) && outbound.attempts < self.options.retries {
+        if !outbound.once && over_limit(&result) && outbound.attempts < self.options.retries {
             let pause = self
                 .options
                 .backoff
@@ -913,7 +970,19 @@ impl<C: Connect> Actor<C> {
         }
     }
 
-    fn fail_in_flight(&mut self, error: &ConnectorError) {
+    fn fail_in_flight(&mut self, reason: &TransportError) {
+        self.deadlines.clear();
+        for (_, outbound) in self.pending.drain() {
+            let error = outbound.interrupted(Interruption::Transport(reason.clone()));
+            let _ = outbound.reply.send(Err(error));
+        }
+        for outbound in self.queue.drain(..) {
+            let _ = outbound.reply.send(Err(reason.clone().into()));
+        }
+        self.reset_pacing();
+    }
+
+    fn close_in_flight(&mut self, error: &ConnectorError) {
         self.deadlines.clear();
         for (_, outbound) in self.pending.drain() {
             let _ = outbound.reply.send(Err(error.clone()));
@@ -921,6 +990,10 @@ impl<C: Connect> Actor<C> {
         for outbound in self.queue.drain(..) {
             let _ = outbound.reply.send(Err(error.clone()));
         }
+        self.reset_pacing();
+    }
+
+    fn reset_pacing(&mut self) {
         self.paused_until = None;
         self.send_at = None;
         for throttle in &mut self.throttles {
@@ -929,7 +1002,7 @@ impl<C: Connect> Actor<C> {
     }
 
     fn fail_all(&mut self, error: &ConnectorError) {
-        self.fail_in_flight(error);
+        self.close_in_flight(error);
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
             if let Command::Request(outbound) = command {

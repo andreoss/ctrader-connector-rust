@@ -313,6 +313,62 @@ pub enum ValueError {
         /// End of the range, in milliseconds since the Unix epoch.
         to: i64,
     },
+    /// The text has more characters than the server keeps.
+    #[error("{kind} has {length} characters, more than the {limit} allowed")]
+    TooLong {
+        /// Kind of the text.
+        kind: &'static str,
+        /// Number of characters of the rejected text.
+        length: usize,
+        /// Largest number of characters allowed.
+        limit: usize,
+    },
+    /// The value is smaller than the symbol allows.
+    #[error("{kind} must be at least {minimum}, got {value}")]
+    BelowMinimum {
+        /// Kind of the value.
+        kind: &'static str,
+        /// The rejected value.
+        value: Decimal,
+        /// Smallest value allowed.
+        minimum: Decimal,
+    },
+    /// The value is larger than the symbol allows.
+    #[error("{kind} must be at most {maximum}, got {value}")]
+    AboveMaximum {
+        /// Kind of the value.
+        kind: &'static str,
+        /// The rejected value.
+        value: Decimal,
+        /// Largest value allowed.
+        maximum: Decimal,
+    },
+    /// The value is not a multiple of the step of the symbol.
+    #[error("{kind} must be a multiple of {step}, got {value}")]
+    OffStep {
+        /// Kind of the value.
+        kind: &'static str,
+        /// The rejected value.
+        value: Decimal,
+        /// Step the value has to be a multiple of.
+        step: Decimal,
+    },
+    /// The value has more decimal places than the symbol has digits.
+    #[error("{kind} must have at most {digits} decimal places, got {value}")]
+    TooFine {
+        /// Kind of the value.
+        kind: &'static str,
+        /// The rejected value.
+        value: Decimal,
+        /// Digits of the symbol.
+        digits: u32,
+    },
+    /// Two values that have to agree do not.
+    #[error("{kind} does not match")]
+    Mismatch {
+        /// Kind of the value.
+        kind: &'static str,
+    },
 }
 
 /// Reasons a connection fails below the level of protocol messages.
@@ -395,6 +451,18 @@ pub enum TokenError {
     Status(u16),
 }
 
+/// What kept the answer to a request that was sent from arriving.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum Interruption {
+    /// The server did not answer in time.
+    #[error("no response within {0:?}")]
+    Timeout(Duration),
+    /// The connection failed while the answer was awaited.
+    #[error("transport failed: {0}")]
+    Transport(TransportError),
+}
+
 /// Any failure reported by this library.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -417,6 +485,10 @@ pub enum ConnectorError {
     /// The server did not answer a request in time.
     #[error("no response within {0:?}")]
     Timeout(Duration),
+    /// A request that must not be sent twice was sent, and the connection failed or the time
+    /// allowed ran out before the server answered: the server may or may not have acted on it.
+    #[error("the request was sent and its outcome is unknown: {0}")]
+    OutcomeUnknown(Interruption),
     /// The connection is shut down and accepts no further requests.
     #[error("connection is shut down")]
     Closed,
@@ -452,7 +524,10 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{ConfigError, ConnectorError, ErrorCode, ServerError, TransportError, ValueError};
+    use super::{
+        ConfigError, ConnectorError, ErrorCode, Interruption, ServerError, TransportError,
+        ValueError,
+    };
     use crate::common::ids::AccountId;
     use crate::common::time::Timestamp;
     use crate::proto_text;
@@ -610,6 +685,16 @@ mod tests {
             }
             .to_string(),
             "the server announced more data between 5 and 9 than it sent"
+        );
+        assert_eq!(
+            ConnectorError::OutcomeUnknown(Interruption::Timeout(Duration::from_secs(2)))
+                .to_string(),
+            "the request was sent and its outcome is unknown: no response within 2s"
+        );
+        assert_eq!(
+            ConnectorError::OutcomeUnknown(Interruption::Transport(TransportError::Closed))
+                .to_string(),
+            "the request was sent and its outcome is unknown: transport failed: connection closed by the peer"
         );
         assert_eq!(
             ConnectorError::Lagged { skipped: 3 }.to_string(),

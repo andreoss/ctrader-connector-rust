@@ -15,6 +15,7 @@ mod stream;
 pub mod symbols;
 pub mod ticks;
 pub mod token;
+pub mod trading;
 pub mod transport;
 pub mod trendbars;
 

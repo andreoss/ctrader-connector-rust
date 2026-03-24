@@ -5,17 +5,20 @@ use prost::Message;
 use crate::common::errors::{ConnectorError, TransportError};
 use crate::open_api::messages::{
     ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaAccountAuthReq, ProtoOaAccountAuthRes,
-    ProtoOaAccountDisconnectEvent, ProtoOaAccountsTokenInvalidatedEvent, ProtoOaApplicationAuthReq,
-    ProtoOaApplicationAuthRes, ProtoOaAssetListReq, ProtoOaAssetListRes,
-    ProtoOaCashFlowHistoryListReq, ProtoOaCashFlowHistoryListRes, ProtoOaClientDisconnectEvent,
+    ProtoOaAccountDisconnectEvent, ProtoOaAccountsTokenInvalidatedEvent, ProtoOaAmendOrderReq,
+    ProtoOaAmendPositionSltpReq, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes,
+    ProtoOaAssetListReq, ProtoOaAssetListRes, ProtoOaCancelOrderReq, ProtoOaCashFlowHistoryListReq,
+    ProtoOaCashFlowHistoryListRes, ProtoOaClientDisconnectEvent, ProtoOaClosePositionReq,
     ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaDepthEvent, ProtoOaErrorRes,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetAccountListByAccessTokenRes,
-    ProtoOaGetTickDataReq, ProtoOaGetTickDataRes, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
-    ProtoOaPayloadType, ProtoOaRefreshTokenReq, ProtoOaRefreshTokenRes, ProtoOaSpotEvent,
-    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
-    ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
-    ProtoOaSubscribeSpotsRes, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
-    ProtoOaSymbolsListRes, ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
+    ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq,
+    ProtoOaGetAccountListByAccessTokenRes, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
+    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaNewOrderReq, ProtoOaOrderErrorEvent,
+    ProtoOaPayloadType, ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaRefreshTokenReq,
+    ProtoOaRefreshTokenRes, ProtoOaSpotEvent, ProtoOaSubscribeDepthQuotesReq,
+    ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeLiveTrendbarReq,
+    ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq, ProtoOaSubscribeSpotsRes,
+    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
+    ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
     ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
     ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes, ProtoOaVersionReq, ProtoOaVersionRes,
     ProtoPayloadType,
@@ -142,6 +145,15 @@ payloads! {
     ProtoOaSymbolsListRes => ProtoOaPayloadType::ProtoOaSymbolsListRes,
     ProtoOaSymbolByIdReq => ProtoOaPayloadType::ProtoOaSymbolByIdReq,
     ProtoOaSymbolByIdRes => ProtoOaPayloadType::ProtoOaSymbolByIdRes,
+    ProtoOaNewOrderReq => ProtoOaPayloadType::ProtoOaNewOrderReq,
+    ProtoOaCancelOrderReq => ProtoOaPayloadType::ProtoOaCancelOrderReq,
+    ProtoOaAmendOrderReq => ProtoOaPayloadType::ProtoOaAmendOrderReq,
+    ProtoOaAmendPositionSltpReq => ProtoOaPayloadType::ProtoOaAmendPositionSltpReq,
+    ProtoOaClosePositionReq => ProtoOaPayloadType::ProtoOaClosePositionReq,
+    ProtoOaReconcileReq => ProtoOaPayloadType::ProtoOaReconcileReq,
+    ProtoOaReconcileRes => ProtoOaPayloadType::ProtoOaReconcileRes,
+    ProtoOaExecutionEvent => ProtoOaPayloadType::ProtoOaExecutionEvent,
+    ProtoOaOrderErrorEvent => ProtoOaPayloadType::ProtoOaOrderErrorEvent,
 }
 
 requests! {
@@ -159,6 +171,7 @@ requests! {
     ProtoOaAssetListReq => ProtoOaAssetListRes, false;
     ProtoOaSymbolsListReq => ProtoOaSymbolsListRes, false;
     ProtoOaSymbolByIdReq => ProtoOaSymbolByIdRes, false;
+    ProtoOaReconcileReq => ProtoOaReconcileRes, false;
     ProtoOaDealListReq => ProtoOaDealListRes, true;
     ProtoOaGetTrendbarsReq => ProtoOaGetTrendbarsRes, true;
     ProtoOaCashFlowHistoryListReq => ProtoOaCashFlowHistoryListRes, true;
@@ -177,7 +190,7 @@ mod tests {
     #[test]
     fn declared_payload_types_match_the_defaults_in_the_proto_files() {
         let declared = declared();
-        assert_eq!(declared.len(), 44);
+        assert_eq!(declared.len(), 53);
         for (name, constant, default) in declared {
             assert_eq!(i64::from(constant), i64::from(default), "{name}");
         }
