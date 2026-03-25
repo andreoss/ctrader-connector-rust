@@ -369,6 +369,12 @@ pub enum ValueError {
         /// Kind of the value.
         kind: &'static str,
     },
+    /// The value cannot be given for this kind of request.
+    #[error("{kind} is not supported here")]
+    Unsupported {
+        /// Kind of the value.
+        kind: &'static str,
+    },
 }
 
 /// Reasons a connection fails below the level of protocol messages.

@@ -14,7 +14,7 @@ use std::time::Duration;
 use ctrader_connector::common::config::{
     ConfigurationOpenApi, ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN, Environment,
 };
-use ctrader_connector::common::decimals::Volume;
+use ctrader_connector::common::decimals::{Price, Volume};
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
 use ctrader_connector::common::ids::{OrderId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
@@ -32,12 +32,13 @@ use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
 use ctrader_connector::open_api::ticks::TickDataParams;
 use ctrader_connector::open_api::trading::{
-    Comment, DealStatus, Execution, ExecutionType, Label, NewOrder, Order, OrderType, Position,
-    PositionStatus, TradeSide,
+    Comment, DealStatus, Execution, ExecutionType, Label, NewOrder, Order, OrderStatus, OrderType,
+    Position, PositionStatus, TimeInForce, TradeSide,
 };
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
 use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message;
+use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -1383,6 +1384,116 @@ async fn live_market_order_opens_a_position_that_reconcile_reads_back() {
         assert_eq!(position.price, deal.execution_price);
         assert_eq!(position.label.as_deref(), Some(desk.label.as_str()));
         assert_eq!(position.comment.as_deref(), Some("market order"));
+    })
+    .await;
+}
+
+impl Desk {
+    async fn market(&self) -> (Price, Price) {
+        let mut quotes = self
+            .client
+            .subscribe_quotes(self.account.id, &[self.symbol.id])
+            .await
+            .expect("spot subscription");
+        let both = timeout(Duration::from_secs(60), async {
+            loop {
+                let quote = quotes.next().await.expect("quote");
+                if let (Some(bid), Some(ask)) = (quote.bid, quote.ask) {
+                    return (bid, ask);
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{TRADED} did not quote both sides in 60 s"));
+        quotes.unsubscribe().await.expect("end of subscription");
+        both
+    }
+
+    fn scaled(&self, price: Price, percent: i64) -> Price {
+        let scaled = price
+            .value()
+            .checked_mul(Decimal::new(percent, 2))
+            .expect("scaled price")
+            .round_dp(self.symbol.digits);
+        Price::new(scaled).expect("price")
+    }
+}
+
+#[tokio::test]
+async fn live_limit_and_stop_orders_wait_far_from_the_market() {
+    trading("ct19", |desk| async move {
+        let (bid, ask) = desk.market().await;
+        let volume = desk.smallest();
+        let below = desk.scaled(bid, 50);
+        let above = desk.scaled(ask, 150);
+        let expiry = Timestamp::now()
+            .checked_add(Duration::from_secs(3_600))
+            .expect("expiry");
+        let limit = NewOrder::limit(
+            desk.account.id,
+            desk.symbol.id,
+            TradeSide::Buy,
+            volume,
+            below,
+        )
+        .good_till(expiry)
+        .label(desk.label());
+        let stop = NewOrder::stop(desk.account.id, desk.symbol.id, TradeSide::Buy, volume, above)
+            .label(desk.label());
+        let mut placed = Vec::new();
+        for order in [&limit, &stop] {
+            let accepted = desk
+                .client
+                .place_order(order, &desk.symbol)
+                .await
+                .expect("pending order");
+            assert_eq!(accepted.kind, ExecutionType::Accepted);
+            placed.push(accepted.order.expect("accepted order").id);
+        }
+        let (positions, orders) = desk.own().await;
+        println!(
+            "live pending orders: bid {bid} ask {ask}, reconcile lists {} own positions and own orders {:?}",
+            positions.len(),
+            orders
+                .iter()
+                .map(|order| (
+                    order.id,
+                    order.kind,
+                    order.side,
+                    order.volume.to_string(),
+                    order.limit_price.map(|price| price.to_string()),
+                    order.stop_price.map(|price| price.to_string()),
+                    order.time_in_force,
+                    order.status,
+                ))
+                .collect::<Vec<_>>(),
+        );
+        assert!(positions.is_empty());
+        assert_eq!(orders.len(), 2);
+        let read = |id: OrderId| {
+            orders
+                .iter()
+                .find(|order| order.id == id)
+                .expect("order read back")
+        };
+        let limit = read(placed[0]);
+        assert_eq!(limit.kind, OrderType::Limit);
+        assert_eq!(limit.side, TradeSide::Buy);
+        assert_eq!(limit.symbol, desk.symbol.id);
+        assert_eq!(limit.volume, volume);
+        assert_eq!(limit.limit_price, Some(below));
+        assert_eq!(limit.stop_price, None);
+        assert_eq!(limit.time_in_force, TimeInForce::GoodTillDate(expiry));
+        assert_eq!(limit.status, OrderStatus::Accepted);
+        let stop = read(placed[1]);
+        assert_eq!(stop.kind, OrderType::Stop);
+        assert_eq!(stop.side, TradeSide::Buy);
+        assert_eq!(stop.symbol, desk.symbol.id);
+        assert_eq!(stop.volume, volume);
+        assert_eq!(stop.stop_price, Some(above));
+        assert_eq!(stop.limit_price, None);
+        assert_eq!(stop.time_in_force, TimeInForce::GoodTillCancel);
+        assert_eq!(stop.status, OrderStatus::Accepted);
     })
     .await;
 }

@@ -9,6 +9,7 @@ use ctrader_connector::common::errors::{
     ConnectorError, ErrorCode, Interruption, TransportError, ValueError,
 };
 use ctrader_connector::common::ids::{AccountId, PositionId, SymbolId};
+use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
@@ -196,7 +197,12 @@ fn wire_order(request: &ProtoOaNewOrderReq, status: i32) -> ProtoOaOrder {
         },
         order_type: request.order_type,
         order_status: status,
-        time_in_force: Some(3),
+        time_in_force: request.time_in_force.or(Some(3)),
+        expiration_timestamp: request.expiration_timestamp,
+        limit_price: request.limit_price,
+        stop_price: request.stop_price,
+        stop_loss: request.stop_loss,
+        take_profit: request.take_profit,
         relative_stop_loss: request.relative_stop_loss,
         relative_take_profit: request.relative_take_profit,
         position_id: Some(500),
@@ -650,5 +656,164 @@ async fn order_that_does_not_fit_the_symbol_is_refused_before_anything_is_sent()
         })
     );
     assert_eq!(server.count(NEW_ORDER_REQ), 0);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn order_with_terms_its_kind_does_not_take_is_refused_before_anything_is_sent() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(accept).await;
+    let place = |order: NewOrder| {
+        let client = client.clone();
+        let symbol = symbol.clone();
+        async move { value_error(client.place_order(&order, &symbol).await) }
+    };
+    let unsupported = |kind| Some(ValueError::Unsupported { kind });
+    assert_eq!(
+        place(market(&symbol, TradeSide::Buy, "1").stop_loss(price("60000"))).await,
+        unsupported("protection given as a price")
+    );
+    assert_eq!(
+        place(market(&symbol, TradeSide::Buy, "1").take_profit(price("60000"))).await,
+        unsupported("protection given as a price")
+    );
+    assert_eq!(
+        place(market(&symbol, TradeSide::Buy, "1").good_till(Timestamp::EPOCH)).await,
+        unsupported("expiry of the order")
+    );
+    let pending = |text: &str| {
+        NewOrder::limit(
+            account(101),
+            symbol.id,
+            TradeSide::Buy,
+            volume("1"),
+            price(text),
+        )
+    };
+    assert_eq!(
+        place(pending("60000.005")).await,
+        Some(ValueError::TooFine {
+            kind: "price",
+            value: price("60000.005").value(),
+            digits: 2,
+        })
+    );
+    assert_eq!(
+        place(pending("0")).await,
+        Some(ValueError::BelowMinimum {
+            kind: "price",
+            value: price("0").value(),
+            minimum: price("0.01").value(),
+        })
+    );
+    assert_eq!(
+        place(pending("60000").stop_loss(price("59000.001"))).await,
+        Some(ValueError::TooFine {
+            kind: "protection given as a price",
+            value: price("59000.001").value(),
+            digits: 2,
+        })
+    );
+    assert_eq!(
+        place(NewOrder::stop(
+            account(101),
+            symbol.id,
+            TradeSide::Sell,
+            volume("1"),
+            price("0.001")
+        ))
+        .await,
+        Some(ValueError::TooFine {
+            kind: "price",
+            value: price("0.001").value(),
+            digits: 2,
+        })
+    );
+    assert_eq!(server.count(NEW_ORDER_REQ), 0);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn limit_and_stop_orders_carry_their_price_and_how_long_they_wait() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(accept).await;
+    let expiry = Timestamp::from_millis(1_900_000_000_000).expect("moment");
+    let limit = NewOrder::limit(
+        account(101),
+        symbol.id,
+        TradeSide::Buy,
+        volume("1"),
+        price("60000.5"),
+    )
+    .good_till(expiry)
+    .stop_loss_distance(price("5"))
+    .stop_loss(price("59000"))
+    .take_profit(price("61000.25"));
+    assert_eq!(limit.kind(), OrderType::Limit);
+    let placed = client
+        .place_order(&limit, &symbol)
+        .await
+        .expect("limit order")
+        .order
+        .expect("order");
+    assert_eq!(placed.kind, OrderType::Limit);
+    assert_eq!(placed.limit_price, Some(price("60000.5")));
+    assert_eq!(placed.stop_price, None);
+    assert_eq!(placed.time_in_force, TimeInForce::GoodTillDate(expiry));
+    assert_eq!(placed.stop_loss, Some(price("59000")));
+    assert_eq!(placed.take_profit, Some(price("61000.25")));
+    let stop = NewOrder::stop(
+        account(101),
+        symbol.id,
+        TradeSide::Sell,
+        volume("2"),
+        price("50000"),
+    )
+    .stop_loss(price("51000"))
+    .stop_loss_distance(price("100"))
+    .take_profit(price("49000"))
+    .take_profit_distance(price("200.5"));
+    assert_eq!(stop.kind(), OrderType::Stop);
+    let placed = client
+        .place_order(&stop, &symbol)
+        .await
+        .expect("stop order")
+        .order
+        .expect("order");
+    assert_eq!(placed.kind, OrderType::Stop);
+    assert_eq!(placed.side, TradeSide::Sell);
+    assert_eq!(placed.stop_price, Some(price("50000")));
+    assert_eq!(placed.limit_price, None);
+    assert_eq!(placed.time_in_force, TimeInForce::GoodTillCancel);
+    assert_eq!(placed.relative_stop_loss, Some(price("100")));
+    assert_eq!(placed.relative_take_profit, Some(price("200.5")));
+    let sent = sent_orders(&server);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].order_type, 2);
+    assert_eq!(sent[0].limit_price, Some(60_000.5));
+    assert_eq!(sent[0].stop_price, None);
+    assert_eq!(sent[0].time_in_force, Some(1));
+    assert_eq!(sent[0].expiration_timestamp, Some(1_900_000_000_000));
+    assert_eq!(sent[0].stop_loss, Some(59_000.0));
+    assert_eq!(sent[0].take_profit, Some(61_000.25));
+    assert_eq!(sent[0].relative_stop_loss, None);
+    assert_eq!(sent[0].relative_take_profit, None);
+    assert_eq!(sent[1].order_type, 3);
+    assert_eq!(sent[1].trade_side, 2);
+    assert_eq!(sent[1].volume, 200);
+    assert_eq!(sent[1].limit_price, None);
+    assert_eq!(sent[1].stop_price, Some(50_000.0));
+    assert_eq!(sent[1].time_in_force, Some(2));
+    assert_eq!(sent[1].expiration_timestamp, None);
+    assert_eq!(sent[1].stop_loss, None);
+    assert_eq!(sent[1].take_profit, None);
+    assert_eq!(sent[1].relative_stop_loss, Some(10_000_000));
+    assert_eq!(sent[1].relative_take_profit, Some(20_050_000));
     client.shutdown().await;
 }

@@ -34,6 +34,7 @@
 //! ```
 
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::common::decimals::{PRICE_SCALE, Price, Volume};
 use crate::common::errors::{ConnectorError, ErrorCode, ServerError, ValueError};
@@ -72,6 +73,7 @@ const POSITION_STATUS: &str = "position status";
 const DEAL_STATUS: &str = "deal status";
 const EXECUTION_TYPE: &str = "execution type";
 const SLIPPAGE: &str = "slippage in points";
+const PROTECTION: &str = "protection given as a price";
 
 macro_rules! text {
     ($(#[$doc:meta])* $name:ident, $kind:expr, $limit:expr) => {
@@ -805,11 +807,60 @@ fn checked_distance(distance: Price, symbol: &Symbol) -> Result<i64, ValueError>
     })
 }
 
+fn checked_price(price: Price, kind: &'static str, symbol: &Symbol) -> Result<f64, ValueError> {
+    let value = checked_digits(price, kind, symbol)?.value();
+    if value.is_zero() {
+        return Err(ValueError::BelowMinimum {
+            kind,
+            value,
+            minimum: Decimal::new(1, symbol.digits.min(PRICE_SCALE)),
+        });
+    }
+    value
+        .to_f64()
+        .ok_or(ValueError::Unrepresentable { kind, value })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Terms {
+    Market,
+    Limit(Price),
+    Stop(Price),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Protection {
+    At(Price),
+    Away(Price),
+}
+
+impl Protection {
+    fn price(self, market: bool, symbol: &Symbol) -> Result<Option<f64>, ValueError> {
+        match self {
+            Self::At(_) if market => Err(ValueError::Unsupported { kind: PROTECTION }),
+            Self::At(price) => checked_price(price, PROTECTION, symbol).map(Some),
+            Self::Away(_) => Ok(None),
+        }
+    }
+
+    fn distance(self, symbol: &Symbol) -> Result<Option<i64>, ValueError> {
+        match self {
+            Self::At(_) => Ok(None),
+            Self::Away(distance) => checked_distance(distance, symbol).map(Some),
+        }
+    }
+}
+
 /// Order to be placed.
 ///
-/// Stop loss and take profit are given as distances from the price the order is executed at,
-/// which is the one form the server takes for every kind of order: the stop loss lies that far
-/// below the price of a buy and above the price of a sell, the take profit on the other side.
+/// An order at market is executed at once. A limit order and a stop order wait at their price
+/// until the market reaches it, till they are cancelled or, when
+/// [`good_till`](NewOrder::good_till) names a moment, till then.
+///
+/// Stop loss and take profit are given as prices or as distances from the price the order is
+/// executed at: the stop loss lies that far below the price of a buy and above the price of a
+/// sell, the take profit on the other side. The server takes only distances for an order at
+/// market.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[must_use]
 pub struct NewOrder {
@@ -817,13 +868,36 @@ pub struct NewOrder {
     symbol: SymbolId,
     side: TradeSide,
     volume: Volume,
+    terms: Terms,
+    expiry: Option<Timestamp>,
     label: Option<Label>,
     comment: Option<Comment>,
-    stop_loss: Option<Price>,
-    take_profit: Option<Price>,
+    stop_loss: Option<Protection>,
+    take_profit: Option<Protection>,
 }
 
 impl NewOrder {
+    const fn new(
+        account: AccountId,
+        symbol: SymbolId,
+        side: TradeSide,
+        volume: Volume,
+        terms: Terms,
+    ) -> Self {
+        Self {
+            account,
+            symbol,
+            side,
+            volume,
+            terms,
+            expiry: None,
+            label: None,
+            comment: None,
+            stop_loss: None,
+            take_profit: None,
+        }
+    }
+
     /// Orders the volume, in units of the symbol, at the price of the market.
     pub const fn market(
         account: AccountId,
@@ -831,16 +905,37 @@ impl NewOrder {
         side: TradeSide,
         volume: Volume,
     ) -> Self {
-        Self {
-            account,
-            symbol,
-            side,
-            volume,
-            label: None,
-            comment: None,
-            stop_loss: None,
-            take_profit: None,
-        }
+        Self::new(account, symbol, side, volume, Terms::Market)
+    }
+
+    /// Orders the volume, in units of the symbol, at the given price or a better one.
+    pub const fn limit(
+        account: AccountId,
+        symbol: SymbolId,
+        side: TradeSide,
+        volume: Volume,
+        price: Price,
+    ) -> Self {
+        Self::new(account, symbol, side, volume, Terms::Limit(price))
+    }
+
+    /// Orders the volume, in units of the symbol, at market once the given price is reached.
+    pub const fn stop(
+        account: AccountId,
+        symbol: SymbolId,
+        side: TradeSide,
+        volume: Volume,
+        price: Price,
+    ) -> Self {
+        Self::new(account, symbol, side, volume, Terms::Stop(price))
+    }
+
+    /// Keeps a pending order in force till the given moment and no longer.
+    ///
+    /// An order at market does not wait, so one with an expiry is refused before it is sent.
+    pub const fn good_till(mut self, expiry: Timestamp) -> Self {
+        self.expiry = Some(expiry);
+        self
     }
 
     /// Gives the order a label, which the position it opens keeps.
@@ -855,15 +950,33 @@ impl NewOrder {
         self
     }
 
-    /// Sets a stop loss at the given distance from the price of execution.
-    pub const fn stop_loss_distance(mut self, distance: Price) -> Self {
-        self.stop_loss = Some(distance);
+    /// Sets a stop loss at the given price, in place of one set before.
+    ///
+    /// An order at market with a stop loss given as a price is refused before it is sent.
+    pub const fn stop_loss(mut self, price: Price) -> Self {
+        self.stop_loss = Some(Protection::At(price));
         self
     }
 
-    /// Sets a take profit at the given distance from the price of execution.
+    /// Sets a take profit at the given price, in place of one set before.
+    ///
+    /// An order at market with a take profit given as a price is refused before it is sent.
+    pub const fn take_profit(mut self, price: Price) -> Self {
+        self.take_profit = Some(Protection::At(price));
+        self
+    }
+
+    /// Sets a stop loss at the given distance from the price of execution, in place of one
+    /// set before.
+    pub const fn stop_loss_distance(mut self, distance: Price) -> Self {
+        self.stop_loss = Some(Protection::Away(distance));
+        self
+    }
+
+    /// Sets a take profit at the given distance from the price of execution, in place of one
+    /// set before.
     pub const fn take_profit_distance(mut self, distance: Price) -> Self {
-        self.take_profit = Some(distance);
+        self.take_profit = Some(Protection::Away(distance));
         self
     }
 
@@ -894,29 +1007,62 @@ impl NewOrder {
     /// Returns the kind of the order.
     #[must_use]
     pub const fn kind(&self) -> OrderType {
-        OrderType::Market
+        match self.terms {
+            Terms::Market => OrderType::Market,
+            Terms::Limit(_) => OrderType::Limit,
+            Terms::Stop(_) => OrderType::Stop,
+        }
     }
 
     fn to_wire(&self, symbol: &Symbol) -> Result<ProtoOaNewOrderReq, ValueError> {
         if symbol.id != self.symbol {
             return Err(ValueError::Mismatch { kind: SYMBOL });
         }
-        let distance = |distance: Option<Price>| {
-            distance
-                .map(|distance| checked_distance(distance, symbol))
-                .transpose()
+        let market = matches!(self.terms, Terms::Market);
+        if market && self.expiry.is_some() {
+            return Err(ValueError::Unsupported { kind: EXPIRY });
+        }
+        let (kind, limit_price, stop_price) = match self.terms {
+            Terms::Market => (ProtoOaOrderType::Market, None, None),
+            Terms::Limit(price) => (
+                ProtoOaOrderType::Limit,
+                Some(checked_price(price, PRICE, symbol)?),
+                None,
+            ),
+            Terms::Stop(price) => (
+                ProtoOaOrderType::Stop,
+                None,
+                Some(checked_price(price, PRICE, symbol)?),
+            ),
+        };
+        let time_in_force = match (market, self.expiry) {
+            (true, _) => None,
+            (false, Some(_)) => Some(ProtoOaTimeInForce::GoodTillDate),
+            (false, None) => Some(ProtoOaTimeInForce::GoodTillCancel),
+        };
+        let price = |protection: Option<Protection>| {
+            protection.map_or(Ok(None), |protection| protection.price(market, symbol))
+        };
+        let distance = |protection: Option<Protection>| {
+            protection.map_or(Ok(None), |protection| protection.distance(symbol))
         };
         Ok(ProtoOaNewOrderReq {
             ctid_trader_account_id: self.account.get(),
             symbol_id: self.symbol.get(),
-            order_type: i32::from(ProtoOaOrderType::Market),
+            order_type: i32::from(kind),
             trade_side: i32::from(self.side.to_wire()),
             volume: checked_volume(self.volume, symbol)?,
+            limit_price,
+            stop_price,
+            time_in_force: time_in_force.map(i32::from),
+            expiration_timestamp: self.expiry.map(Timestamp::as_millis),
             label: self.label.as_ref().map(|label| label.as_str().to_owned()),
             comment: self
                 .comment
                 .as_ref()
                 .map(|comment| comment.as_str().to_owned()),
+            stop_loss: price(self.stop_loss)?,
+            take_profit: price(self.take_profit)?,
             relative_stop_loss: distance(self.stop_loss)?,
             relative_take_profit: distance(self.take_profit)?,
             ..ProtoOaNewOrderReq::default()
@@ -939,11 +1085,13 @@ impl OpenApiClient {
     /// `symbol` holds the trading details of the symbol of the order, as
     /// [`OpenApiClient::symbol_details`] returns them. The order is checked against them and
     /// nothing is sent when its volume lies outside the smallest and largest volume of the
-    /// symbol or off its step, or when a distance is finer than the digits of the symbol.
+    /// symbol or off its step, when a price or a distance is finer than the digits of the
+    /// symbol, or when the order has terms its kind does not take.
     ///
     /// The first event of an order the server takes is its acceptance, with
     /// [`ExecutionType::Accepted`]. An order at market is executed right after: the fill
-    /// arrives as a further event, which is read from the events of the connection.
+    /// arrives as a further event, which is read from the events of the connection. A pending
+    /// order stays in force and is listed among the orders of the account.
     ///
     /// The request is written at most once and never sent again by this library.
     ///
@@ -1158,6 +1306,12 @@ mod tests {
                     kind: "symbol of the order",
                 },
                 "symbol of the order does not match",
+            ),
+            (
+                ValueError::Unsupported {
+                    kind: "expiry of the order",
+                },
+                "expiry of the order is not supported here",
             ),
         ];
         for (error, text) in cases {
