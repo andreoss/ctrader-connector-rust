@@ -1497,3 +1497,60 @@ async fn live_limit_and_stop_orders_wait_far_from_the_market() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn live_stop_limit_order_waits_with_its_stop_price_and_slippage() {
+    trading("ct20", |desk| async move {
+        let (bid, ask) = desk.market().await;
+        let volume = desk.smallest();
+        let above = desk.scaled(ask, 150);
+        let slippage = 40;
+        let order = NewOrder::stop_limit(
+            desk.account.id,
+            desk.symbol.id,
+            TradeSide::Buy,
+            volume,
+            above,
+            slippage,
+        )
+        .label(desk.label());
+        let accepted = desk
+            .client
+            .place_order(&order, &desk.symbol)
+            .await
+            .expect("stop-limit order");
+        assert_eq!(accepted.kind, ExecutionType::Accepted);
+        let placed = accepted.order.expect("accepted order");
+        let (positions, orders) = desk.own().await;
+        println!(
+            "live stop-limit order: bid {bid} ask {ask}, reconcile lists {} own positions and own orders {:?}",
+            positions.len(),
+            orders
+                .iter()
+                .map(|order| (
+                    order.id,
+                    order.kind,
+                    order.side,
+                    order.volume.to_string(),
+                    order.stop_price.map(|price| price.to_string()),
+                    order.limit_price.map(|price| price.to_string()),
+                    order.slippage_points,
+                    order.time_in_force,
+                ))
+                .collect::<Vec<_>>(),
+        );
+        assert!(positions.is_empty());
+        assert_eq!(orders.len(), 1);
+        let read = &orders[0];
+        assert_eq!(read.id, placed.id);
+        assert_eq!(read.kind, OrderType::StopLimit);
+        assert_eq!(read.side, TradeSide::Buy);
+        assert_eq!(read.symbol, desk.symbol.id);
+        assert_eq!(read.volume, volume);
+        assert_eq!(read.stop_price, Some(above));
+        assert_eq!(read.limit_price, None);
+        assert_eq!(read.slippage_points, Some(slippage));
+        assert_eq!(read.status, OrderStatus::Accepted);
+    })
+    .await;
+}

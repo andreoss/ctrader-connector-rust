@@ -826,6 +826,7 @@ enum Terms {
     Market,
     Limit(Price),
     Stop(Price),
+    StopLimit { stop: Price, slippage: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -853,8 +854,8 @@ impl Protection {
 
 /// Order to be placed.
 ///
-/// An order at market is executed at once. A limit order and a stop order wait at their price
-/// until the market reaches it, till they are cancelled or, when
+/// An order at market is executed at once. A limit, a stop and a stop-limit order wait at
+/// their price until the market reaches it, till they are cancelled or, when
 /// [`good_till`](NewOrder::good_till) names a moment, till then.
 ///
 /// Stop loss and take profit are given as prices or as distances from the price the order is
@@ -928,6 +929,28 @@ impl NewOrder {
         price: Price,
     ) -> Self {
         Self::new(account, symbol, side, volume, Terms::Stop(price))
+    }
+
+    /// Orders the volume, in units of the symbol, once the given stop price is reached, at a
+    /// price no further from it than the slippage, in points of the symbol.
+    ///
+    /// The server models the limit of a stop-limit order as that distance and takes no limit
+    /// price for it.
+    pub const fn stop_limit(
+        account: AccountId,
+        symbol: SymbolId,
+        side: TradeSide,
+        volume: Volume,
+        stop: Price,
+        slippage: u32,
+    ) -> Self {
+        Self::new(
+            account,
+            symbol,
+            side,
+            volume,
+            Terms::StopLimit { stop, slippage },
+        )
     }
 
     /// Keeps a pending order in force till the given moment and no longer.
@@ -1011,6 +1034,7 @@ impl NewOrder {
             Terms::Market => OrderType::Market,
             Terms::Limit(_) => OrderType::Limit,
             Terms::Stop(_) => OrderType::Stop,
+            Terms::StopLimit { .. } => OrderType::StopLimit,
         }
     }
 
@@ -1022,17 +1046,28 @@ impl NewOrder {
         if market && self.expiry.is_some() {
             return Err(ValueError::Unsupported { kind: EXPIRY });
         }
-        let (kind, limit_price, stop_price) = match self.terms {
-            Terms::Market => (ProtoOaOrderType::Market, None, None),
+        let (kind, limit_price, stop_price, slippage) = match self.terms {
+            Terms::Market => (ProtoOaOrderType::Market, None, None, None),
             Terms::Limit(price) => (
                 ProtoOaOrderType::Limit,
                 Some(checked_price(price, PRICE, symbol)?),
+                None,
                 None,
             ),
             Terms::Stop(price) => (
                 ProtoOaOrderType::Stop,
                 None,
                 Some(checked_price(price, PRICE, symbol)?),
+                None,
+            ),
+            Terms::StopLimit { stop, slippage } => (
+                ProtoOaOrderType::StopLimit,
+                None,
+                Some(checked_price(stop, PRICE, symbol)?),
+                Some(
+                    i32::try_from(slippage)
+                        .map_err(|_| ValueError::OutOfRange { kind: SLIPPAGE })?,
+                ),
             ),
         };
         let time_in_force = match (market, self.expiry) {
@@ -1054,6 +1089,7 @@ impl NewOrder {
             volume: checked_volume(self.volume, symbol)?,
             limit_price,
             stop_price,
+            slippage_in_points: slippage,
             time_in_force: time_in_force.map(i32::from),
             expiration_timestamp: self.expiry.map(Timestamp::as_millis),
             label: self.label.as_ref().map(|label| label.as_str().to_owned()),

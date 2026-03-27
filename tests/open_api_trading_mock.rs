@@ -201,6 +201,7 @@ fn wire_order(request: &ProtoOaNewOrderReq, status: i32) -> ProtoOaOrder {
         expiration_timestamp: request.expiration_timestamp,
         limit_price: request.limit_price,
         stop_price: request.stop_price,
+        slippage_in_points: request.slippage_in_points.map(i64::from),
         stop_loss: request.stop_loss,
         take_profit: request.take_profit,
         relative_stop_loss: request.relative_stop_loss,
@@ -815,5 +816,51 @@ async fn limit_and_stop_orders_carry_their_price_and_how_long_they_wait() {
     assert_eq!(sent[1].take_profit, None);
     assert_eq!(sent[1].relative_stop_loss, Some(10_000_000));
     assert_eq!(sent[1].relative_take_profit, Some(20_050_000));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_limit_order_carries_its_stop_price_and_slippage_and_no_limit_price() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(accept).await;
+    let stop_limit = |slippage: u32| {
+        NewOrder::stop_limit(
+            account(101),
+            symbol.id,
+            TradeSide::Buy,
+            volume("1"),
+            price("70000.5"),
+            slippage,
+        )
+    };
+    assert_eq!(stop_limit(25).kind(), OrderType::StopLimit);
+    let placed = client
+        .place_order(&stop_limit(25), &symbol)
+        .await
+        .expect("stop-limit order")
+        .order
+        .expect("order");
+    assert_eq!(placed.kind, OrderType::StopLimit);
+    assert_eq!(placed.stop_price, Some(price("70000.5")));
+    assert_eq!(placed.limit_price, None);
+    assert_eq!(placed.slippage_points, Some(25));
+    assert_eq!(placed.time_in_force, TimeInForce::GoodTillCancel);
+    assert_eq!(
+        value_error(client.place_order(&stop_limit(u32::MAX), &symbol).await),
+        Some(ValueError::OutOfRange {
+            kind: "slippage in points"
+        })
+    );
+    let sent = sent_orders(&server);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].order_type, 6);
+    assert_eq!(sent[0].stop_price, Some(70_000.5));
+    assert_eq!(sent[0].limit_price, None);
+    assert_eq!(sent[0].slippage_in_points, Some(25));
+    assert_eq!(sent[0].base_slippage_price, None);
+    assert_eq!(sent[0].time_in_force, Some(2));
     client.shutdown().await;
 }
