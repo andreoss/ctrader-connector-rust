@@ -42,10 +42,10 @@ use crate::common::ids::{AccountId, DealId, OrderId, PositionId, SymbolId};
 use crate::common::time::Timestamp;
 use crate::open_api::client::OpenApiClient;
 use crate::open_api::messages::{
-    ProtoMessage, ProtoOaClosePositionDetail, ProtoOaDeal, ProtoOaDealStatus,
-    ProtoOaExecutionEvent, ProtoOaExecutionType, ProtoOaNewOrderReq, ProtoOaOrder,
-    ProtoOaOrderErrorEvent, ProtoOaOrderStatus, ProtoOaOrderType, ProtoOaPosition,
-    ProtoOaPositionStatus, ProtoOaTimeInForce, ProtoOaTradeSide,
+    ProtoMessage, ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaClosePositionDetail,
+    ProtoOaDeal, ProtoOaDealStatus, ProtoOaExecutionEvent, ProtoOaExecutionType,
+    ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent, ProtoOaOrderStatus, ProtoOaOrderType,
+    ProtoOaPosition, ProtoOaPositionStatus, ProtoOaTimeInForce, ProtoOaTradeSide,
 };
 use crate::open_api::payload::Payload;
 use crate::open_api::symbols::Symbol;
@@ -74,6 +74,7 @@ const DEAL_STATUS: &str = "deal status";
 const EXECUTION_TYPE: &str = "execution type";
 const SLIPPAGE: &str = "slippage in points";
 const PROTECTION: &str = "protection given as a price";
+const AMENDMENT: &str = "amendment of an order that does not wait at a price";
 
 macro_rules! text {
     ($(#[$doc:meta])* $name:ident, $kind:expr, $limit:expr) => {
@@ -1106,6 +1107,213 @@ impl NewOrder {
     }
 }
 
+/// Change to a pending order.
+///
+/// The amendment starts from the order as it was read and carries every value the request
+/// can state, changed or not, so the order ends up exactly as the amendment describes it: a
+/// stop loss, a take profit or an expiry the amendment does not hold is taken off the order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[must_use]
+pub struct OrderAmendment {
+    account: AccountId,
+    order: OrderId,
+    symbol: SymbolId,
+    kind: OrderType,
+    volume: Volume,
+    price: Option<Price>,
+    expiry: Option<Timestamp>,
+    stop_loss: Option<Protection>,
+    take_profit: Option<Protection>,
+    slippage: Option<u32>,
+}
+
+impl OrderAmendment {
+    /// Starts an amendment that leaves the order of the account as it is.
+    pub fn of(account: AccountId, order: &Order) -> Self {
+        let protection = |price: Option<Price>, distance: Option<Price>| {
+            price
+                .map(Protection::At)
+                .or_else(|| distance.map(Protection::Away))
+        };
+        Self {
+            account,
+            order: order.id,
+            symbol: order.symbol,
+            kind: order.kind,
+            volume: order.volume,
+            price: match order.kind {
+                OrderType::Limit => order.limit_price,
+                _ => order.stop_price,
+            },
+            expiry: match order.time_in_force {
+                TimeInForce::GoodTillDate(expiry) => Some(expiry),
+                _ => None,
+            },
+            stop_loss: protection(order.stop_loss, order.relative_stop_loss),
+            take_profit: protection(order.take_profit, order.relative_take_profit),
+            slippage: order.slippage_points,
+        }
+    }
+
+    /// Changes the volume, in units of the symbol.
+    pub const fn volume(mut self, volume: Volume) -> Self {
+        self.volume = volume;
+        self
+    }
+
+    /// Changes the price the order waits at: the limit price of a limit order, the stop price
+    /// of a stop or stop-limit order.
+    pub const fn price(mut self, price: Price) -> Self {
+        self.price = Some(price);
+        self
+    }
+
+    /// Keeps the order in force till the given moment.
+    pub const fn good_till(mut self, expiry: Timestamp) -> Self {
+        self.expiry = Some(expiry);
+        self
+    }
+
+    /// Keeps the order in force until it is executed or cancelled.
+    pub const fn good_till_cancelled(mut self) -> Self {
+        self.expiry = None;
+        self
+    }
+
+    /// Sets the stop loss to the given price, or takes it off the order with `None`.
+    pub fn stop_loss(mut self, price: Option<Price>) -> Self {
+        self.stop_loss = price.map(Protection::At);
+        self
+    }
+
+    /// Sets the take profit to the given price, or takes it off the order with `None`.
+    pub fn take_profit(mut self, price: Option<Price>) -> Self {
+        self.take_profit = price.map(Protection::At);
+        self
+    }
+
+    /// Changes the slippage of a stop-limit order, in points of the symbol.
+    pub const fn slippage(mut self, points: u32) -> Self {
+        self.slippage = Some(points);
+        self
+    }
+
+    /// Returns the order the amendment changes.
+    #[must_use]
+    pub const fn order(&self) -> OrderId {
+        self.order
+    }
+
+    fn to_wire(&self, symbol: &Symbol) -> Result<ProtoOaAmendOrderReq, ValueError> {
+        if symbol.id != self.symbol {
+            return Err(ValueError::Mismatch { kind: SYMBOL });
+        }
+        let price = self
+            .price
+            .map(|price| checked_price(price, PRICE, symbol))
+            .transpose()?;
+        let (limit_price, stop_price, slippage) = match self.kind {
+            OrderType::Limit => (price, None, None),
+            OrderType::Stop => (None, price, None),
+            OrderType::StopLimit => (None, price, self.slippage),
+            _ => return Err(ValueError::Unsupported { kind: AMENDMENT }),
+        };
+        let at = |protection: Option<Protection>| {
+            protection.map_or(Ok(None), |protection| protection.price(false, symbol))
+        };
+        let away = |protection: Option<Protection>| {
+            protection.map_or(Ok(None), |protection| protection.distance(symbol))
+        };
+        Ok(ProtoOaAmendOrderReq {
+            payload_type: None,
+            ctid_trader_account_id: self.account.get(),
+            order_id: self.order.get(),
+            volume: Some(checked_volume(self.volume, symbol)?),
+            limit_price,
+            stop_price,
+            expiration_timestamp: self.expiry.map(Timestamp::as_millis),
+            stop_loss: at(self.stop_loss)?,
+            take_profit: at(self.take_profit)?,
+            slippage_in_points: slippage
+                .map(|points| {
+                    i32::try_from(points).map_err(|_| ValueError::OutOfRange { kind: SLIPPAGE })
+                })
+                .transpose()?,
+            relative_stop_loss: away(self.stop_loss)?,
+            relative_take_profit: away(self.take_profit)?,
+            guaranteed_stop_loss: None,
+            trailing_stop_loss: None,
+            stop_trigger_method: None,
+        })
+    }
+}
+
+/// Change to the stop loss and take profit of a position.
+///
+/// The amendment starts from the position as it was read; the request states both prices, and
+/// one it does not state is taken off the position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
+pub struct PositionAmendment {
+    account: AccountId,
+    position: PositionId,
+    symbol: SymbolId,
+    stop_loss: Option<Price>,
+    take_profit: Option<Price>,
+}
+
+impl PositionAmendment {
+    /// Starts an amendment that leaves the position of the account as it is.
+    pub const fn of(account: AccountId, position: &Position) -> Self {
+        Self {
+            account,
+            position: position.id,
+            symbol: position.symbol,
+            stop_loss: position.stop_loss,
+            take_profit: position.take_profit,
+        }
+    }
+
+    /// Sets the stop loss to the given price, or removes it with `None`.
+    pub const fn stop_loss(mut self, price: Option<Price>) -> Self {
+        self.stop_loss = price;
+        self
+    }
+
+    /// Sets the take profit to the given price, or removes it with `None`.
+    pub const fn take_profit(mut self, price: Option<Price>) -> Self {
+        self.take_profit = price;
+        self
+    }
+
+    /// Returns the position the amendment changes.
+    #[must_use]
+    pub const fn position(&self) -> PositionId {
+        self.position
+    }
+
+    fn to_wire(self, symbol: &Symbol) -> Result<ProtoOaAmendPositionSltpReq, ValueError> {
+        if symbol.id != self.symbol {
+            return Err(ValueError::Mismatch { kind: SYMBOL });
+        }
+        let price = |price: Option<Price>| {
+            price
+                .map(|price| checked_price(price, PROTECTION, symbol))
+                .transpose()
+        };
+        Ok(ProtoOaAmendPositionSltpReq {
+            payload_type: None,
+            ctid_trader_account_id: self.account.get(),
+            position_id: self.position.get(),
+            stop_loss: price(self.stop_loss)?,
+            take_profit: price(self.take_profit)?,
+            guaranteed_stop_loss: None,
+            trailing_stop_loss: None,
+            stop_loss_trigger_method: None,
+        })
+    }
+}
+
 impl OpenApiClient {
     pub(crate) async fn trade<R: Payload>(&self, request: &R) -> Result<Execution, ConnectorError> {
         let message = self
@@ -1147,6 +1355,51 @@ impl OpenApiClient {
         symbol: &Symbol,
     ) -> Result<Execution, ConnectorError> {
         let request = order.to_wire(symbol)?;
+        self.trade(&request).await
+    }
+
+    /// Amends a pending order and returns the first execution event the server answers with,
+    /// which for an amendment the server takes has [`ExecutionType::Replaced`] and carries
+    /// the order as it is afterwards.
+    ///
+    /// `symbol` holds the trading details of the symbol of the order; the amendment is checked
+    /// against them as an order is before it is placed. Only limit, stop and stop-limit orders
+    /// can be amended.
+    ///
+    /// The request is written at most once and never sent again by this library.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`OpenApiClient::place_order`].
+    pub async fn amend_order(
+        &self,
+        amendment: &OrderAmendment,
+        symbol: &Symbol,
+    ) -> Result<Execution, ConnectorError> {
+        let request = amendment.to_wire(symbol)?;
+        self.trade(&request).await
+    }
+
+    /// Amends the stop loss and take profit of a position and returns the first execution
+    /// event the server answers with, which carries the position as it is afterwards. For an
+    /// amendment the server takes the event has [`ExecutionType::Accepted`] when the position
+    /// had neither a stop loss nor a take profit before, since the order that holds them is
+    /// new then, and [`ExecutionType::Replaced`] otherwise.
+    ///
+    /// `symbol` holds the trading details of the symbol of the position; the prices are
+    /// checked against its digits before anything is sent.
+    ///
+    /// The request is written at most once and never sent again by this library.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`OpenApiClient::place_order`].
+    pub async fn amend_position(
+        &self,
+        amendment: &PositionAmendment,
+        symbol: &Symbol,
+    ) -> Result<Execution, ConnectorError> {
+        let request = amendment.to_wire(symbol)?;
         self.trade(&request).await
     }
 }

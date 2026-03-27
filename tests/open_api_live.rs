@@ -16,7 +16,7 @@ use ctrader_connector::common::config::{
 };
 use ctrader_connector::common::decimals::{Price, Volume};
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
-use ctrader_connector::common::ids::{OrderId, SymbolId};
+use ctrader_connector::common::ids::{OrderId, PositionId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
@@ -32,8 +32,8 @@ use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
 use ctrader_connector::open_api::ticks::TickDataParams;
 use ctrader_connector::open_api::trading::{
-    Comment, DealStatus, Execution, ExecutionType, Label, NewOrder, Order, OrderStatus, OrderType,
-    Position, PositionStatus, TimeInForce, TradeSide,
+    Comment, DealStatus, Execution, ExecutionType, Label, NewOrder, Order, OrderAmendment,
+    OrderStatus, OrderType, Position, PositionAmendment, PositionStatus, TimeInForce, TradeSide,
 };
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
 use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
@@ -1553,4 +1553,171 @@ async fn live_stop_limit_order_waits_with_its_stop_price_and_slippage() {
         assert_eq!(read.status, OrderStatus::Accepted);
     })
     .await;
+}
+
+#[tokio::test]
+async fn live_amendments_change_a_pending_order_and_the_protection_of_a_position() {
+    trading("ct21", |desk| async move {
+        let (bid, ask) = desk.market().await;
+        amend_pending(&desk, bid, ask).await;
+        amend_protection(&desk, bid, ask).await;
+    })
+    .await;
+}
+
+async fn amend_pending(desk: &Desk, bid: Price, ask: Price) {
+    let volume = desk.smallest();
+    let hour = Duration::from_secs(3_600);
+    let expiry = Timestamp::now().checked_add(hour).expect("expiry");
+    let order = NewOrder::limit(
+        desk.account.id,
+        desk.symbol.id,
+        TradeSide::Buy,
+        volume,
+        desk.scaled(bid, 50),
+    )
+    .good_till(expiry)
+    .label(desk.label());
+    let placed = desk
+        .client
+        .place_order(&order, &desk.symbol)
+        .await
+        .expect("limit order")
+        .order
+        .expect("accepted order");
+    let doubled = Volume::new(volume.value() + volume.value()).expect("volume");
+    let later = expiry.checked_add(hour).expect("expiry");
+    let (price, stop_loss, take_profit) = (
+        desk.scaled(bid, 45),
+        desk.scaled(bid, 40),
+        desk.scaled(ask, 160),
+    );
+    let amendment = OrderAmendment::of(desk.account.id, &placed)
+        .price(price)
+        .volume(doubled)
+        .good_till(later)
+        .stop_loss(Some(stop_loss))
+        .take_profit(Some(take_profit));
+    assert_eq!(amendment.order(), placed.id);
+    let replaced = desk
+        .client
+        .amend_order(&amendment, &desk.symbol)
+        .await
+        .expect("amended order");
+    assert_eq!(replaced.kind, ExecutionType::Replaced);
+    let read = desk.order(placed.id).await;
+    println!(
+        "live amended order: {} volume {} price {:?} till {:?} stop loss {:?} take profit {:?}",
+        read.id,
+        read.volume,
+        read.limit_price.map(|price| price.to_string()),
+        read.time_in_force,
+        read.stop_loss.map(|price| price.to_string()),
+        read.take_profit.map(|price| price.to_string()),
+    );
+    assert_eq!(read.volume, doubled);
+    assert_eq!(read.limit_price, Some(price));
+    assert_eq!(read.time_in_force, TimeInForce::GoodTillDate(later));
+    assert_eq!(read.stop_loss, Some(stop_loss));
+    assert_eq!(read.take_profit, Some(take_profit));
+    let bare = OrderAmendment::of(desk.account.id, &read)
+        .stop_loss(None)
+        .good_till_cancelled();
+    let replaced = desk
+        .client
+        .amend_order(&bare, &desk.symbol)
+        .await
+        .expect("amended order");
+    assert_eq!(replaced.kind, ExecutionType::Replaced);
+    let read = desk.order(placed.id).await;
+    println!(
+        "live amended order without stop loss and expiry: till {:?} stop loss {:?} take profit {:?}",
+        read.time_in_force,
+        read.stop_loss.map(|price| price.to_string()),
+        read.take_profit.map(|price| price.to_string()),
+    );
+    assert_eq!(read.volume, doubled);
+    assert_eq!(read.limit_price, Some(price));
+    assert_eq!(read.stop_loss, None);
+    assert_eq!(read.take_profit, Some(take_profit));
+    assert_eq!(read.time_in_force, TimeInForce::GoodTillCancel);
+}
+
+async fn amend_protection(desk: &Desk, bid: Price, ask: Price) {
+    let volume = desk.smallest();
+    let mut events = desk.client.events();
+    let market = NewOrder::market(desk.account.id, desk.symbol.id, TradeSide::Buy, volume)
+        .label(desk.label());
+    let accepted = desk
+        .client
+        .place_order(&market, &desk.symbol)
+        .await
+        .expect("market order")
+        .order
+        .expect("accepted order");
+    let opened = loop {
+        let execution = next_execution(&mut events, accepted.id).await;
+        if execution.kind == ExecutionType::Filled {
+            break execution.position.expect("opened position");
+        }
+    };
+    assert_eq!((opened.stop_loss, opened.take_profit), (None, None));
+    let (stop_loss, take_profit) = (desk.scaled(bid, 50), desk.scaled(ask, 150));
+    let amendment = PositionAmendment::of(desk.account.id, &opened)
+        .stop_loss(Some(stop_loss))
+        .take_profit(Some(take_profit));
+    assert_eq!(amendment.position(), opened.id);
+    let protected = desk
+        .client
+        .amend_position(&amendment, &desk.symbol)
+        .await
+        .expect("amended position");
+    let read = desk.position(opened.id).await;
+    println!(
+        "live amended position: {} answered {:?}, stop loss {:?} take profit {:?}",
+        read.id,
+        protected.kind,
+        read.stop_loss.map(|price| price.to_string()),
+        read.take_profit.map(|price| price.to_string()),
+    );
+    assert_eq!(protected.kind, ExecutionType::Accepted);
+    assert_eq!(read.stop_loss, Some(stop_loss));
+    assert_eq!(read.take_profit, Some(take_profit));
+    assert_eq!(read.volume, volume);
+    let replaced = desk
+        .client
+        .amend_position(
+            &PositionAmendment::of(desk.account.id, &read).take_profit(None),
+            &desk.symbol,
+        )
+        .await
+        .expect("amended position");
+    let read = desk.position(opened.id).await;
+    println!(
+        "live amended position without take profit: answered {:?}, stop loss {:?} take profit {:?}",
+        replaced.kind,
+        read.stop_loss.map(|price| price.to_string()),
+        read.take_profit.map(|price| price.to_string()),
+    );
+    assert_eq!(replaced.kind, ExecutionType::Replaced);
+    assert_eq!(read.stop_loss, Some(stop_loss));
+    assert_eq!(read.take_profit, None);
+}
+
+impl Desk {
+    async fn order(&self, id: OrderId) -> Order {
+        let (_, orders) = self.own().await;
+        orders
+            .into_iter()
+            .find(|order| order.id == id)
+            .expect("order read back")
+    }
+
+    async fn position(&self, id: PositionId) -> Position {
+        let (positions, _) = self.own().await;
+        positions
+            .into_iter()
+            .find(|position| position.id == id)
+            .expect("position read back")
+    }
 }

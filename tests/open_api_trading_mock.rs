@@ -13,14 +13,14 @@ use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
-    ProtoOaDeal, ProtoOaExecutionEvent, ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent,
-    ProtoOaPosition, ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeData,
-    ProtoOaVersionRes,
+    ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaDeal, ProtoOaExecutionEvent,
+    ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent, ProtoOaPosition, ProtoOaSymbol,
+    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeData, ProtoOaVersionRes,
 };
 use ctrader_connector::open_api::symbols::Symbol;
 use ctrader_connector::open_api::trading::{
-    Comment, Execution, ExecutionType, Label, NewOrder, OrderStatus, OrderType, TimeInForce,
-    TradeSide,
+    Comment, Execution, ExecutionType, Label, NewOrder, Order, OrderAmendment, OrderStatus,
+    OrderType, Position, PositionAmendment, TimeInForce, TradeSide,
 };
 use ctrader_connector::open_api::transport::Plain;
 use prost::Message as _;
@@ -34,12 +34,16 @@ use tokio::time::timeout;
 const SYMBOL_BY_ID_REQ: u32 = 2116;
 const SYMBOL_BY_ID_RES: u32 = 2117;
 const NEW_ORDER_REQ: u32 = 2106;
+const AMEND_ORDER_REQ: u32 = 2109;
+const AMEND_POSITION_REQ: u32 = 2110;
+const MISSING: i64 = 404;
 const EXECUTION_EVENT: u32 = 2126;
 const ORDER_ERROR_EVENT: u32 = 2132;
 const VERSION_RES: u32 = 2105;
 
 const ACCEPTED: i32 = 2;
 const FILLED: i32 = 3;
+const REPLACED: i32 = 4;
 const REJECTED: i32 = 7;
 
 fn account(id: i64) -> AccountId {
@@ -862,5 +866,382 @@ async fn stop_limit_order_carries_its_stop_price_and_slippage_and_no_limit_price
     assert_eq!(sent[0].slippage_in_points, Some(25));
     assert_eq!(sent[0].base_slippage_price, None);
     assert_eq!(sent[0].time_in_force, Some(2));
+    client.shutdown().await;
+}
+
+fn amended_order(request: &ProtoOaAmendOrderReq) -> ProtoOaOrder {
+    let kind = match (request.limit_price, request.slippage_in_points) {
+        (Some(_), _) => 2,
+        (None, Some(_)) => 6,
+        (None, None) => 3,
+    };
+    ProtoOaOrder {
+        order_id: request.order_id,
+        trade_data: ProtoOaTradeData {
+            symbol_id: 7,
+            volume: request.volume.unwrap_or(100),
+            trade_side: 1,
+            ..ProtoOaTradeData::default()
+        },
+        order_type: kind,
+        order_status: 1,
+        time_in_force: Some(if request.expiration_timestamp.is_some() {
+            1
+        } else {
+            2
+        }),
+        expiration_timestamp: request.expiration_timestamp,
+        limit_price: request.limit_price,
+        stop_price: request.stop_price,
+        slippage_in_points: request.slippage_in_points.map(i64::from),
+        stop_loss: request.stop_loss,
+        take_profit: request.take_profit,
+        relative_stop_loss: request.relative_stop_loss,
+        relative_take_profit: request.relative_take_profit,
+        ..ProtoOaOrder::default()
+    }
+}
+
+fn amended_position(request: &ProtoOaAmendPositionSltpReq) -> ProtoOaPosition {
+    ProtoOaPosition {
+        position_id: request.position_id,
+        trade_data: ProtoOaTradeData {
+            symbol_id: 7,
+            volume: 100,
+            trade_side: 1,
+            ..ProtoOaTradeData::default()
+        },
+        position_status: 1,
+        swap: 0,
+        price: Some(64_000.25),
+        stop_loss: request.stop_loss,
+        take_profit: request.take_profit,
+        ..ProtoOaPosition::default()
+    }
+}
+
+fn not_found(account: i64, code: &str) -> Answer {
+    answer(
+        ORDER_ERROR_EVENT,
+        &ProtoOaOrderErrorEvent {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            error_code: code.to_owned(),
+            order_id: None,
+            position_id: None,
+            description: Some("nothing with that id".to_owned()),
+        },
+    )
+}
+
+fn amend(payload_type: u32, payload: &[u8]) -> Answer {
+    match payload_type {
+        AMEND_ORDER_REQ => {
+            let request = ProtoOaAmendOrderReq::decode(payload).ok()?;
+            if request.order_id == MISSING {
+                return not_found(request.ctid_trader_account_id, "ORDER_NOT_FOUND");
+            }
+            answer(
+                EXECUTION_EVENT,
+                &ProtoOaExecutionEvent {
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                    execution_type: REPLACED,
+                    order: Some(amended_order(&request)),
+                    ..ProtoOaExecutionEvent::default()
+                },
+            )
+        }
+        AMEND_POSITION_REQ => {
+            let request = ProtoOaAmendPositionSltpReq::decode(payload).ok()?;
+            if request.position_id == MISSING {
+                return not_found(request.ctid_trader_account_id, "POSITION_NOT_FOUND");
+            }
+            let first = request.take_profit.is_some() && request.stop_loss.is_some();
+            answer(
+                EXECUTION_EVENT,
+                &ProtoOaExecutionEvent {
+                    ctid_trader_account_id: request.ctid_trader_account_id,
+                    execution_type: if first { ACCEPTED } else { REPLACED },
+                    position: Some(amended_position(&request)),
+                    ..ProtoOaExecutionEvent::default()
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+fn sent<T: prost::Message + Default>(server: &MockServer, payload_type: u32) -> Vec<T> {
+    server
+        .received()
+        .iter()
+        .filter(|received| received.payload_type == payload_type)
+        .map(|received| T::decode(received.payload.as_slice()).expect("request"))
+        .collect()
+}
+
+fn pending(id: i64, kind: i32, symbol: i64) -> Order {
+    let waits_at = Some(60_000.5);
+    Order::try_from(ProtoOaOrder {
+        order_id: id,
+        trade_data: ProtoOaTradeData {
+            symbol_id: symbol,
+            volume: 100,
+            trade_side: 1,
+            ..ProtoOaTradeData::default()
+        },
+        order_type: kind,
+        order_status: 1,
+        time_in_force: Some(1),
+        expiration_timestamp: Some(1_800_000_000_000),
+        limit_price: if kind == 2 { waits_at } else { None },
+        stop_price: if kind == 3 || kind == 6 {
+            waits_at
+        } else {
+            None
+        },
+        slippage_in_points: (kind == 6).then_some(25),
+        stop_loss: Some(50_000.0),
+        relative_take_profit: Some(150_000),
+        ..ProtoOaOrder::default()
+    })
+    .expect("order")
+}
+
+fn open(id: i64, symbol: i64) -> Position {
+    Position::try_from(ProtoOaPosition {
+        position_id: id,
+        trade_data: ProtoOaTradeData {
+            symbol_id: symbol,
+            volume: 100,
+            trade_side: 1,
+            ..ProtoOaTradeData::default()
+        },
+        position_status: 1,
+        swap: 0,
+        price: Some(64_000.25),
+        ..ProtoOaPosition::default()
+    })
+    .expect("position")
+}
+
+#[tokio::test]
+async fn amendment_of_a_pending_order_states_the_whole_order() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(amend).await;
+    let later = Timestamp::from_millis(1_800_000_600_000).expect("timestamp");
+    let limit = OrderAmendment::of(account(101), &pending(900, 2, 7));
+    assert_eq!(limit.order().get(), 900);
+    let untouched = client
+        .amend_order(&limit, &symbol)
+        .await
+        .expect("amended order");
+    assert_eq!(untouched.kind, ExecutionType::Replaced);
+    let changed = limit
+        .clone()
+        .price(price("59000.25"))
+        .volume(volume("1.5"))
+        .good_till(later)
+        .stop_loss(None)
+        .take_profit(Some(price("70000")));
+    let order = client
+        .amend_order(&changed, &symbol)
+        .await
+        .expect("amended order")
+        .order
+        .expect("order");
+    assert_eq!(order.volume, volume("1.5"));
+    assert_eq!(order.limit_price, Some(price("59000.25")));
+    assert_eq!(order.time_in_force, TimeInForce::GoodTillDate(later));
+    assert_eq!(
+        (order.stop_loss, order.take_profit),
+        (None, Some(price("70000")))
+    );
+    let stop = OrderAmendment::of(account(101), &pending(901, 3, 7))
+        .price(price("61000"))
+        .good_till_cancelled();
+    client
+        .amend_order(&stop, &symbol)
+        .await
+        .expect("amended stop order");
+    let stop_limit = OrderAmendment::of(account(101), &pending(902, 6, 7)).slippage(30);
+    client
+        .amend_order(&stop_limit, &symbol)
+        .await
+        .expect("amended stop-limit order");
+    let sent: Vec<ProtoOaAmendOrderReq> = sent(&server, AMEND_ORDER_REQ);
+    assert_eq!(sent.len(), 4);
+    assert_eq!(
+        (sent[0].ctid_trader_account_id, sent[0].order_id),
+        (101, 900)
+    );
+    assert_eq!(sent[0].volume, Some(100));
+    assert_eq!(
+        (sent[0].limit_price, sent[0].stop_price),
+        (Some(60_000.5), None)
+    );
+    assert_eq!(sent[0].expiration_timestamp, Some(1_800_000_000_000));
+    assert_eq!(
+        (sent[0].stop_loss, sent[0].take_profit),
+        (Some(50_000.0), None)
+    );
+    assert_eq!(sent[0].relative_stop_loss, None);
+    assert_eq!(sent[0].relative_take_profit, Some(150_000));
+    assert_eq!(sent[0].slippage_in_points, None);
+    assert_eq!(sent[1].volume, Some(150));
+    assert_eq!(sent[1].limit_price, Some(59_000.25));
+    assert_eq!(sent[1].expiration_timestamp, Some(1_800_000_600_000));
+    assert_eq!(
+        (sent[1].stop_loss, sent[1].relative_stop_loss),
+        (None, None)
+    );
+    assert_eq!(sent[1].take_profit, Some(70_000.0));
+    assert_eq!(sent[1].relative_take_profit, None);
+    assert_eq!(
+        (sent[2].limit_price, sent[2].stop_price),
+        (None, Some(61_000.0))
+    );
+    assert_eq!(sent[2].expiration_timestamp, None);
+    assert_eq!(
+        (sent[3].limit_price, sent[3].stop_price),
+        (None, Some(60_000.5))
+    );
+    assert_eq!(sent[3].slippage_in_points, Some(30));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn amendment_that_does_not_fit_is_refused_before_anything_is_sent() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(amend).await;
+    let limit = OrderAmendment::of(account(101), &pending(900, 2, 7));
+    let refused = |amendment: OrderAmendment| {
+        let (client, symbol) = (client.clone(), symbol.clone());
+        async move { value_error(client.amend_order(&amendment, &symbol).await) }
+    };
+    assert!(matches!(
+        refused(OrderAmendment::of(account(101), &pending(900, 1, 7))).await,
+        Some(ValueError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        refused(OrderAmendment::of(account(101), &pending(900, 2, 8))).await,
+        Some(ValueError::Mismatch { .. })
+    ));
+    assert!(matches!(
+        refused(limit.clone().volume(volume("1.25"))).await,
+        Some(ValueError::OffStep { .. })
+    ));
+    assert!(matches!(
+        refused(limit.clone().price(price("59000.255"))).await,
+        Some(ValueError::TooFine { .. })
+    ));
+    assert!(matches!(
+        refused(limit.clone().stop_loss(Some(price("0.001")))).await,
+        Some(ValueError::TooFine { .. })
+    ));
+    assert!(matches!(
+        refused(OrderAmendment::of(account(101), &pending(902, 6, 7)).slippage(u32::MAX)).await,
+        Some(ValueError::OutOfRange { .. })
+    ));
+    let position = PositionAmendment::of(account(101), &open(500, 7));
+    assert!(matches!(
+        value_error(
+            client
+                .amend_position(&PositionAmendment::of(account(101), &open(500, 8)), &symbol)
+                .await
+        ),
+        Some(ValueError::Mismatch { .. })
+    ));
+    assert!(matches!(
+        value_error(
+            client
+                .amend_position(&position.take_profit(Some(price("70000.001"))), &symbol)
+                .await
+        ),
+        Some(ValueError::TooFine { .. })
+    ));
+    assert_eq!(server.count(AMEND_ORDER_REQ), 0);
+    assert_eq!(server.count(AMEND_POSITION_REQ), 0);
+    assert_eq!(
+        server_code(
+            client
+                .amend_order(
+                    &OrderAmendment::of(account(101), &pending(MISSING, 2, 7)),
+                    &symbol
+                )
+                .await
+        ),
+        Some(ErrorCode::OrderNotFound)
+    );
+    assert_eq!(
+        server_code(
+            client
+                .amend_position(
+                    &PositionAmendment::of(account(101), &open(MISSING, 7)),
+                    &symbol
+                )
+                .await
+        ),
+        Some(ErrorCode::PositionNotFound)
+    );
+    assert_eq!(server.count(AMEND_ORDER_REQ), 1);
+    assert_eq!(server.count(AMEND_POSITION_REQ), 1);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn amendment_of_a_position_states_both_protection_prices() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(amend).await;
+    let opened = open(500, 7);
+    let amendment = PositionAmendment::of(account(101), &opened)
+        .stop_loss(Some(price("50000.5")))
+        .take_profit(Some(price("70000")));
+    assert_eq!(amendment.position(), opened.id);
+    let protected = client
+        .amend_position(&amendment, &symbol)
+        .await
+        .expect("amended position");
+    assert_eq!(protected.kind, ExecutionType::Accepted);
+    let position = protected.position.expect("position");
+    assert_eq!(position.stop_loss, Some(price("50000.5")));
+    assert_eq!(position.take_profit, Some(price("70000")));
+    let replaced = client
+        .amend_position(
+            &PositionAmendment::of(account(101), &position).take_profit(None),
+            &symbol,
+        )
+        .await
+        .expect("amended position");
+    assert_eq!(replaced.kind, ExecutionType::Replaced);
+    let position = replaced.position.expect("position");
+    assert_eq!(
+        (position.stop_loss, position.take_profit),
+        (Some(price("50000.5")), None)
+    );
+    let sent: Vec<ProtoOaAmendPositionSltpReq> = sent(&server, AMEND_POSITION_REQ);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        (sent[0].ctid_trader_account_id, sent[0].position_id),
+        (101, 500)
+    );
+    assert_eq!(
+        (sent[0].stop_loss, sent[0].take_profit),
+        (Some(50_000.5), Some(70_000.0))
+    );
+    assert_eq!(
+        (sent[1].stop_loss, sent[1].take_profit),
+        (Some(50_000.5), None)
+    );
+    assert_eq!(sent[1].trailing_stop_loss, None);
     client.shutdown().await;
 }
