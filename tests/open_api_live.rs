@@ -22,10 +22,9 @@ use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::messages::{
-    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaCancelOrderReq,
-    ProtoOaClosePositionReq, ProtoOaDepthEvent, ProtoOaExecutionEvent,
-    ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq, ProtoOaReconcileReq,
-    ProtoOaSpotEvent, ProtoOaVersionReq,
+    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaClosePositionReq,
+    ProtoOaDepthEvent, ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq,
+    ProtoOaGetTickDataReq, ProtoOaReconcileReq, ProtoOaSpotEvent, ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::payload::Payload;
 use ctrader_connector::open_api::quotes::QuoteSide;
@@ -1224,20 +1223,11 @@ impl Desk {
                 self.label
             );
             for order in orders.iter().filter(|order| !order.closing) {
-                let cancel = ProtoOaCancelOrderReq {
-                    payload_type: None,
-                    ctid_trader_account_id: self.account.id.get(),
-                    order_id: order.id.get(),
-                };
-                let outcome = self
-                    .client
-                    .connection()
-                    .request_once(ProtoOaCancelOrderReq::PAYLOAD_TYPE, cancel.encode_to_vec())
-                    .await;
+                let outcome = self.client.cancel_order(self.account.id, order.id).await;
                 println!(
                     "live sweep: cancel order {} answered {:?}",
                     order.id,
-                    outcome.map(|message| message.payload_type)
+                    outcome.map(|execution| execution.kind)
                 );
             }
             for position in &positions {
@@ -1720,4 +1710,59 @@ impl Desk {
             .find(|position| position.id == id)
             .expect("position read back")
     }
+}
+
+#[tokio::test]
+async fn live_cancelled_pending_order_is_no_longer_listed() {
+    trading("ct22", |desk| async move {
+        let (bid, _) = desk.market().await;
+        let order = NewOrder::limit(
+            desk.account.id,
+            desk.symbol.id,
+            TradeSide::Buy,
+            desk.smallest(),
+            desk.scaled(bid, 50),
+        )
+        .label(desk.label());
+        let placed = desk
+            .client
+            .place_order(&order, &desk.symbol)
+            .await
+            .expect("limit order")
+            .order
+            .expect("accepted order");
+        let (_, listed) = desk.own().await;
+        assert_eq!(
+            listed.iter().map(|order| order.id).collect::<Vec<_>>(),
+            vec![placed.id]
+        );
+        let cancelled = desk
+            .client
+            .cancel_order(desk.account.id, placed.id)
+            .await
+            .expect("cancelled order");
+        assert_eq!(cancelled.kind, ExecutionType::Cancelled);
+        let last = cancelled.order.expect("order of the cancellation");
+        assert_eq!(last.id, placed.id);
+        assert_eq!(last.status, OrderStatus::Cancelled);
+        let (positions, orders) = desk.own().await;
+        println!(
+            "live cancel: order {} answered {:?} with status {:?}, reconcile lists {} own orders and {} own positions",
+            placed.id,
+            cancelled.kind,
+            last.status,
+            orders.len(),
+            positions.len(),
+        );
+        assert!(orders.is_empty());
+        assert!(positions.is_empty());
+        let again = desk.client.cancel_order(desk.account.id, placed.id).await;
+        let code = match again {
+            Err(ConnectorError::Server(error)) => Some(error.code),
+            _ => None,
+        };
+        println!("live cancel of an order no longer in force: {code:?}");
+        assert_eq!(code, Some(ErrorCode::OrderNotFound));
+    })
+    .await;
 }

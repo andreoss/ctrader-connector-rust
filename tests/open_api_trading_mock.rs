@@ -13,9 +13,10 @@ use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
-    ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaDeal, ProtoOaExecutionEvent,
-    ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent, ProtoOaPosition, ProtoOaSymbol,
-    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeData, ProtoOaVersionRes,
+    ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq, ProtoOaDeal,
+    ProtoOaExecutionEvent, ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent,
+    ProtoOaPosition, ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeData,
+    ProtoOaVersionRes,
 };
 use ctrader_connector::open_api::symbols::Symbol;
 use ctrader_connector::open_api::trading::{
@@ -34,6 +35,7 @@ use tokio::time::timeout;
 const SYMBOL_BY_ID_REQ: u32 = 2116;
 const SYMBOL_BY_ID_RES: u32 = 2117;
 const NEW_ORDER_REQ: u32 = 2106;
+const CANCEL_ORDER_REQ: u32 = 2108;
 const AMEND_ORDER_REQ: u32 = 2109;
 const AMEND_POSITION_REQ: u32 = 2110;
 const MISSING: i64 = 404;
@@ -1243,5 +1245,96 @@ async fn amendment_of_a_position_states_both_protection_prices() {
         (Some(50_000.5), None)
     );
     assert_eq!(sent[1].trailing_stop_loss, None);
+    client.shutdown().await;
+}
+
+fn cancel(payload_type: u32, payload: &[u8]) -> Answer {
+    if payload_type != CANCEL_ORDER_REQ {
+        return None;
+    }
+    let request = ProtoOaCancelOrderReq::decode(payload).ok()?;
+    let event = |kind: i32, status: i32| ProtoOaExecutionEvent {
+        ctid_trader_account_id: request.ctid_trader_account_id,
+        execution_type: kind,
+        order: Some(ProtoOaOrder {
+            order_id: request.order_id,
+            trade_data: ProtoOaTradeData {
+                symbol_id: 7,
+                volume: 100,
+                trade_side: 2,
+                ..ProtoOaTradeData::default()
+            },
+            order_type: 2,
+            order_status: status,
+            limit_price: Some(60_000.5),
+            ..ProtoOaOrder::default()
+        }),
+        ..ProtoOaExecutionEvent::default()
+    };
+    match request.order_id {
+        MISSING => not_found(request.ctid_trader_account_id, "ORDER_NOT_FOUND"),
+        901 => answer(EXECUTION_EVENT, &event(8, 1)),
+        _ => answer(EXECUTION_EVENT, &event(5, 5)),
+    }
+}
+
+#[tokio::test]
+async fn cancellation_names_the_order_and_returns_it_as_cancelled() {
+    let Session { server, client, .. } = session(cancel).await;
+    let order = pending(900, 2, 7);
+    let cancelled = client
+        .cancel_order(account(101), order.id)
+        .await
+        .expect("cancelled order");
+    assert_eq!(cancelled.kind, ExecutionType::Cancelled);
+    assert_eq!(cancelled.account, account(101));
+    let last = cancelled.order.expect("order");
+    assert_eq!(last.id, order.id);
+    assert_eq!(last.status, OrderStatus::Cancelled);
+    assert_eq!(last.side, TradeSide::Sell);
+    assert_eq!(
+        server_code(
+            client
+                .cancel_order(account(101), pending(MISSING, 2, 7).id)
+                .await
+        ),
+        Some(ErrorCode::OrderNotFound)
+    );
+    assert_eq!(
+        server_code(
+            client
+                .cancel_order(account(101), pending(901, 2, 7).id)
+                .await
+        ),
+        Some(ErrorCode::UnknownError)
+    );
+    let sent: Vec<ProtoOaCancelOrderReq> = sent(&server, CANCEL_ORDER_REQ);
+    assert_eq!(
+        sent.iter()
+            .map(|request| (request.ctid_trader_account_id, request.order_id))
+            .collect::<Vec<_>>(),
+        vec![(101, 900), (101, MISSING), (101, 901)]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancellation_without_an_answer_has_an_unknown_outcome_and_is_not_sent_again() {
+    let Session { server, client, .. } = session_with(
+        |_, _| None,
+        vec![CANCEL_ORDER_REQ],
+        |options| options.timeout(Duration::from_millis(300)),
+    )
+    .await;
+    assert_eq!(
+        client
+            .cancel_order(account(101), pending(900, 2, 7).id)
+            .await,
+        Err(ConnectorError::OutcomeUnknown(Interruption::Timeout(
+            Duration::from_millis(300)
+        )))
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(server.count(CANCEL_ORDER_REQ), 1);
     client.shutdown().await;
 }

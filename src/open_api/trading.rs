@@ -42,10 +42,11 @@ use crate::common::ids::{AccountId, DealId, OrderId, PositionId, SymbolId};
 use crate::common::time::Timestamp;
 use crate::open_api::client::OpenApiClient;
 use crate::open_api::messages::{
-    ProtoMessage, ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaClosePositionDetail,
-    ProtoOaDeal, ProtoOaDealStatus, ProtoOaExecutionEvent, ProtoOaExecutionType,
-    ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent, ProtoOaOrderStatus, ProtoOaOrderType,
-    ProtoOaPosition, ProtoOaPositionStatus, ProtoOaTimeInForce, ProtoOaTradeSide,
+    ProtoMessage, ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq,
+    ProtoOaClosePositionDetail, ProtoOaDeal, ProtoOaDealStatus, ProtoOaExecutionEvent,
+    ProtoOaExecutionType, ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent,
+    ProtoOaOrderStatus, ProtoOaOrderType, ProtoOaPosition, ProtoOaPositionStatus,
+    ProtoOaTimeInForce, ProtoOaTradeSide,
 };
 use crate::open_api::payload::Payload;
 use crate::open_api::symbols::Symbol;
@@ -1401,6 +1402,34 @@ impl OpenApiClient {
     ) -> Result<Execution, ConnectorError> {
         let request = amendment.to_wire(symbol)?;
         self.trade(&request).await
+    }
+
+    /// Cancels a pending order of an authorised account and returns the first execution event
+    /// the server answers with, which for an order the server takes out of force has
+    /// [`ExecutionType::Cancelled`] and carries the order as it was last.
+    ///
+    /// The request is written at most once and never sent again by this library.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Value`] when the answer carries a value out of range,
+    /// [`ConnectorError::Server`] with the code the server gives when it refuses to cancel,
+    /// be it with an error, an order error event or an execution event that reports the
+    /// refusal, [`ConnectorError::OutcomeUnknown`] when the request was written and no answer
+    /// arrived, in which case the order may or may not be in force, and the errors of
+    /// [`Connection::request_once`](crate::open_api::connection::Connection::request_once)
+    /// otherwise.
+    pub async fn cancel_order(
+        &self,
+        account: AccountId,
+        order: OrderId,
+    ) -> Result<Execution, ConnectorError> {
+        self.trade(&ProtoOaCancelOrderReq {
+            payload_type: None,
+            ctid_trader_account_id: account.get(),
+            order_id: order.get(),
+        })
+        .await
     }
 }
 
