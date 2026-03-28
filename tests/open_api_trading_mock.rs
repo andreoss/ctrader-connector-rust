@@ -15,8 +15,8 @@ use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
     ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq, ProtoOaDeal,
     ProtoOaExecutionEvent, ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent,
-    ProtoOaPosition, ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeData,
-    ProtoOaVersionRes,
+    ProtoOaPosition, ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaSymbol, ProtoOaSymbolByIdReq,
+    ProtoOaSymbolByIdRes, ProtoOaTradeData, ProtoOaVersionRes,
 };
 use ctrader_connector::open_api::symbols::Symbol;
 use ctrader_connector::open_api::trading::{
@@ -37,6 +37,8 @@ const SYMBOL_BY_ID_RES: u32 = 2117;
 const NEW_ORDER_REQ: u32 = 2106;
 const CANCEL_ORDER_REQ: u32 = 2108;
 const AMEND_ORDER_REQ: u32 = 2109;
+const RECONCILE_REQ: u32 = 2124;
+const RECONCILE_RES: u32 = 2125;
 const AMEND_POSITION_REQ: u32 = 2110;
 const MISSING: i64 = 404;
 const EXECUTION_EVENT: u32 = 2126;
@@ -1336,5 +1338,103 @@ async fn cancellation_without_an_answer_has_an_unknown_outcome_and_is_not_sent_a
     );
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(server.count(CANCEL_ORDER_REQ), 1);
+    client.shutdown().await;
+}
+
+fn reconciled(payload_type: u32, payload: &[u8]) -> Answer {
+    if payload_type != RECONCILE_REQ {
+        return None;
+    }
+    let request = ProtoOaReconcileReq::decode(payload).ok()?;
+    let trade = |side: i32, label: &str| ProtoOaTradeData {
+        symbol_id: 7,
+        volume: 150,
+        trade_side: side,
+        label: Some(label.to_owned()),
+        ..ProtoOaTradeData::default()
+    };
+    let order = |id: i64, kind: i32, side: i32| ProtoOaOrder {
+        order_id: id,
+        trade_data: trade(side, "run-1"),
+        order_type: kind,
+        order_status: 1,
+        ..ProtoOaOrder::default()
+    };
+    let position = ProtoOaPosition {
+        position_id: 500,
+        trade_data: trade(1, "run-1"),
+        position_status: 1,
+        swap: -125,
+        price: Some(64_000.25),
+        stop_loss: Some(50_000.5),
+        used_margin: Some(6_400),
+        money_digits: Some(2),
+        ..ProtoOaPosition::default()
+    };
+    let broken = request.ctid_trader_account_id == 102;
+    answer(
+        RECONCILE_RES,
+        &ProtoOaReconcileRes {
+            payload_type: None,
+            ctid_trader_account_id: request.ctid_trader_account_id,
+            position: vec![position],
+            order: vec![
+                ProtoOaOrder {
+                    limit_price: Some(60_000.5),
+                    ..order(900, 2, 1)
+                },
+                ProtoOaOrder {
+                    stop_price: Some(50_000.5),
+                    closing_order: Some(true),
+                    position_id: Some(500),
+                    ..order(901, 4, if broken { 9 } else { 2 })
+                },
+            ],
+        },
+    )
+}
+
+#[tokio::test]
+async fn reconcile_returns_positions_and_orders_whole_or_not_at_all() {
+    let Session { server, client, .. } = session(reconciled).await;
+    let reconciliation = client.reconcile(account(101)).await.expect("reconcile");
+    assert_eq!(reconciliation.account, account(101));
+    assert_eq!(reconciliation.positions.len(), 1);
+    let position = &reconciliation.positions[0];
+    assert_eq!(position.id, PositionId::new(500).expect("id"));
+    assert_eq!(
+        (position.side, position.volume),
+        (TradeSide::Buy, volume("1.5"))
+    );
+    assert_eq!(position.price, Some(price("64000.25")));
+    assert_eq!(position.stop_loss, Some(price("50000.5")));
+    assert_eq!(position.swap.to_string(), "-1.25");
+    assert_eq!(
+        position
+            .used_margin
+            .map(|margin| margin.to_string())
+            .as_deref(),
+        Some("64.00")
+    );
+    assert_eq!(position.label.as_deref(), Some("run-1"));
+    let orders = &reconciliation.orders;
+    assert_eq!(orders.len(), 2);
+    assert_eq!(
+        (orders[0].kind, orders[0].closing),
+        (OrderType::Limit, false)
+    );
+    assert_eq!(orders[0].limit_price, Some(price("60000.5")));
+    assert_eq!(orders[1].kind, OrderType::StopLossTakeProfit);
+    assert!(orders[1].closing);
+    assert_eq!(orders[1].position, Some(position.id));
+    assert_eq!(orders[1].side, TradeSide::Sell);
+    assert!(matches!(
+        value_error(client.reconcile(account(102)).await),
+        Some(ValueError::OutOfRange { .. })
+    ));
+    let sent: Vec<ProtoOaReconcileReq> = sent(&server, RECONCILE_REQ);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].ctid_trader_account_id, 101);
+    assert_eq!(sent[0].return_protection_orders, Some(true));
     client.shutdown().await;
 }

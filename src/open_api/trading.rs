@@ -46,7 +46,7 @@ use crate::open_api::messages::{
     ProtoOaClosePositionDetail, ProtoOaDeal, ProtoOaDealStatus, ProtoOaExecutionEvent,
     ProtoOaExecutionType, ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent,
     ProtoOaOrderStatus, ProtoOaOrderType, ProtoOaPosition, ProtoOaPositionStatus,
-    ProtoOaTimeInForce, ProtoOaTradeSide,
+    ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaTimeInForce, ProtoOaTradeSide,
 };
 use crate::open_api::payload::Payload;
 use crate::open_api::symbols::Symbol;
@@ -704,6 +704,39 @@ impl TryFrom<ProtoOaExecutionEvent> for Execution {
             deal: event.deal.map(Deal::try_from).transpose()?,
             error_code: event.error_code.as_deref().map(ErrorCode::from_wire),
             server_event: event.is_server_event.unwrap_or(false),
+        })
+    }
+}
+
+/// Positions and pending orders of an account, as the server holds them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct Reconciliation {
+    /// Account the positions and orders belong to.
+    pub account: AccountId,
+    /// Positions that are open.
+    pub positions: Vec<Position>,
+    /// Orders in force: the pending ones, and the ones that hold the stop loss and take profit
+    /// of a position, which have [`Order::closing`] set.
+    pub orders: Vec<Order>,
+}
+
+impl TryFrom<ProtoOaReconcileRes> for Reconciliation {
+    type Error = ValueError;
+
+    fn try_from(answer: ProtoOaReconcileRes) -> Result<Self, Self::Error> {
+        Ok(Self {
+            account: AccountId::new(answer.ctid_trader_account_id)?,
+            positions: answer
+                .position
+                .into_iter()
+                .map(Position::try_from)
+                .collect::<Result<_, _>>()?,
+            orders: answer
+                .order
+                .into_iter()
+                .map(Order::try_from)
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -1430,6 +1463,29 @@ impl OpenApiClient {
             order_id: order.get(),
         })
         .await
+    }
+
+    /// Reads the open positions and the orders in force of an authorised account.
+    ///
+    /// The orders include the ones that hold the stop loss and take profit of a position.
+    /// The answer is returned whole or not at all: one position or order that does not parse
+    /// fails the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Value`] when the answer carries a value out of range and the
+    /// errors of [`Connection::request`](crate::open_api::connection::Connection::request)
+    /// otherwise.
+    pub async fn reconcile(&self, account: AccountId) -> Result<Reconciliation, ConnectorError> {
+        let answer = self
+            .connection()
+            .request(&ProtoOaReconcileReq {
+                payload_type: None,
+                ctid_trader_account_id: account.get(),
+                return_protection_orders: Some(true),
+            })
+            .await?;
+        Ok(Reconciliation::try_from(answer)?)
     }
 }
 

@@ -24,7 +24,7 @@ use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaClosePositionReq,
     ProtoOaDepthEvent, ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq,
-    ProtoOaGetTickDataReq, ProtoOaReconcileReq, ProtoOaSpotEvent, ProtoOaVersionReq,
+    ProtoOaGetTickDataReq, ProtoOaSpotEvent, ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::payload::Payload;
 use ctrader_connector::open_api::quotes::QuoteSide;
@@ -1185,26 +1185,20 @@ impl Desk {
     async fn own(&self) -> (Vec<Position>, Vec<Order>) {
         let reconciled = self
             .client
-            .connection()
-            .request(&ProtoOaReconcileReq {
-                payload_type: None,
-                ctid_trader_account_id: self.account.id.get(),
-                return_protection_orders: Some(true),
-            })
+            .reconcile(self.account.id)
             .await
             .expect("reconcile");
+        assert_eq!(reconciled.account, self.account.id);
         let label = Some(self.label.as_str());
         let positions = reconciled
-            .position
+            .positions
             .into_iter()
-            .filter(|position| position.trade_data.label.as_deref() == label)
-            .map(|position| Position::try_from(position).expect("position"))
+            .filter(|position| position.label.as_deref() == label)
             .collect();
         let orders = reconciled
-            .order
+            .orders
             .into_iter()
-            .filter(|order| order.trade_data.label.as_deref() == label)
-            .map(|order| Order::try_from(order).expect("order"))
+            .filter(|order| order.label.as_deref() == label)
             .collect();
         (positions, orders)
     }
@@ -1645,12 +1639,7 @@ async fn amend_protection(desk: &Desk, bid: Price, ask: Price) {
         .expect("market order")
         .order
         .expect("accepted order");
-    let opened = loop {
-        let execution = next_execution(&mut events, accepted.id).await;
-        if execution.kind == ExecutionType::Filled {
-            break execution.position.expect("opened position");
-        }
-    };
+    let opened = opened_by(&mut events, accepted.id).await;
     assert_eq!((opened.stop_loss, opened.take_profit), (None, None));
     let (stop_loss, take_profit) = (desk.scaled(bid, 50), desk.scaled(ask, 150));
     let amendment = PositionAmendment::of(desk.account.id, &opened)
@@ -1765,4 +1754,117 @@ async fn live_cancelled_pending_order_is_no_longer_listed() {
         assert_eq!(code, Some(ErrorCode::OrderNotFound));
     })
     .await;
+}
+
+#[tokio::test]
+async fn live_reconcile_lists_exactly_the_orders_and_positions_of_the_run() {
+    trading("ct23", |desk| async move {
+        let (bid, ask) = desk.market().await;
+        let volume = desk.smallest();
+        let (below, above, guard) = (
+            desk.scaled(bid, 50),
+            desk.scaled(ask, 150),
+            desk.scaled(bid, 40),
+        );
+        let (account, symbol) = (desk.account.id, desk.symbol.id);
+        let comment = |text: &str| Comment::new(text).expect("comment");
+        let limit = NewOrder::limit(account, symbol, TradeSide::Buy, volume, below)
+            .label(desk.label())
+            .comment(comment("limit"));
+        let stop = NewOrder::stop(account, symbol, TradeSide::Buy, volume, above)
+            .label(desk.label())
+            .comment(comment("stop"));
+        let market = NewOrder::market(account, symbol, TradeSide::Buy, volume)
+            .label(desk.label())
+            .comment(comment("market"));
+        let mut events = desk.client.events();
+        let mut placed = Vec::new();
+        for order in [&limit, &stop, &market] {
+            let accepted = desk
+                .client
+                .place_order(order, &desk.symbol)
+                .await
+                .expect("order");
+            placed.push(accepted.order.expect("accepted order").id);
+        }
+        let opened = opened_by(&mut events, placed[2]).await;
+        desk.client
+            .amend_position(
+                &PositionAmendment::of(account, &opened).stop_loss(Some(guard)),
+                &desk.symbol,
+            )
+            .await
+            .expect("protected position");
+        let (positions, orders) = desk.own().await;
+        println!(
+            "live reconcile: own positions {:?}, own orders {:?}",
+            positions
+                .iter()
+                .map(|position| (position.id, position.volume.to_string(), position.status))
+                .collect::<Vec<_>>(),
+            orders
+                .iter()
+                .map(|order| (order.id, order.kind, order.closing, order.comment.clone()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(positions.len(), 1);
+        let position = &positions[0];
+        assert_eq!(position.id, opened.id);
+        assert_eq!((position.side, position.volume), (TradeSide::Buy, volume));
+        assert_eq!(position.status, PositionStatus::Open);
+        assert_eq!(
+            (position.stop_loss, position.take_profit),
+            (Some(guard), None)
+        );
+        assert_eq!(position.comment.as_deref(), Some("market"));
+        assert!(
+            position
+                .used_margin
+                .is_some_and(|margin| margin > Decimal::ZERO)
+        );
+        let (protection, pending): (Vec<_>, Vec<_>) =
+            orders.iter().partition(|order| order.closing);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|order| order.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([placed[0], placed[1]])
+        );
+        for order in &pending {
+            let limit = order.id == placed[0];
+            assert_eq!(
+                order.kind,
+                if limit {
+                    OrderType::Limit
+                } else {
+                    OrderType::Stop
+                }
+            );
+            assert_eq!(order.limit_price, limit.then_some(below));
+            assert_eq!(order.stop_price, (!limit).then_some(above));
+            assert_eq!(
+                order.comment.as_deref(),
+                Some(if limit { "limit" } else { "stop" })
+            );
+            assert_eq!((order.side, order.volume), (TradeSide::Buy, volume));
+            assert_eq!(order.status, OrderStatus::Accepted);
+            assert_eq!(order.symbol, symbol);
+        }
+        assert_eq!(protection.len(), 1);
+        assert_eq!(protection[0].kind, OrderType::StopLossTakeProfit);
+        assert_eq!(protection[0].position, Some(opened.id));
+        assert_eq!(protection[0].side, TradeSide::Sell);
+        assert_eq!(protection[0].stop_price, Some(guard));
+    })
+    .await;
+}
+
+async fn opened_by(events: &mut broadcast::Receiver<Event>, order: OrderId) -> Position {
+    loop {
+        let execution = next_execution(events, order).await;
+        if execution.kind == ExecutionType::Filled {
+            break execution.position.expect("opened position");
+        }
+    }
 }
