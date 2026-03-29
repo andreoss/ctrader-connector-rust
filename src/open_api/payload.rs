@@ -18,10 +18,10 @@ use crate::open_api::messages::{
     ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeLiveTrendbarReq,
     ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq, ProtoOaSubscribeSpotsRes,
     ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
-    ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
-    ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
-    ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes, ProtoOaVersionReq, ProtoOaVersionRes,
-    ProtoPayloadType,
+    ProtoOaTraderReq, ProtoOaTraderRes, ProtoOaUnsubscribeDepthQuotesReq,
+    ProtoOaUnsubscribeDepthQuotesRes, ProtoOaUnsubscribeLiveTrendbarReq,
+    ProtoOaUnsubscribeLiveTrendbarRes, ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes,
+    ProtoOaVersionReq, ProtoOaVersionRes, ProtoPayloadType,
 };
 
 /// Message that travels inside a [`ProtoMessage`] under a fixed payload type.
@@ -154,6 +154,8 @@ payloads! {
     ProtoOaReconcileRes => ProtoOaPayloadType::ProtoOaReconcileRes,
     ProtoOaExecutionEvent => ProtoOaPayloadType::ProtoOaExecutionEvent,
     ProtoOaOrderErrorEvent => ProtoOaPayloadType::ProtoOaOrderErrorEvent,
+    ProtoOaTraderReq => ProtoOaPayloadType::ProtoOaTraderReq,
+    ProtoOaTraderRes => ProtoOaPayloadType::ProtoOaTraderRes,
 }
 
 requests! {
@@ -172,6 +174,7 @@ requests! {
     ProtoOaSymbolsListReq => ProtoOaSymbolsListRes, false;
     ProtoOaSymbolByIdReq => ProtoOaSymbolByIdRes, false;
     ProtoOaReconcileReq => ProtoOaReconcileRes, false;
+    ProtoOaTraderReq => ProtoOaTraderRes, false;
     ProtoOaDealListReq => ProtoOaDealListRes, true;
     ProtoOaGetTrendbarsReq => ProtoOaGetTrendbarsRes, true;
     ProtoOaCashFlowHistoryListReq => ProtoOaCashFlowHistoryListRes, true;
@@ -190,7 +193,7 @@ mod tests {
     #[test]
     fn declared_payload_types_match_the_defaults_in_the_proto_files() {
         let declared = declared();
-        assert_eq!(declared.len(), 53);
+        assert_eq!(declared.len(), 55);
         for (name, constant, default) in declared {
             assert_eq!(i64::from(constant), i64::from(default), "{name}");
         }

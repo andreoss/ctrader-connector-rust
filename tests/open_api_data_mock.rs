@@ -7,6 +7,7 @@ use std::time::Duration;
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, ValueError};
 use ctrader_connector::common::ids::{AccountId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
+use ctrader_connector::open_api::account::{AccessRights, AccountType};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::DepthBook;
@@ -17,9 +18,10 @@ use ctrader_connector::open_api::messages::{
     ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
     ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
     ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
-    ProtoOaSymbolsListRes, ProtoOaTickData, ProtoOaTrendbar, ProtoOaUnsubscribeDepthQuotesReq,
-    ProtoOaUnsubscribeDepthQuotesRes, ProtoOaUnsubscribeLiveTrendbarReq,
-    ProtoOaUnsubscribeLiveTrendbarRes, ProtoOaUnsubscribeSpotsReq,
+    ProtoOaSymbolsListRes, ProtoOaTickData, ProtoOaTrader, ProtoOaTraderReq, ProtoOaTraderRes,
+    ProtoOaTrendbar, ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
+    ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
+    ProtoOaUnsubscribeSpotsReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{SymbolsParams, TradingMode};
@@ -36,6 +38,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
 const ASSET_LIST_REQ: u32 = 2112;
+const TRADER_REQ: u32 = 2121;
+const TRADER_RES: u32 = 2122;
 const ASSET_LIST_RES: u32 = 2113;
 const SYMBOLS_LIST_REQ: u32 = 2114;
 const SYMBOLS_LIST_RES: u32 = 2115;
@@ -1385,5 +1389,139 @@ async fn more_ticks_announced_but_never_sent_are_a_typed_error() {
         })
     );
     assert_eq!(server.count(GET_TICKDATA_REQ), 1);
+    client.shutdown().await;
+}
+
+fn trader_data(payload_type: u32, payload: &[u8]) -> Answer {
+    if payload_type != TRADER_REQ {
+        return None;
+    }
+    let request = ProtoOaTraderReq::decode(payload).ok()?;
+    let account = request.ctid_trader_account_id;
+    let plain = ProtoOaTrader {
+        ctid_trader_account_id: account,
+        balance: 1_234_567,
+        deposit_asset_id: 11,
+        ..ProtoOaTrader::default()
+    };
+    let trader = match account {
+        101 => ProtoOaTrader {
+            leverage_in_cents: Some(10_000),
+            max_leverage: Some(500),
+            account_type: Some(1),
+            access_rights: Some(1),
+            swap_free: Some(true),
+            is_limited_risk: Some(true),
+            broker_name: Some("Mock Broker".to_owned()),
+            registration_timestamp: Some(1_600_000_000_000),
+            ..plain
+        },
+        102 => ProtoOaTrader {
+            deposit_asset_id: 4,
+            money_digits: Some(8),
+            manager_bonus: Some(150_000_000),
+            ib_bonus: Some(1),
+            non_withdrawable_bonus: Some(0),
+            account_type: Some(2),
+            access_rights: Some(3),
+            ..plain
+        },
+        103 => ProtoOaTrader {
+            deposit_asset_id: 99,
+            ..plain
+        },
+        104 => ProtoOaTrader {
+            account_type: Some(9),
+            ..plain
+        },
+        105 => ProtoOaTrader {
+            access_rights: Some(7),
+            ..plain
+        },
+        106 => ProtoOaTrader {
+            access_rights: Some(2),
+            account_type: Some(0),
+            ..plain
+        },
+        _ => plain,
+    };
+    answer(
+        TRADER_RES,
+        &ProtoOaTraderRes {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            trader,
+        },
+    )
+}
+
+#[tokio::test]
+async fn trader_carries_scaled_money_and_the_name_of_its_deposit_asset() {
+    let Session { server, client } = session(|payload_type, payload| {
+        trader_data(payload_type, payload).or_else(|| reference_data(payload_type, payload))
+    })
+    .await;
+    let trader = client.trader(account(101)).await.expect("trader");
+    assert_eq!(trader.account, account(101));
+    assert_eq!(trader.balance.to_string(), "12345.67");
+    assert_eq!(trader.money_digits, 2);
+    assert_eq!(trader.deposit_asset.get(), 11);
+    assert_eq!(trader.currency, "USD");
+    assert_eq!(
+        trader
+            .leverage
+            .map(|leverage| leverage.to_string())
+            .as_deref(),
+        Some("100")
+    );
+    assert_eq!(trader.max_leverage, Some(500));
+    assert_eq!(trader.account_type, AccountType::Netted);
+    assert_eq!(trader.access_rights, AccessRights::CloseOnly);
+    assert!(trader.swap_free && trader.limited_risk);
+    assert_eq!(trader.broker_name.as_deref(), Some("Mock Broker"));
+    assert_eq!(
+        trader.registered,
+        Timestamp::from_millis(1_600_000_000_000).ok()
+    );
+    let other = client.trader(account(102)).await.expect("trader");
+    assert_eq!(other.balance.to_string(), "0.01234567");
+    assert_eq!(other.money_digits, 8);
+    assert_eq!(other.currency, "EUR");
+    assert_eq!(
+        other
+            .manager_bonus
+            .map(|bonus| bonus.to_string())
+            .as_deref(),
+        Some("1.50000000")
+    );
+    assert_eq!(
+        other.ib_bonus.map(|bonus| bonus.to_string()).as_deref(),
+        Some("0.00000001")
+    );
+    assert_eq!(
+        other.non_withdrawable_bonus,
+        Some(rust_decimal::Decimal::ZERO)
+    );
+    assert_eq!(other.account_type, AccountType::SpreadBetting);
+    assert_eq!(other.access_rights, AccessRights::NoLogin);
+    assert_eq!((other.leverage, other.registered), (None, None));
+    assert!(!other.swap_free && !other.limited_risk);
+    let bare = client.trader(account(106)).await.expect("trader");
+    assert_eq!(bare.account_type, AccountType::Hedged);
+    assert_eq!(bare.access_rights, AccessRights::NoTrading);
+    let plain = client.trader(account(107)).await.expect("trader");
+    assert_eq!(plain.account_type, AccountType::Hedged);
+    assert_eq!(plain.access_rights, AccessRights::FullAccess);
+    for (id, kind) in [
+        (103, "deposit asset"),
+        (104, "account type"),
+        (105, "access rights"),
+    ] {
+        assert_eq!(
+            client.trader(account(id)).await,
+            Err(ConnectorError::Value(ValueError::OutOfRange { kind })),
+        );
+    }
+    assert_eq!(server.count(TRADER_REQ), 7);
     client.shutdown().await;
 }

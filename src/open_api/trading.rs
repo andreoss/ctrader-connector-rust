@@ -57,7 +57,7 @@ pub const MAX_LABEL_LENGTH: usize = 100;
 /// Largest number of characters of a [`Comment`].
 pub const MAX_COMMENT_LENGTH: usize = 512;
 
-const DEFAULT_MONEY_DIGITS: u32 = 2;
+pub(crate) const DEFAULT_MONEY_DIGITS: u32 = 2;
 
 const LABEL: &str = "label";
 const COMMENT: &str = "comment";

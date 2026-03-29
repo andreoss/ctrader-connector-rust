@@ -18,6 +18,7 @@ use ctrader_connector::common::decimals::{Price, Volume};
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
 use ctrader_connector::common::ids::{OrderId, PositionId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
+use ctrader_connector::open_api::account::AccessRights;
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
@@ -2051,4 +2052,39 @@ async fn live_execution_stream_reports_the_life_of_orders_in_order() {
         assert_eq!(error.account, account);
     })
     .await;
+}
+
+#[tokio::test]
+async fn live_trader_reports_the_balance_and_currency_of_the_demo_account() {
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let trader = client.trader(account.id).await.expect("trader");
+    let assets = client.assets(account.id).await.expect("assets");
+    println!(
+        "live trader: balance {} {} with {} money digits, leverage {:?}, {:?}, {:?}",
+        trader.balance,
+        trader.currency,
+        trader.money_digits,
+        trader.leverage.map(|leverage| leverage.to_string()),
+        trader.account_type,
+        trader.access_rights,
+    );
+    assert_eq!(trader.account, account.id);
+    assert!(trader.balance > Decimal::ZERO);
+    assert_eq!(trader.balance.scale(), trader.money_digits);
+    assert!(trader.currency.len() >= 3 && trader.currency.chars().all(|c| c.is_ascii_uppercase()));
+    assert_eq!(
+        assets
+            .iter()
+            .find(|asset| asset.id == trader.deposit_asset)
+            .map(|asset| asset.name.as_str()),
+        Some(trader.currency.as_str())
+    );
+    assert!(
+        trader
+            .leverage
+            .is_some_and(|leverage| leverage >= Decimal::ONE)
+    );
+    assert_eq!(trader.access_rights, AccessRights::FullAccess);
+    client.shutdown().await;
 }
