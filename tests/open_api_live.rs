@@ -22,9 +22,9 @@ use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::messages::{
-    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaClosePositionReq,
-    ProtoOaDepthEvent, ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq,
-    ProtoOaGetTickDataReq, ProtoOaSpotEvent, ProtoOaVersionReq,
+    ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
+    ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq,
+    ProtoOaSpotEvent, ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::payload::Payload;
 use ctrader_connector::open_api::quotes::QuoteSide;
@@ -1225,21 +1225,14 @@ impl Desk {
                 );
             }
             for position in &positions {
-                let close = ProtoOaClosePositionReq {
-                    payload_type: None,
-                    ctid_trader_account_id: self.account.id.get(),
-                    position_id: position.id.get(),
-                    volume: position.volume.to_wire().expect("volume"),
-                };
                 let outcome = self
                     .client
-                    .connection()
-                    .request_once(ProtoOaClosePositionReq::PAYLOAD_TYPE, close.encode_to_vec())
+                    .close_position(self.account.id, position, position.volume, &self.symbol)
                     .await;
                 println!(
                     "live sweep: close position {} answered {:?}",
                     position.id,
-                    outcome.map(|message| message.payload_type)
+                    outcome.map(|execution| execution.kind)
                 );
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1867,4 +1860,91 @@ async fn opened_by(events: &mut broadcast::Receiver<Event>, order: OrderId) -> P
             break execution.position.expect("opened position");
         }
     }
+}
+
+async fn closed_by(events: &mut broadcast::Receiver<Event>, order: OrderId) -> Execution {
+    loop {
+        let execution = next_execution(events, order).await;
+        if execution.kind == ExecutionType::Filled {
+            break execution;
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_position_is_closed_in_part_and_then_in_whole() {
+    trading("ct24", |desk| async move {
+        let part = desk.smallest();
+        let whole = Volume::new(part.value() + part.value()).expect("volume");
+        let mut events = desk.client.events();
+        let market = NewOrder::market(desk.account.id, desk.symbol.id, TradeSide::Buy, whole)
+            .label(desk.label());
+        let accepted = desk
+            .client
+            .place_order(&market, &desk.symbol)
+            .await
+            .expect("market order")
+            .order
+            .expect("accepted order");
+        let opened = opened_by(&mut events, accepted.id).await;
+        assert_eq!(opened.volume, whole);
+        let first = desk
+            .client
+            .close_position(desk.account.id, &opened, part, &desk.symbol)
+            .await
+            .expect("partial close");
+        assert_eq!(first.kind, ExecutionType::Accepted);
+        let closing = first.order.expect("closing order");
+        assert!(closing.closing);
+        assert_eq!((closing.side, closing.volume), (TradeSide::Sell, part));
+        assert_eq!(closing.position, Some(opened.id));
+        let reduced = closed_by(&mut events, closing.id).await;
+        let deal = reduced.deal.expect("closing deal");
+        let detail = deal.closing.expect("closing detail");
+        assert_eq!((deal.position, deal.filled_volume), (opened.id, part));
+        assert_eq!(Some(detail.entry_price), opened.price);
+        let read = desk.position(opened.id).await;
+        println!(
+            "live partial close: position {} of {} closed by {}, deal {} at {:?}, reconcile reads volume {}",
+            opened.id,
+            opened.volume,
+            part,
+            deal.id,
+            deal.execution_price.map(|price| price.to_string()),
+            read.volume,
+        );
+        assert_eq!(read.volume, part);
+        assert_eq!(read.status, PositionStatus::Open);
+        assert_eq!(reduced.position.map(|position| position.volume), Some(part));
+        let second = desk
+            .client
+            .close_position(desk.account.id, &read, read.volume, &desk.symbol)
+            .await
+            .expect("close");
+        let closing = second.order.expect("closing order");
+        let closed = closed_by(&mut events, closing.id).await;
+        let last = closed.position.expect("closed position");
+        let (positions, orders) = desk.own().await;
+        println!(
+            "live close: position {} ends {:?}, reconcile lists {} own positions and {} own orders",
+            last.id,
+            last.status,
+            positions.len(),
+            orders.len(),
+        );
+        assert_eq!(last.status, PositionStatus::Closed);
+        assert!(positions.is_empty());
+        assert!(orders.is_empty());
+        let code = match desk
+            .client
+            .close_position(desk.account.id, &read, read.volume, &desk.symbol)
+            .await
+        {
+            Err(ConnectorError::Server(error)) => Some(error.code),
+            _ => None,
+        };
+        println!("live close of a position already closed: {code:?}");
+        assert_eq!(code, Some(ErrorCode::PositionNotFound));
+    })
+    .await;
 }

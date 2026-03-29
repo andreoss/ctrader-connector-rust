@@ -43,10 +43,11 @@ use crate::common::time::Timestamp;
 use crate::open_api::client::OpenApiClient;
 use crate::open_api::messages::{
     ProtoMessage, ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq,
-    ProtoOaClosePositionDetail, ProtoOaDeal, ProtoOaDealStatus, ProtoOaExecutionEvent,
-    ProtoOaExecutionType, ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent,
-    ProtoOaOrderStatus, ProtoOaOrderType, ProtoOaPosition, ProtoOaPositionStatus,
-    ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaTimeInForce, ProtoOaTradeSide,
+    ProtoOaClosePositionDetail, ProtoOaClosePositionReq, ProtoOaDeal, ProtoOaDealStatus,
+    ProtoOaExecutionEvent, ProtoOaExecutionType, ProtoOaNewOrderReq, ProtoOaOrder,
+    ProtoOaOrderErrorEvent, ProtoOaOrderStatus, ProtoOaOrderType, ProtoOaPosition,
+    ProtoOaPositionStatus, ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaTimeInForce,
+    ProtoOaTradeSide,
 };
 use crate::open_api::payload::Payload;
 use crate::open_api::symbols::Symbol;
@@ -802,6 +803,11 @@ fn checked_volume(volume: Volume, symbol: &Symbol) -> Result<i64, ValueError> {
             });
         }
     }
+    on_step(value, symbol)?;
+    volume.to_wire()
+}
+
+fn on_step(value: Decimal, symbol: &Symbol) -> Result<(), ValueError> {
     if let Some(step) = symbol.step_volume.map(Volume::value) {
         let aligned = value.checked_rem(step).is_some_and(|rest| rest.is_zero());
         if !step.is_zero() && !aligned {
@@ -811,6 +817,32 @@ fn checked_volume(volume: Volume, symbol: &Symbol) -> Result<i64, ValueError> {
                 step,
             });
         }
+    }
+    Ok(())
+}
+
+fn closing_volume(volume: Volume, position: &Position, symbol: &Symbol) -> Result<i64, ValueError> {
+    if symbol.id != position.symbol {
+        return Err(ValueError::Mismatch { kind: SYMBOL });
+    }
+    let value = volume.value();
+    if value.is_zero() {
+        return Err(ValueError::BelowMinimum {
+            kind: VOLUME,
+            value,
+            minimum: Decimal::new(1, crate::common::decimals::VOLUME_SCALE),
+        });
+    }
+    let whole = position.volume.value();
+    if value > whole {
+        return Err(ValueError::AboveMaximum {
+            kind: VOLUME,
+            value,
+            maximum: whole,
+        });
+    }
+    if value < whole {
+        on_step(value, symbol)?;
     }
     volume.to_wire()
 }
@@ -1486,6 +1518,41 @@ impl OpenApiClient {
             })
             .await?;
         Ok(Reconciliation::try_from(answer)?)
+    }
+
+    /// Closes a position of an authorised account, in whole or in part, and returns the first
+    /// execution event the server answers with.
+    ///
+    /// `position` is the position as it was last read, `volume` the part of it to close, in
+    /// units of the symbol, and `symbol` holds the trading details of the symbol of the
+    /// position. Nothing is sent when the volume is zero or larger than the position, or when
+    /// a part of the position lies off the step of the symbol.
+    ///
+    /// The server closes with an order of its own: the first event is the acceptance of that
+    /// order, with [`ExecutionType::Accepted`], and the fill arrives as a further event, which
+    /// is read from the events of the connection and carries the deal with its
+    /// [`Deal::closing`] detail and the position as it is afterwards.
+    ///
+    /// The request is written at most once and never sent again by this library.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`OpenApiClient::place_order`]; with
+    /// [`ConnectorError::OutcomeUnknown`] the position may or may not be closed.
+    pub async fn close_position(
+        &self,
+        account: AccountId,
+        position: &Position,
+        volume: Volume,
+        symbol: &Symbol,
+    ) -> Result<Execution, ConnectorError> {
+        let request = ProtoOaClosePositionReq {
+            payload_type: None,
+            ctid_trader_account_id: account.get(),
+            position_id: position.id.get(),
+            volume: closing_volume(volume, position, symbol)?,
+        };
+        self.trade(&request).await
     }
 }
 

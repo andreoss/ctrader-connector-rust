@@ -13,10 +13,10 @@ use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::messages::{
-    ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq, ProtoOaDeal,
-    ProtoOaExecutionEvent, ProtoOaNewOrderReq, ProtoOaOrder, ProtoOaOrderErrorEvent,
-    ProtoOaPosition, ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaSymbol, ProtoOaSymbolByIdReq,
-    ProtoOaSymbolByIdRes, ProtoOaTradeData, ProtoOaVersionRes,
+    ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq,
+    ProtoOaClosePositionReq, ProtoOaDeal, ProtoOaExecutionEvent, ProtoOaNewOrderReq, ProtoOaOrder,
+    ProtoOaOrderErrorEvent, ProtoOaPosition, ProtoOaReconcileReq, ProtoOaReconcileRes,
+    ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeData, ProtoOaVersionRes,
 };
 use ctrader_connector::open_api::symbols::Symbol;
 use ctrader_connector::open_api::trading::{
@@ -37,6 +37,7 @@ const SYMBOL_BY_ID_RES: u32 = 2117;
 const NEW_ORDER_REQ: u32 = 2106;
 const CANCEL_ORDER_REQ: u32 = 2108;
 const AMEND_ORDER_REQ: u32 = 2109;
+const CLOSE_POSITION_REQ: u32 = 2111;
 const RECONCILE_REQ: u32 = 2124;
 const RECONCILE_RES: u32 = 2125;
 const AMEND_POSITION_REQ: u32 = 2110;
@@ -1013,11 +1014,15 @@ fn pending(id: i64, kind: i32, symbol: i64) -> Order {
 }
 
 fn open(id: i64, symbol: i64) -> Position {
+    open_sized(id, symbol, 100)
+}
+
+fn open_sized(id: i64, symbol: i64, size: i64) -> Position {
     Position::try_from(ProtoOaPosition {
         position_id: id,
         trade_data: ProtoOaTradeData {
             symbol_id: symbol,
-            volume: 100,
+            volume: size,
             trade_side: 1,
             ..ProtoOaTradeData::default()
         },
@@ -1436,5 +1441,139 @@ async fn reconcile_returns_positions_and_orders_whole_or_not_at_all() {
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[0].ctid_trader_account_id, 101);
     assert_eq!(sent[0].return_protection_orders, Some(true));
+    client.shutdown().await;
+}
+
+fn close(payload_type: u32, payload: &[u8]) -> Answer {
+    if payload_type != CLOSE_POSITION_REQ {
+        return None;
+    }
+    let request = ProtoOaClosePositionReq::decode(payload).ok()?;
+    if request.position_id == MISSING {
+        return not_found(request.ctid_trader_account_id, "POSITION_NOT_FOUND");
+    }
+    let trade = |volume: i64, side: i32| ProtoOaTradeData {
+        symbol_id: 7,
+        volume,
+        trade_side: side,
+        ..ProtoOaTradeData::default()
+    };
+    answer(
+        EXECUTION_EVENT,
+        &ProtoOaExecutionEvent {
+            ctid_trader_account_id: request.ctid_trader_account_id,
+            execution_type: ACCEPTED,
+            order: Some(ProtoOaOrder {
+                order_id: 950,
+                trade_data: trade(request.volume, 2),
+                order_type: 1,
+                order_status: 1,
+                closing_order: Some(true),
+                position_id: Some(request.position_id),
+                ..ProtoOaOrder::default()
+            }),
+            position: Some(ProtoOaPosition {
+                position_id: request.position_id,
+                trade_data: trade(100, 1),
+                position_status: 1,
+                swap: 0,
+                ..ProtoOaPosition::default()
+            }),
+            ..ProtoOaExecutionEvent::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn close_states_the_position_and_the_volume_to_close() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(close).await;
+    let position = open(500, 7);
+    let accepted = client
+        .close_position(account(101), &position, volume("0.5"), &symbol)
+        .await
+        .expect("partial close");
+    assert_eq!(accepted.kind, ExecutionType::Accepted);
+    let closing = accepted.order.expect("closing order");
+    assert!(closing.closing);
+    assert_eq!(
+        (closing.side, closing.volume),
+        (TradeSide::Sell, volume("0.5"))
+    );
+    assert_eq!(closing.position, Some(position.id));
+    client
+        .close_position(account(101), &position, position.volume, &symbol)
+        .await
+        .expect("close");
+    let odd = open_sized(501, 7, 125);
+    client
+        .close_position(account(101), &odd, odd.volume, &symbol)
+        .await
+        .expect("close of a position off the step");
+    assert_eq!(
+        server_code(
+            client
+                .close_position(account(101), &open(MISSING, 7), volume("1"), &symbol)
+                .await
+        ),
+        Some(ErrorCode::PositionNotFound)
+    );
+    let sent: Vec<ProtoOaClosePositionReq> = sent(&server, CLOSE_POSITION_REQ);
+    assert_eq!(
+        sent.iter()
+            .map(|request| (
+                request.ctid_trader_account_id,
+                request.position_id,
+                request.volume
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (101, 500, 50),
+            (101, 500, 100),
+            (101, 501, 125),
+            (101, MISSING, 100)
+        ]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn close_that_does_not_fit_the_position_is_refused_before_anything_is_sent() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(close).await;
+    let position = open(500, 7);
+    let refused = |position: Position, units: &str| {
+        let (client, symbol, volume) = (client.clone(), symbol.clone(), volume(units));
+        async move {
+            value_error(
+                client
+                    .close_position(account(101), &position, volume, &symbol)
+                    .await,
+            )
+        }
+    };
+    assert!(matches!(
+        refused(position.clone(), "1.5").await,
+        Some(ValueError::AboveMaximum { .. })
+    ));
+    assert!(matches!(
+        refused(position.clone(), "0.25").await,
+        Some(ValueError::OffStep { .. })
+    ));
+    assert!(matches!(
+        refused(position.clone(), "0").await,
+        Some(ValueError::BelowMinimum { .. })
+    ));
+    assert!(matches!(
+        refused(open(500, 8), "1").await,
+        Some(ValueError::Mismatch { .. })
+    ));
+    assert_eq!(server.count(CLOSE_POSITION_REQ), 0);
     client.shutdown().await;
 }
