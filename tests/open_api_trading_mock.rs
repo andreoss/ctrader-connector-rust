@@ -12,8 +12,9 @@ use ctrader_connector::common::ids::{AccountId, PositionId, SymbolId};
 use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
+use ctrader_connector::open_api::executions::TradeEvent;
 use ctrader_connector::open_api::messages::{
-    ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq,
+    ProtoMessage, ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq,
     ProtoOaClosePositionReq, ProtoOaDeal, ProtoOaExecutionEvent, ProtoOaNewOrderReq, ProtoOaOrder,
     ProtoOaOrderErrorEvent, ProtoOaPosition, ProtoOaReconcileReq, ProtoOaReconcileRes,
     ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeData, ProtoOaVersionRes,
@@ -1575,5 +1576,161 @@ async fn close_that_does_not_fit_the_position_is_refused_before_anything_is_sent
         Some(ValueError::Mismatch { .. })
     ));
     assert_eq!(server.count(CLOSE_POSITION_REQ), 0);
+    client.shutdown().await;
+}
+
+async fn soon<T>(what: &str, future: impl Future<Output = T>) -> T {
+    timeout(Duration::from_secs(5), future)
+        .await
+        .unwrap_or_else(|_| panic!("nothing arrived in time: {what}"))
+}
+
+fn order_error(account: i64, order: Option<i64>, position: Option<i64>) -> ProtoMessage {
+    envelope(
+        ORDER_ERROR_EVENT,
+        &ProtoOaOrderErrorEvent {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            error_code: "NOT_ENOUGH_MONEY".to_owned(),
+            order_id: order,
+            position_id: position,
+            description: Some("not enough free margin".to_owned()),
+        },
+        None,
+    )
+}
+
+#[tokio::test]
+async fn execution_stream_delivers_the_events_of_its_account_in_order() {
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session(accept).await;
+    let mut stream = client.executions(account(101));
+    assert_eq!(stream.account(), account(101));
+    let placed = client
+        .place_order(&market(&symbol, TradeSide::Buy, "1"), &symbol)
+        .await
+        .expect("order")
+        .order
+        .expect("order");
+    let request = sent_orders(&server).remove(0);
+    let foreign = ProtoOaNewOrderReq {
+        ctid_trader_account_id: 202,
+        ..request.clone()
+    };
+    server.push(envelope(
+        EXECUTION_EVENT,
+        &execution(&foreign, FILLED),
+        None,
+    ));
+    server.push(order_error(202, Some(900), None));
+    server.push(envelope(
+        EXECUTION_EVENT,
+        &execution(&request, FILLED),
+        None,
+    ));
+    server.push(order_error(101, Some(900), Some(500)));
+    server.push(envelope(EXECUTION_EVENT, &execution(&request, 99), None));
+    server.push(order_error(101, Some(-1), None));
+    server.push(envelope(EXECUTION_EVENT, &execution(&request, 5), None));
+    let accepted = soon("acceptance", stream.next()).await.expect("event");
+    assert_eq!(accepted.order(), Some(placed.id));
+    assert_eq!(
+        accepted.execution().map(|execution| execution.kind),
+        Some(ExecutionType::Accepted)
+    );
+    let filled = soon("fill", stream.next()).await.expect("event");
+    let TradeEvent::Execution(fill) = &filled else {
+        panic!("expected an execution, got {filled:?}");
+    };
+    assert_eq!(fill.kind, ExecutionType::Filled);
+    assert_eq!(fill.deal.as_ref().map(|deal| deal.order), Some(placed.id));
+    let refused = soon("order error", stream.next()).await.expect("event");
+    assert_eq!(refused.order(), Some(placed.id));
+    assert!(refused.execution().is_none());
+    let TradeEvent::OrderError(error) = refused else {
+        panic!("expected an order error, got {refused:?}");
+    };
+    assert_eq!(error.account, account(101));
+    assert_eq!(error.code, ErrorCode::NotEnoughMoney);
+    assert_eq!(error.position, PositionId::new(500).ok());
+    assert_eq!(error.description.as_deref(), Some("not enough free margin"));
+    for what in ["execution out of range", "order error out of range"] {
+        assert!(matches!(
+            soon(what, stream.next()).await,
+            Err(ConnectorError::Value(_))
+        ));
+    }
+    let cancelled = soon("cancellation", stream.next()).await.expect("event");
+    assert_eq!(
+        cancelled.execution().map(|execution| execution.kind),
+        Some(ExecutionType::Cancelled)
+    );
+    client.shutdown().await;
+    assert_eq!(
+        soon("end", stream.next()).await,
+        Err(ConnectorError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn execution_stream_that_falls_behind_reports_the_loss_and_goes_on() {
+    const CAPACITY: usize = 4;
+    const FLOOD: u64 = 10;
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session_with(accept, Vec::new(), |options| {
+        options.event_capacity(CAPACITY)
+    })
+    .await;
+    client
+        .place_order(&market(&symbol, TradeSide::Buy, "1"), &symbol)
+        .await
+        .expect("order");
+    let request = sent_orders(&server).remove(0);
+    let mut stream = client.executions(account(101));
+    let mut watch = client.events();
+    for _ in 0..FLOOD - 1 {
+        server.push(envelope(
+            EXECUTION_EVENT,
+            &execution(&request, ACCEPTED),
+            None,
+        ));
+    }
+    server.push(envelope(
+        EXECUTION_EVENT,
+        &execution(&request, FILLED),
+        None,
+    ));
+    let mut seen = 0_u64;
+    soon("the flood reaches the client", async {
+        while seen < FLOOD {
+            match watch.recv().await {
+                Ok(_) => seen += 1,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => seen += skipped,
+                Err(broadcast::error::RecvError::Closed) => panic!("connection closed"),
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        soon("lag", stream.next()).await,
+        Err(ConnectorError::Lagged {
+            skipped: FLOOD - u64::try_from(CAPACITY).expect("capacity")
+        })
+    );
+    let mut kinds = Vec::new();
+    for _ in 0..CAPACITY {
+        let event = soon("event after the lag", stream.next())
+            .await
+            .expect("event");
+        kinds.push(event.execution().map(|execution| execution.kind));
+    }
+    assert_eq!(kinds.last(), Some(&Some(ExecutionType::Filled)));
+    assert_eq!(kinds[0], Some(ExecutionType::Accepted));
     client.shutdown().await;
 }

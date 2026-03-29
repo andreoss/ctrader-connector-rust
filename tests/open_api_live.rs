@@ -21,6 +21,7 @@ use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
+use ctrader_connector::open_api::executions::{ExecutionStream, TradeEvent};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
     ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq,
@@ -1945,6 +1946,109 @@ async fn live_position_is_closed_in_part_and_then_in_whole() {
         };
         println!("live close of a position already closed: {code:?}");
         assert_eq!(code, Some(ErrorCode::PositionNotFound));
+    })
+    .await;
+}
+
+async fn next_of(stream: &mut ExecutionStream, order: OrderId) -> Execution {
+    timeout(STEP, async {
+        loop {
+            let event = stream.next().await.expect("trade event");
+            assert!(
+                !matches!(event, TradeEvent::OrderError(_)),
+                "the server refused a request: {event:?}"
+            );
+            if event.order() == Some(order) {
+                break *match event {
+                    TradeEvent::Execution(execution) => execution,
+                    other => panic!("unexpected event {other:?}"),
+                };
+            }
+        }
+    })
+    .await
+    .expect("execution event in time")
+}
+
+#[tokio::test]
+async fn live_execution_stream_reports_the_life_of_orders_in_order() {
+    trading("ct25", |desk| async move {
+        let (bid, _) = desk.market().await;
+        let volume = desk.smallest();
+        let (account, symbol) = (desk.account.id, desk.symbol.id);
+        let mut stream = desk.client.executions(account);
+        let market = NewOrder::market(account, symbol, TradeSide::Buy, volume).label(desk.label());
+        let taken = desk
+            .client
+            .place_order(&market, &desk.symbol)
+            .await
+            .expect("market order")
+            .order
+            .expect("accepted order");
+        let accepted = next_of(&mut stream, taken.id).await;
+        let filled = next_of(&mut stream, taken.id).await;
+        println!(
+            "live execution stream: market order {} reported {:?} then {:?} with deal {:?}",
+            taken.id,
+            accepted.kind,
+            filled.kind,
+            filled.deal.as_ref().map(|deal| deal.id),
+        );
+        assert_eq!(accepted.kind, ExecutionType::Accepted);
+        assert_eq!(filled.kind, ExecutionType::Filled);
+        assert_eq!(accepted.account, account);
+        let deal = filled.deal.expect("deal of the fill");
+        assert_eq!((deal.order, deal.filled_volume), (taken.id, volume));
+        assert_eq!(
+            filled.position.map(|position| position.status),
+            Some(PositionStatus::Open)
+        );
+        let limit = NewOrder::limit(
+            account,
+            symbol,
+            TradeSide::Buy,
+            volume,
+            desk.scaled(bid, 50),
+        )
+        .label(desk.label());
+        let waiting = desk
+            .client
+            .place_order(&limit, &desk.symbol)
+            .await
+            .expect("limit order")
+            .order
+            .expect("accepted order");
+        desk.client
+            .cancel_order(account, waiting.id)
+            .await
+            .expect("cancelled order");
+        let accepted = next_of(&mut stream, waiting.id).await;
+        let cancelled = next_of(&mut stream, waiting.id).await;
+        println!(
+            "live execution stream: limit order {} reported {:?} then {:?}",
+            waiting.id, accepted.kind, cancelled.kind,
+        );
+        assert_eq!(accepted.kind, ExecutionType::Accepted);
+        assert_eq!(cancelled.kind, ExecutionType::Cancelled);
+        assert_eq!(
+            cancelled.order.map(|order| order.status),
+            Some(OrderStatus::Cancelled)
+        );
+        let refused = desk.client.cancel_order(account, waiting.id).await;
+        assert!(matches!(refused, Err(ConnectorError::Server(_))));
+        let event = timeout(STEP, stream.next())
+            .await
+            .expect("order error event in time")
+            .expect("trade event");
+        let TradeEvent::OrderError(error) = event else {
+            panic!("expected an order error, got {event:?}");
+        };
+        println!(
+            "live execution stream: second cancellation reported order error {:?}",
+            error.code
+        );
+        assert_eq!(error.code, ErrorCode::OrderNotFound);
+        assert_eq!(error.account, account);
     })
     .await;
 }
