@@ -11,6 +11,7 @@ pub mod client;
 pub mod connection;
 pub mod depth;
 pub mod executions;
+pub mod history;
 pub mod payload;
 pub mod quotes;
 mod stream;

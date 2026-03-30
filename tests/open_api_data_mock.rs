@@ -13,15 +13,16 @@ use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::DepthBook;
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
-    ProtoOaDepthEvent, ProtoOaDepthQuote, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
-    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaLightSymbol, ProtoOaSpotEvent,
+    ProtoOaDeal, ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaDepthEvent, ProtoOaDepthQuote,
+    ProtoOaGetTickDataReq, ProtoOaGetTickDataRes, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
+    ProtoOaLightSymbol, ProtoOaOrder, ProtoOaOrderListReq, ProtoOaOrderListRes, ProtoOaSpotEvent,
     ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
     ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
     ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
-    ProtoOaSymbolsListRes, ProtoOaTickData, ProtoOaTrader, ProtoOaTraderReq, ProtoOaTraderRes,
-    ProtoOaTrendbar, ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
-    ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
-    ProtoOaUnsubscribeSpotsReq,
+    ProtoOaSymbolsListRes, ProtoOaTickData, ProtoOaTradeData, ProtoOaTrader, ProtoOaTraderReq,
+    ProtoOaTraderRes, ProtoOaTrendbar, ProtoOaUnsubscribeDepthQuotesReq,
+    ProtoOaUnsubscribeDepthQuotesRes, ProtoOaUnsubscribeLiveTrendbarReq,
+    ProtoOaUnsubscribeLiveTrendbarRes, ProtoOaUnsubscribeSpotsReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{SymbolsParams, TradingMode};
@@ -1523,5 +1524,290 @@ async fn trader_carries_scaled_money_and_the_name_of_its_deposit_asset() {
         );
     }
     assert_eq!(server.count(TRADER_REQ), 7);
+    client.shutdown().await;
+}
+
+const DEAL_LIST_REQ: u32 = 2133;
+const DEAL_LIST_RES: u32 = 2134;
+const ORDER_LIST_REQ: u32 = 2175;
+const ORDER_LIST_RES: u32 = 2176;
+const ROWS_PER_RESPONSE: usize = 3;
+const HISTORY_TIMES: [i64; 8] = [
+    1_000,
+    2_000,
+    2_000,
+    2_499,
+    2_500,
+    3_000,
+    WEEK + 6_000,
+    3 * WEEK,
+];
+const CROWDED_HISTORY_TIMES: [i64; 5] = [900, 1_000, 1_000, 1_000, 1_000];
+
+fn history_rows(account: i64, from: i64, to: i64) -> Result<(Vec<(i64, i64)>, bool), Answer> {
+    if from >= to {
+        return Err(refuse(
+            "INCORRECT_BOUNDARIES",
+            "Incorrect period boundaries",
+        ));
+    }
+    if to - from > WEEK {
+        return Err(refuse("INCORRECT_BOUNDARIES", "range too long"));
+    }
+    let times: &[i64] = match account {
+        108 => {
+            return Err(refuse(
+                "CH_CTID_TRADER_ACCOUNT_NOT_FOUND",
+                "unknown account",
+            ));
+        }
+        106 => &CROWDED_HISTORY_TIMES,
+        _ => &HISTORY_TIMES,
+    };
+    let matching: Vec<(i64, i64)> = (1_i64..)
+        .zip(times.iter().copied())
+        .filter(|(_, at)| from <= *at && *at <= to)
+        .collect();
+    let more = matching.len() > ROWS_PER_RESPONSE;
+    Ok((
+        matching.into_iter().rev().take(ROWS_PER_RESPONSE).collect(),
+        more,
+    ))
+}
+
+fn history_data(payload_type: u32, payload: &[u8]) -> Answer {
+    match payload_type {
+        DEAL_LIST_REQ => {
+            let request = ProtoOaDealListReq::decode(payload).ok()?;
+            let account = request.ctid_trader_account_id;
+            let (rows, has_more) =
+                match history_rows(account, request.from_timestamp, request.to_timestamp) {
+                    Ok(rows) => rows,
+                    Err(refusal) => return refusal,
+                };
+            let deal = rows
+                .into_iter()
+                .map(|(id, at)| ProtoOaDeal {
+                    deal_id: id,
+                    order_id: 100 + id,
+                    position_id: 200 + id,
+                    volume: 100,
+                    filled_volume: 100,
+                    symbol_id: 1,
+                    create_timestamp: at,
+                    execution_timestamp: at + 200,
+                    utc_last_update_timestamp: Some(at),
+                    trade_side: if account == 107 && id == 1 { 9 } else { 1 },
+                    deal_status: 2,
+                    ..ProtoOaDeal::default()
+                })
+                .collect();
+            answer(
+                DEAL_LIST_RES,
+                &ProtoOaDealListRes {
+                    payload_type: None,
+                    ctid_trader_account_id: account,
+                    deal,
+                    has_more,
+                },
+            )
+        }
+        ORDER_LIST_REQ => {
+            let request = ProtoOaOrderListReq::decode(payload).ok()?;
+            let account = request.ctid_trader_account_id;
+            let (rows, has_more) =
+                match history_rows(account, request.from_timestamp, request.to_timestamp) {
+                    Ok(rows) => rows,
+                    Err(refusal) => return refusal,
+                };
+            let order = rows
+                .into_iter()
+                .map(|(id, at)| ProtoOaOrder {
+                    order_id: id,
+                    trade_data: ProtoOaTradeData {
+                        symbol_id: 1,
+                        volume: 100,
+                        trade_side: 2,
+                        label: Some(format!("row-{id}")),
+                        ..ProtoOaTradeData::default()
+                    },
+                    order_type: if account == 107 && id == 1 { 99 } else { 2 },
+                    order_status: 3,
+                    utc_last_update_timestamp: Some(at),
+                    ..ProtoOaOrder::default()
+                })
+                .collect();
+            answer(
+                ORDER_LIST_RES,
+                &ProtoOaOrderListRes {
+                    payload_type: None,
+                    ctid_trader_account_id: account,
+                    order,
+                    has_more,
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+fn asked<M: prost::Message + Default>(
+    server: &MockServer,
+    payload_type: u32,
+    ends: impl Fn(&M) -> (i64, i64),
+) -> Vec<(i64, i64)> {
+    server
+        .received()
+        .iter()
+        .filter(|message| message.payload_type == payload_type)
+        .map(|message| ends(&M::decode(message.payload.as_slice()).expect("request")))
+        .collect()
+}
+
+#[tokio::test]
+async fn deal_history_is_whole_in_order_and_asked_for_in_parts_the_server_accepts() {
+    let Session { server, client } = session(history_data).await;
+    let deals = client
+        .deal_history(account(101), millis(0, 3 * WEEK))
+        .await
+        .expect("deals");
+    let ids: Vec<i64> = deals.iter().map(|deal| deal.id.get()).collect();
+    assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        deals.first().map(|deal| deal.executed.as_millis()),
+        Some(1_200)
+    );
+    assert!(
+        deals
+            .windows(2)
+            .all(|pair| pair[0].executed <= pair[1].executed)
+    );
+    let requests = asked(&server, DEAL_LIST_REQ, |request: &ProtoOaDealListReq| {
+        assert_eq!(request.max_rows, None);
+        assert_eq!(request.ctid_trader_account_id, 101);
+        (request.from_timestamp, request.to_timestamp)
+    });
+    assert!(
+        requests.len() > 3,
+        "a crowded part is asked for again in halves"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(from, to)| from < to && to - from <= WEEK)
+    );
+    assert_eq!(requests.first(), Some(&(2 * WEEK + 2, 3 * WEEK)));
+    assert!(requests.contains(&(0, WEEK)) && requests.contains(&(WEEK + 1, 2 * WEEK + 1)));
+    let before = server.count(DEAL_LIST_REQ);
+    let one = client
+        .deal_history(account(101), millis(2_500, 2_500))
+        .await
+        .expect("deals");
+    assert_eq!(
+        one.iter().map(|deal| deal.id.get()).collect::<Vec<_>>(),
+        [5],
+        "the deal of the millisecond before is left out"
+    );
+    assert_eq!(server.count(DEAL_LIST_REQ), before + 1);
+    let request: ProtoOaDealListReq = last_request(&server, DEAL_LIST_REQ);
+    assert_eq!(
+        (request.from_timestamp, request.to_timestamp),
+        (2_499, 2_500)
+    );
+    let ends = client
+        .deal_history(account(101), millis(2_000, 2_499))
+        .await
+        .expect("deals");
+    assert_eq!(
+        ends.iter().map(|deal| deal.id.get()).collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn order_history_is_whole_in_the_order_of_the_last_update() {
+    let Session { server, client } = session(history_data).await;
+    let orders = client
+        .order_history(account(101), millis(0, 3 * WEEK))
+        .await
+        .expect("orders");
+    let ids: Vec<i64> = orders.iter().map(|order| order.id.get()).collect();
+    assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        orders
+            .last()
+            .and_then(|order| order.updated)
+            .map(Timestamp::as_millis),
+        Some(3 * WEEK)
+    );
+    assert_eq!(
+        orders.first().and_then(|order| order.label.clone()),
+        Some("row-1".to_owned())
+    );
+    let requests = asked(&server, ORDER_LIST_REQ, |request: &ProtoOaOrderListReq| {
+        (request.from_timestamp, request.to_timestamp)
+    });
+    assert!(requests.len() > 3);
+    assert!(
+        requests
+            .iter()
+            .all(|(from, to)| from < to && to - from <= WEEK)
+    );
+    let one = client
+        .order_history(account(101), millis(2_500, 2_500))
+        .await
+        .expect("orders");
+    assert_eq!(
+        one.iter().map(|order| order.id.get()).collect::<Vec<_>>(),
+        [5]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn history_the_server_cannot_send_whole_is_an_error_and_never_a_part() {
+    let Session {
+        server: _server,
+        client,
+    } = session(history_data).await;
+    let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
+    let incomplete = ConnectorError::Incomplete {
+        from: at(1_000),
+        to: at(1_001),
+    };
+    assert_eq!(
+        client.deal_history(account(106), millis(0, 5_000)).await,
+        Err(incomplete.clone())
+    );
+    assert_eq!(
+        client.order_history(account(106), millis(0, 5_000)).await,
+        Err(incomplete)
+    );
+    assert_eq!(
+        client
+            .deal_history(account(106), millis(0, 950))
+            .await
+            .map(|deals| deals.len()),
+        Ok(1)
+    );
+    assert!(matches!(
+        client.deal_history(account(107), millis(0, 3 * WEEK)).await,
+        Err(ConnectorError::Value(ValueError::OutOfRange { .. }))
+    ));
+    assert!(matches!(
+        client
+            .order_history(account(107), millis(0, 3 * WEEK))
+            .await,
+        Err(ConnectorError::Value(ValueError::OutOfRange { .. }))
+    ));
+    assert_eq!(
+        server_code(client.deal_history(account(108), millis(0, 10)).await),
+        Some(ErrorCode::ChCtidTraderAccountNotFound)
+    );
+    assert_eq!(
+        server_code(client.order_history(account(108), millis(0, 10)).await),
+        Some(ErrorCode::ChCtidTraderAccountNotFound)
+    );
     client.shutdown().await;
 }

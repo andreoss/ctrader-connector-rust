@@ -33,7 +33,7 @@ use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
 use ctrader_connector::open_api::ticks::TickDataParams;
 use ctrader_connector::open_api::trading::{
-    Comment, DealStatus, Execution, ExecutionType, Label, NewOrder, Order, OrderAmendment,
+    Comment, Deal, DealStatus, Execution, ExecutionType, Label, NewOrder, Order, OrderAmendment,
     OrderStatus, OrderType, Position, PositionAmendment, PositionStatus, TimeInForce, TradeSide,
 };
 use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
@@ -2087,4 +2087,95 @@ async fn live_trader_reports_the_balance_and_currency_of_the_demo_account() {
     );
     assert_eq!(trader.access_rights, AccessRights::FullAccess);
     client.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_history_holds_the_deals_and_orders_of_the_run() {
+    trading("ct27", |desk| async move {
+        let margin = Duration::from_secs(120);
+        let started = Timestamp::now().checked_sub(margin).expect("start");
+        let (bid, _) = desk.market().await;
+        let (account, symbol, volume) = (desk.account.id, desk.symbol.id, desk.smallest());
+        let limit =
+            NewOrder::limit(account, symbol, TradeSide::Buy, volume, desk.scaled(bid, 50))
+                .label(desk.label());
+        let resting = desk
+            .client
+            .place_order(&limit, &desk.symbol)
+            .await
+            .expect("limit order")
+            .order
+            .expect("accepted order");
+        desk.client
+            .cancel_order(account, resting.id)
+            .await
+            .expect("cancelled order");
+        let mut events = desk.client.events();
+        let market = NewOrder::market(account, symbol, TradeSide::Buy, volume).label(desk.label());
+        let accepted = desk
+            .client
+            .place_order(&market, &desk.symbol)
+            .await
+            .expect("market order")
+            .order
+            .expect("accepted order");
+        let opened = opened_by(&mut events, accepted.id).await;
+        let closing = desk
+            .client
+            .close_position(account, &opened, opened.volume, &desk.symbol)
+            .await
+            .expect("close")
+            .order
+            .expect("closing order");
+        let closed = closed_by(&mut events, closing.id).await;
+        let last = closed.deal.expect("closing deal");
+        let ended = Timestamp::now().checked_add(margin).expect("end");
+        let range = TimeRange::new(started, ended).expect("range");
+        let deals = desk.client.deal_history(account, range).await.expect("deals");
+        let orders = desk
+            .client
+            .order_history(account, range)
+            .await
+            .expect("orders");
+        let own: Vec<&Deal> = deals
+            .iter()
+            .filter(|deal| deal.position == opened.id)
+            .collect();
+        let labelled: Vec<&Order> = orders
+            .iter()
+            .filter(|order| order.label.as_deref() == Some(desk.label.as_str()))
+            .collect();
+        println!(
+            "live history: {} deals and {} orders in range, own deals {:?} of orders {:?}, own orders {:?}",
+            deals.len(),
+            orders.len(),
+            own.iter().map(|deal| deal.id.get()).collect::<Vec<_>>(),
+            own.iter().map(|deal| deal.order.get()).collect::<Vec<_>>(),
+            labelled
+                .iter()
+                .map(|order| (order.id.get(), order.status))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            own.iter().map(|deal| deal.order).collect::<Vec<_>>(),
+            vec![accepted.id, closing.id]
+        );
+        assert_eq!(own.last().map(|deal| deal.id), Some(last.id));
+        assert_eq!(own.last().copied(), Some(&last));
+        assert!(own.iter().all(|deal| deal.filled_volume == volume));
+        assert!(deals.windows(2).all(|pair| pair[0].executed <= pair[1].executed));
+        assert!(orders.windows(2).all(|pair| pair[0].updated <= pair[1].updated));
+        let status = |id: OrderId| {
+            labelled
+                .iter()
+                .find(|order| order.id == id)
+                .map(|order| order.status)
+        };
+        assert_eq!(status(resting.id), Some(OrderStatus::Cancelled));
+        assert_eq!(status(accepted.id), Some(OrderStatus::Filled));
+        assert_eq!(status(closing.id), Some(OrderStatus::Filled));
+        let (positions, pending) = desk.own().await;
+        assert!(positions.is_empty() && pending.is_empty());
+    })
+    .await;
 }

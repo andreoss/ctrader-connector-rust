@@ -13,12 +13,12 @@ use crate::open_api::messages::{
     ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq,
     ProtoOaGetAccountListByAccessTokenRes, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
     ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaNewOrderReq, ProtoOaOrderErrorEvent,
-    ProtoOaPayloadType, ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaRefreshTokenReq,
-    ProtoOaRefreshTokenRes, ProtoOaSpotEvent, ProtoOaSubscribeDepthQuotesReq,
-    ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeLiveTrendbarReq,
-    ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq, ProtoOaSubscribeSpotsRes,
-    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
-    ProtoOaTraderReq, ProtoOaTraderRes, ProtoOaUnsubscribeDepthQuotesReq,
+    ProtoOaOrderListReq, ProtoOaOrderListRes, ProtoOaPayloadType, ProtoOaReconcileReq,
+    ProtoOaReconcileRes, ProtoOaRefreshTokenReq, ProtoOaRefreshTokenRes, ProtoOaSpotEvent,
+    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
+    ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
+    ProtoOaSubscribeSpotsRes, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
+    ProtoOaSymbolsListRes, ProtoOaTraderReq, ProtoOaTraderRes, ProtoOaUnsubscribeDepthQuotesReq,
     ProtoOaUnsubscribeDepthQuotesRes, ProtoOaUnsubscribeLiveTrendbarReq,
     ProtoOaUnsubscribeLiveTrendbarRes, ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes,
     ProtoOaVersionReq, ProtoOaVersionRes, ProtoPayloadType,
@@ -156,6 +156,8 @@ payloads! {
     ProtoOaOrderErrorEvent => ProtoOaPayloadType::ProtoOaOrderErrorEvent,
     ProtoOaTraderReq => ProtoOaPayloadType::ProtoOaTraderReq,
     ProtoOaTraderRes => ProtoOaPayloadType::ProtoOaTraderRes,
+    ProtoOaOrderListReq => ProtoOaPayloadType::ProtoOaOrderListReq,
+    ProtoOaOrderListRes => ProtoOaPayloadType::ProtoOaOrderListRes,
 }
 
 requests! {
@@ -176,6 +178,7 @@ requests! {
     ProtoOaReconcileReq => ProtoOaReconcileRes, false;
     ProtoOaTraderReq => ProtoOaTraderRes, false;
     ProtoOaDealListReq => ProtoOaDealListRes, true;
+    ProtoOaOrderListReq => ProtoOaOrderListRes, true;
     ProtoOaGetTrendbarsReq => ProtoOaGetTrendbarsRes, true;
     ProtoOaCashFlowHistoryListReq => ProtoOaCashFlowHistoryListRes, true;
     ProtoOaGetTickDataReq => ProtoOaGetTickDataRes, true;
@@ -193,7 +196,7 @@ mod tests {
     #[test]
     fn declared_payload_types_match_the_defaults_in_the_proto_files() {
         let declared = declared();
-        assert_eq!(declared.len(), 55);
+        assert_eq!(declared.len(), 57);
         for (name, constant, default) in declared {
             assert_eq!(i64::from(constant), i64::from(default), "{name}");
         }
