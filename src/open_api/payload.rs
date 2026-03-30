@@ -12,13 +12,16 @@ use crate::open_api::messages::{
     ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaDepthEvent, ProtoOaErrorRes,
     ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq,
     ProtoOaGetAccountListByAccessTokenRes, ProtoOaGetTickDataReq, ProtoOaGetTickDataRes,
-    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaNewOrderReq, ProtoOaOrderErrorEvent,
-    ProtoOaOrderListReq, ProtoOaOrderListRes, ProtoOaPayloadType, ProtoOaReconcileReq,
-    ProtoOaReconcileRes, ProtoOaRefreshTokenReq, ProtoOaRefreshTokenRes, ProtoOaSpotEvent,
-    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
-    ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
-    ProtoOaSubscribeSpotsRes, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
-    ProtoOaSymbolsListRes, ProtoOaTraderReq, ProtoOaTraderRes, ProtoOaUnsubscribeDepthQuotesReq,
+    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaMarginCallListReq,
+    ProtoOaMarginCallListRes, ProtoOaMarginCallTriggerEvent, ProtoOaMarginCallUpdateEvent,
+    ProtoOaMarginCallUpdateReq, ProtoOaMarginCallUpdateRes, ProtoOaMarginChangedEvent,
+    ProtoOaNewOrderReq, ProtoOaOrderErrorEvent, ProtoOaOrderListReq, ProtoOaOrderListRes,
+    ProtoOaPayloadType, ProtoOaReconcileReq, ProtoOaReconcileRes, ProtoOaRefreshTokenReq,
+    ProtoOaRefreshTokenRes, ProtoOaSpotEvent, ProtoOaSubscribeDepthQuotesReq,
+    ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeLiveTrendbarReq,
+    ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq, ProtoOaSubscribeSpotsRes,
+    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes,
+    ProtoOaTraderReq, ProtoOaTraderRes, ProtoOaUnsubscribeDepthQuotesReq,
     ProtoOaUnsubscribeDepthQuotesRes, ProtoOaUnsubscribeLiveTrendbarReq,
     ProtoOaUnsubscribeLiveTrendbarRes, ProtoOaUnsubscribeSpotsReq, ProtoOaUnsubscribeSpotsRes,
     ProtoOaVersionReq, ProtoOaVersionRes, ProtoPayloadType,
@@ -158,6 +161,13 @@ payloads! {
     ProtoOaTraderRes => ProtoOaPayloadType::ProtoOaTraderRes,
     ProtoOaOrderListReq => ProtoOaPayloadType::ProtoOaOrderListReq,
     ProtoOaOrderListRes => ProtoOaPayloadType::ProtoOaOrderListRes,
+    ProtoOaMarginChangedEvent => ProtoOaPayloadType::ProtoOaMarginChangedEvent,
+    ProtoOaMarginCallListReq => ProtoOaPayloadType::ProtoOaMarginCallListReq,
+    ProtoOaMarginCallListRes => ProtoOaPayloadType::ProtoOaMarginCallListRes,
+    ProtoOaMarginCallUpdateReq => ProtoOaPayloadType::ProtoOaMarginCallUpdateReq,
+    ProtoOaMarginCallUpdateRes => ProtoOaPayloadType::ProtoOaMarginCallUpdateRes,
+    ProtoOaMarginCallUpdateEvent => ProtoOaPayloadType::ProtoOaMarginCallUpdateEvent,
+    ProtoOaMarginCallTriggerEvent => ProtoOaPayloadType::ProtoOaMarginCallTriggerEvent,
 }
 
 requests! {
@@ -177,6 +187,8 @@ requests! {
     ProtoOaSymbolByIdReq => ProtoOaSymbolByIdRes, false;
     ProtoOaReconcileReq => ProtoOaReconcileRes, false;
     ProtoOaTraderReq => ProtoOaTraderRes, false;
+    ProtoOaMarginCallListReq => ProtoOaMarginCallListRes, false;
+    ProtoOaMarginCallUpdateReq => ProtoOaMarginCallUpdateRes, false;
     ProtoOaDealListReq => ProtoOaDealListRes, true;
     ProtoOaOrderListReq => ProtoOaOrderListRes, true;
     ProtoOaGetTrendbarsReq => ProtoOaGetTrendbarsRes, true;
@@ -196,7 +208,7 @@ mod tests {
     #[test]
     fn declared_payload_types_match_the_defaults_in_the_proto_files() {
         let declared = declared();
-        assert_eq!(declared.len(), 57);
+        assert_eq!(declared.len(), 64);
         for (name, constant, default) in declared {
             assert_eq!(i64::from(constant), i64::from(default), "{name}");
         }

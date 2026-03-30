@@ -1,4 +1,4 @@
-//! Deals and orders of an account inside a range of time.
+//! Deals, orders and changes of the balance of an account inside a range of time.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -23,16 +23,22 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use rust_decimal::Decimal;
+
 use crate::common::errors::{ConnectorError, ValueError};
-use crate::common::ids::AccountId;
+use crate::common::ids::{AccountId, CashFlowId};
 use crate::common::time::{TimeRange, Timestamp};
 use crate::open_api::client::OpenApiClient;
-use crate::open_api::messages::{ProtoOaDealListReq, ProtoOaOrderListReq};
-use crate::open_api::trading::{Deal, Order};
+use crate::open_api::messages::{
+    ProtoOaCashFlowHistoryListReq, ProtoOaChangeBalanceType, ProtoOaDealListReq,
+    ProtoOaDepositWithdraw, ProtoOaOrderListReq,
+};
+use crate::open_api::trading::{Deal, Order, money};
 
 const MAX_RANGE_MILLIS: i64 = 604_800_000;
 
 const HISTORY_TIMESTAMP: &str = "end of the range of history";
+const CASH_FLOW_KIND: &str = "kind of cash flow";
 
 /// Longest range of time the server accepts in one request for deals, orders or cash flow.
 pub const MAX_HISTORY_RANGE: Duration = Duration::from_millis(MAX_RANGE_MILLIS.unsigned_abs());
@@ -108,6 +114,150 @@ fn widened(start: i64, end: i64) -> Result<(i64, i64), ValueError> {
             .ok_or(ValueError::OutOfRange {
                 kind: HISTORY_TIMESTAMP,
             }),
+    }
+}
+
+macro_rules! cash_flow_kinds {
+    ($($(#[$doc:meta])* $name:ident => $wire:ident, $deposit:literal;)*) => {
+        /// Reason the balance of an account changed outside of trading.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub enum CashFlowKind {
+            $($(#[$doc])* $name,)*
+        }
+
+        impl CashFlowKind {
+            fn from_wire(raw: i32) -> Result<Self, ValueError> {
+                match ProtoOaChangeBalanceType::try_from(raw) {
+                    $(Ok(ProtoOaChangeBalanceType::$wire) => Ok(Self::$name),)*
+                    Err(_) => Err(ValueError::OutOfRange { kind: CASH_FLOW_KIND }),
+                }
+            }
+
+            /// Tells whether the change adds money to the account; otherwise it takes money
+            /// from it.
+            #[must_use]
+            pub const fn is_deposit(self) -> bool {
+                match self {
+                    $(Self::$name => $deposit,)*
+                }
+            }
+        }
+    };
+}
+
+cash_flow_kinds! {
+    /// Money paid in.
+    Deposit => BalanceDeposit, true;
+    /// Money paid out.
+    Withdraw => BalanceWithdraw, false;
+    /// Commission of a strategy received from an account of the same broker.
+    DepositStrategyCommissionInner => BalanceDepositStrategyCommissionInner, true;
+    /// Commission of a strategy paid to an account of the same broker.
+    WithdrawStrategyCommissionInner => BalanceWithdrawStrategyCommissionInner, false;
+    /// Commissions received as an introducing broker.
+    DepositIbCommissions => BalanceDepositIbCommissions, true;
+    /// Share of commissions passed on by an introducing broker.
+    WithdrawIbSharedPercentage => BalanceWithdrawIbSharedPercentage, false;
+    /// Share of commissions received from a sub introducing broker.
+    DepositIbSharedPercentageFromSubIb => BalanceDepositIbSharedPercentageFromSubIb, true;
+    /// Share of commissions received from the broker.
+    DepositIbSharedPercentageFromBroker => BalanceDepositIbSharedPercentageFromBroker, true;
+    /// Rebate received.
+    DepositRebate => BalanceDepositRebate, true;
+    /// Rebate taken back.
+    WithdrawRebate => BalanceWithdrawRebate, false;
+    /// Commission of a strategy received from an account of another broker.
+    DepositStrategyCommissionOuter => BalanceDepositStrategyCommissionOuter, true;
+    /// Commission of a strategy paid to an account of another broker.
+    WithdrawStrategyCommissionOuter => BalanceWithdrawStrategyCommissionOuter, false;
+    /// Compensation of a bonus taken from the account.
+    WithdrawBonusCompensation => BalanceWithdrawBonusCompensation, false;
+    /// Share of commissions passed on to the broker.
+    WithdrawIbSharedPercentageToBroker => BalanceWithdrawIbSharedPercentageToBroker, false;
+    /// Dividends received.
+    DepositDividends => BalanceDepositDividends, true;
+    /// Dividends charged.
+    WithdrawDividends => BalanceWithdrawDividends, false;
+    /// Charge for a guaranteed stop loss.
+    WithdrawGslCharge => BalanceWithdrawGslCharge, false;
+    /// Charge for holding a position over the rollover.
+    WithdrawRollover => BalanceWithdrawRollover, false;
+    /// Bonus that cannot be paid out, added.
+    DepositNonwithdrawableBonus => BalanceDepositNonwithdrawableBonus, true;
+    /// Bonus that cannot be paid out, removed.
+    WithdrawNonwithdrawableBonus => BalanceWithdrawNonwithdrawableBonus, false;
+    /// Swap received.
+    DepositSwap => BalanceDepositSwap, true;
+    /// Swap charged.
+    WithdrawSwap => BalanceWithdrawSwap, false;
+    /// Management fee received.
+    DepositManagementFee => BalanceDepositManagementFee, true;
+    /// Management fee paid.
+    WithdrawManagementFee => BalanceWithdrawManagementFee, false;
+    /// Performance fee received.
+    DepositPerformanceFee => BalanceDepositPerformanceFee, true;
+    /// Money moved out for a subaccount.
+    WithdrawForSubaccount => BalanceWithdrawForSubaccount, false;
+    /// Money moved in to a subaccount.
+    DepositToSubaccount => BalanceDepositToSubaccount, true;
+    /// Money moved out of a subaccount.
+    WithdrawFromSubaccount => BalanceWithdrawFromSubaccount, false;
+    /// Money moved in from a subaccount.
+    DepositFromSubaccount => BalanceDepositFromSubaccount, true;
+    /// Fee for copying a strategy.
+    WithdrawCopyFee => BalanceWithdrawCopyFee, false;
+    /// Fee for an account that does not trade.
+    WithdrawInactivityFee => BalanceWithdrawInactivityFee, false;
+    /// Transfer received from another account.
+    DepositTransfer => BalanceDepositTransfer, true;
+    /// Transfer sent to another account.
+    WithdrawTransfer => BalanceWithdrawTransfer, false;
+    /// Bonus turned into money of the account.
+    DepositConvertedBonus => BalanceDepositConvertedBonus, true;
+    /// Money added to bring a negative balance back to zero.
+    DepositNegativeBalanceProtection => BalanceDepositNegativeBalanceProtection, true;
+}
+
+/// One change of the balance of an account outside of trading, such as a deposit or a
+/// withdrawal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct CashFlow {
+    /// Identifier of the change in the history of the balance.
+    pub id: CashFlowId,
+    /// Reason of the change.
+    pub kind: CashFlowKind,
+    /// Size of the change in the deposit currency; [`CashFlowKind::is_deposit`] tells its
+    /// direction.
+    pub amount: Decimal,
+    /// Balance after the change, in the deposit currency.
+    pub balance: Decimal,
+    /// Equity after the change, in the deposit currency.
+    pub equity: Option<Decimal>,
+    /// Moment of the change.
+    pub at: Timestamp,
+    /// Note the broker attached.
+    pub note: Option<String>,
+    /// Version of the balance after the change.
+    pub balance_version: Option<i64>,
+}
+
+impl TryFrom<ProtoOaDepositWithdraw> for CashFlow {
+    type Error = ValueError;
+
+    fn try_from(change: ProtoOaDepositWithdraw) -> Result<Self, Self::Error> {
+        let digits = change.money_digits;
+        Ok(Self {
+            id: CashFlowId::new(change.balance_history_id)?,
+            kind: CashFlowKind::from_wire(change.operation_type)?,
+            amount: money(change.delta, digits)?,
+            balance: money(change.balance, digits)?,
+            equity: change.equity.map(|raw| money(raw, digits)).transpose()?,
+            at: Timestamp::from_millis(change.change_balance_timestamp)?,
+            note: change.external_note,
+            balance_version: change.balance_version,
+        })
     }
 }
 
@@ -207,15 +357,60 @@ impl OpenApiClient {
         orders.sort_by_key(|order| (order.updated, order.id));
         Ok(orders)
     }
+
+    /// Fetches the deposits, withdrawals and other changes of the balance of an authorised
+    /// account outside of trading that were made inside a range of time, oldest first.
+    ///
+    /// A range longer than [`MAX_HISTORY_RANGE`] is fetched with several requests, each of
+    /// which counts against the limit for historical data. A single millisecond is asked for
+    /// together with the one before it, and what belongs to that other millisecond is left
+    /// out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Server`] when the server refuses a request,
+    /// [`ConnectorError::Value`] when a change carries a value out of range, in which case no
+    /// part of the range is returned, and the errors of
+    /// [`Connection::request`](crate::open_api::connection::Connection::request) otherwise.
+    pub async fn cash_flow_history(
+        &self,
+        account: AccountId,
+        range: TimeRange,
+    ) -> Result<Vec<CashFlow>, ConnectorError> {
+        let mut windows = Windows::new(range)?;
+        let mut changes = BTreeMap::new();
+        while let Some((from, to)) = windows.next() {
+            let request = ProtoOaCashFlowHistoryListReq {
+                payload_type: None,
+                ctid_trader_account_id: account.get(),
+                from_timestamp: from,
+                to_timestamp: to,
+            };
+            let response = self.connection().request(&request).await?;
+            for change in response.deposit_withdraw {
+                let change = CashFlow::try_from(change)?;
+                if inside(range, Some(change.at.as_millis())) {
+                    changes.insert(change.id, change);
+                }
+            }
+        }
+        let mut changes: Vec<CashFlow> = changes.into_values().collect();
+        changes.sort_by_key(|change| (change.at, change.id));
+        Ok(changes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{MAX_HISTORY_RANGE, MAX_RANGE_MILLIS, Windows, widened};
-    use crate::common::errors::ConnectorError;
+    use super::{CashFlow, CashFlowKind, MAX_HISTORY_RANGE, MAX_RANGE_MILLIS, Windows, widened};
+    use crate::common::errors::{ConnectorError, ValueError};
     use crate::common::time::{TimeRange, Timestamp};
+    use crate::open_api::messages::{
+        ProtoOaChangeBalanceType, ProtoOaDepositWithdraw, ProtoOaExecutionEvent,
+    };
+    use crate::open_api::trading::{Execution, ExecutionType};
 
     fn range(from: i64, to: i64) -> TimeRange {
         let at = |millis| Timestamp::from_millis(millis).expect("timestamp");
@@ -298,5 +493,74 @@ mod tests {
             })
         );
         assert!(windows.split((i64::MIN, i64::MAX)).is_err());
+    }
+
+    #[test]
+    fn every_kind_of_cash_flow_of_the_wire_is_known_with_its_direction() {
+        let mut known = 0;
+        for raw in -1..=64 {
+            match ProtoOaChangeBalanceType::try_from(raw) {
+                Ok(wire) => {
+                    let kind = CashFlowKind::from_wire(raw).expect("kind");
+                    assert_eq!(
+                        kind.is_deposit(),
+                        wire.as_str_name().starts_with("BALANCE_DEPOSIT"),
+                        "{}",
+                        wire.as_str_name()
+                    );
+                    known += 1;
+                }
+                Err(_) => assert_eq!(
+                    CashFlowKind::from_wire(raw),
+                    Err(ValueError::OutOfRange {
+                        kind: "kind of cash flow"
+                    })
+                ),
+            }
+        }
+        assert_eq!(known, 35);
+        assert_eq!(CashFlowKind::from_wire(1), Ok(CashFlowKind::Withdraw));
+    }
+
+    #[test]
+    fn execution_event_carries_the_cash_flow_it_reports() {
+        let change = ProtoOaDepositWithdraw {
+            operation_type: 0,
+            balance_history_id: 77,
+            balance: 150_000,
+            delta: 100_000,
+            change_balance_timestamp: 1_000,
+            external_note: Some("first deposit".to_owned()),
+            balance_version: Some(3),
+            equity: Some(150_100),
+            money_digits: Some(2),
+        };
+        let event = ProtoOaExecutionEvent {
+            ctid_trader_account_id: 101,
+            execution_type: 10,
+            deposit_withdraw: Some(change.clone()),
+            ..ProtoOaExecutionEvent::default()
+        };
+        let execution = Execution::try_from(event).expect("execution");
+        assert_eq!(execution.kind, ExecutionType::DepositWithdraw);
+        let flow = execution.cash_flow.expect("cash flow");
+        assert_eq!(flow.id.get(), 77);
+        assert_eq!(flow.kind, CashFlowKind::Deposit);
+        assert_eq!(flow.amount.to_string(), "1000.00");
+        assert_eq!(flow.balance.to_string(), "1500.00");
+        assert_eq!(
+            flow.equity.map(|equity| equity.to_string()).as_deref(),
+            Some("1501.00")
+        );
+        assert_eq!(flow.at.as_millis(), 1_000);
+        assert_eq!(flow.note.as_deref(), Some("first deposit"));
+        assert_eq!(flow.balance_version, Some(3));
+        assert!(
+            CashFlow::try_from(ProtoOaDepositWithdraw {
+                balance_history_id: 0,
+                ..change
+            })
+            .is_err()
+        );
     }
 }

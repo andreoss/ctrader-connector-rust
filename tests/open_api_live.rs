@@ -23,6 +23,7 @@ use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::executions::{ExecutionStream, TradeEvent};
+use ctrader_connector::open_api::margin::{MarginChange, MarginEvent, MarginStream};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
     ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq,
@@ -2176,6 +2177,104 @@ async fn live_history_holds_the_deals_and_orders_of_the_run() {
         assert_eq!(status(closing.id), Some(OrderStatus::Filled));
         let (positions, pending) = desk.own().await;
         assert!(positions.is_empty() && pending.is_empty());
+    })
+    .await;
+}
+
+async fn margin_of(stream: &mut MarginStream, position: PositionId) -> Option<MarginChange> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next().await.expect("margin event") {
+                MarginEvent::Changed(change) if change.position == position => break change,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+#[tokio::test]
+async fn live_margin_changes_with_the_position_and_cash_flow_is_read() {
+    trading("ct28", |desk| async move {
+        let account = desk.account.id;
+        let part = desk.smallest();
+        let whole = Volume::new(part.value() + part.value()).expect("volume");
+        let mut margin = desk.client.margin_events(account);
+        let mut events = desk.client.events();
+        let market =
+            NewOrder::market(account, desk.symbol.id, TradeSide::Buy, whole).label(desk.label());
+        let accepted = desk
+            .client
+            .place_order(&market, &desk.symbol)
+            .await
+            .expect("market order")
+            .order
+            .expect("accepted order");
+        let opened = opened_by(&mut events, accepted.id).await;
+        let on_open = margin_of(&mut margin, opened.id).await;
+        assert!(on_open.is_none_or(|change| change.used_margin > Decimal::ZERO));
+        let closing = desk
+            .client
+            .close_position(account, &opened, part, &desk.symbol)
+            .await
+            .expect("partial close")
+            .order
+            .expect("closing order");
+        closed_by(&mut events, closing.id).await;
+        let on_part = margin_of(&mut margin, opened.id).await;
+        println!(
+            "live margin: change event on open {:?}, on partial close {:?}",
+            on_open.map(|change| change.used_margin.to_string()),
+            on_part.map(|change| change.used_margin.to_string()),
+        );
+        assert!(on_part.is_none_or(|change| change.used_margin > Decimal::ZERO));
+        let rest = desk.position(opened.id).await;
+        let closing = desk
+            .client
+            .close_position(account, &rest, rest.volume, &desk.symbol)
+            .await
+            .expect("close")
+            .order
+            .expect("closing order");
+        closed_by(&mut events, closing.id).await;
+        let calls = desk
+            .client
+            .margin_calls(account)
+            .await
+            .expect("margin calls");
+        println!(
+            "live margin calls: {:?}",
+            calls
+                .iter()
+                .map(|call| (call.level, call.threshold.to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(calls.iter().all(|call| call.threshold > Decimal::ZERO));
+        assert!(calls.windows(2).all(|pair| pair[0].level != pair[1].level));
+        let month = TimeRange::ending_at(Timestamp::now(), Duration::from_secs(28 * 86_400));
+        let flows = desk
+            .client
+            .cash_flow_history(account, month)
+            .await
+            .expect("cash flow");
+        println!(
+            "live cash flow: {} changes in four weeks: {:?}",
+            flows.len(),
+            flows
+                .iter()
+                .map(|flow| (flow.kind, flow.amount.to_string(), flow.at.as_millis()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            flows
+                .iter()
+                .all(|flow| month.from() <= flow.at && flow.at <= month.to())
+        );
+        assert!(flows.windows(2).all(|pair| pair[0].at <= pair[1].at));
+        assert!(flows.iter().all(|flow| flow.amount > Decimal::ZERO));
+        let (positions, orders) = desk.own().await;
+        assert!(positions.is_empty() && orders.is_empty());
     })
     .await;
 }

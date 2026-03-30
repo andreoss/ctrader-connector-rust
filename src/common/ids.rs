@@ -97,6 +97,11 @@ id!(
     DealId,
     "deal id"
 );
+id!(
+    /// Identifier of a change in the history of the balance of an account.
+    CashFlowId,
+    "cash flow id"
+);
 
 id!(
     /// Identifier of an asset, such as a currency.
@@ -113,7 +118,9 @@ id!(
 mod tests {
     use std::collections::HashSet;
 
-    use super::{AccountId, AssetId, DealId, OrderId, PositionId, SymbolCategoryId, SymbolId};
+    use super::{
+        AccountId, AssetId, CashFlowId, DealId, OrderId, PositionId, SymbolCategoryId, SymbolId,
+    };
     use crate::common::errors::ValueError;
 
     macro_rules! id_tests {
@@ -185,6 +192,7 @@ mod tests {
         order: OrderId, "order id";
         position: PositionId, "position id";
         deal: DealId, "deal id";
+        cash_flow: CashFlowId, "cash flow id";
         asset: AssetId, "asset id";
         symbol_category: SymbolCategoryId, "symbol category id";
     }

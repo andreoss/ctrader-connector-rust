@@ -41,6 +41,7 @@ use crate::common::errors::{ConnectorError, ErrorCode, ServerError, ValueError};
 use crate::common::ids::{AccountId, DealId, OrderId, PositionId, SymbolId};
 use crate::common::time::Timestamp;
 use crate::open_api::client::OpenApiClient;
+use crate::open_api::history::CashFlow;
 use crate::open_api::messages::{
     ProtoMessage, ProtoOaAmendOrderReq, ProtoOaAmendPositionSltpReq, ProtoOaCancelOrderReq,
     ProtoOaClosePositionDetail, ProtoOaClosePositionReq, ProtoOaDeal, ProtoOaDealStatus,
@@ -686,6 +687,8 @@ pub struct Execution {
     pub position: Option<Position>,
     /// Deal the event reports.
     pub deal: Option<Deal>,
+    /// Deposit, withdrawal or other change of the balance outside of trading the event reports.
+    pub cash_flow: Option<CashFlow>,
     /// Reason the server gives when it refuses an order.
     pub error_code: Option<ErrorCode>,
     /// Tells whether the server acted by itself, as when a stop loss is hit, and not on a
@@ -703,6 +706,7 @@ impl TryFrom<ProtoOaExecutionEvent> for Execution {
             order: event.order.map(Order::try_from).transpose()?,
             position: event.position.map(Position::try_from).transpose()?,
             deal: event.deal.map(Deal::try_from).transpose()?,
+            cash_flow: event.deposit_withdraw.map(CashFlow::try_from).transpose()?,
             error_code: event.error_code.as_deref().map(ErrorCode::from_wire),
             server_event: event.is_server_event.unwrap_or(false),
         })

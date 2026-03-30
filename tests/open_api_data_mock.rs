@@ -11,18 +11,24 @@ use ctrader_connector::open_api::account::{AccessRights, AccountType};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::DepthBook;
+use ctrader_connector::open_api::history::CashFlowKind;
+use ctrader_connector::open_api::margin::{MarginCall, MarginCallLevel, MarginEvent};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaArchivedSymbol, ProtoOaAsset, ProtoOaAssetListReq, ProtoOaAssetListRes,
-    ProtoOaDeal, ProtoOaDealListReq, ProtoOaDealListRes, ProtoOaDepthEvent, ProtoOaDepthQuote,
+    ProtoOaCashFlowHistoryListReq, ProtoOaCashFlowHistoryListRes, ProtoOaDeal, ProtoOaDealListReq,
+    ProtoOaDealListRes, ProtoOaDepositWithdraw, ProtoOaDepthEvent, ProtoOaDepthQuote,
     ProtoOaGetTickDataReq, ProtoOaGetTickDataRes, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
-    ProtoOaLightSymbol, ProtoOaOrder, ProtoOaOrderListReq, ProtoOaOrderListRes, ProtoOaSpotEvent,
-    ProtoOaSubscribeDepthQuotesReq, ProtoOaSubscribeDepthQuotesRes,
-    ProtoOaSubscribeLiveTrendbarReq, ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq,
-    ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq,
-    ProtoOaSymbolsListRes, ProtoOaTickData, ProtoOaTradeData, ProtoOaTrader, ProtoOaTraderReq,
-    ProtoOaTraderRes, ProtoOaTrendbar, ProtoOaUnsubscribeDepthQuotesReq,
-    ProtoOaUnsubscribeDepthQuotesRes, ProtoOaUnsubscribeLiveTrendbarReq,
-    ProtoOaUnsubscribeLiveTrendbarRes, ProtoOaUnsubscribeSpotsReq,
+    ProtoOaLightSymbol, ProtoOaMarginCall, ProtoOaMarginCallListReq, ProtoOaMarginCallListRes,
+    ProtoOaMarginCallTriggerEvent, ProtoOaMarginCallUpdateEvent, ProtoOaMarginCallUpdateReq,
+    ProtoOaMarginCallUpdateRes, ProtoOaMarginChangedEvent, ProtoOaOrder, ProtoOaOrderListReq,
+    ProtoOaOrderListRes, ProtoOaSpotEvent, ProtoOaSubscribeDepthQuotesReq,
+    ProtoOaSubscribeDepthQuotesRes, ProtoOaSubscribeLiveTrendbarReq,
+    ProtoOaSubscribeLiveTrendbarRes, ProtoOaSubscribeSpotsReq, ProtoOaSymbol, ProtoOaSymbolByIdReq,
+    ProtoOaSymbolByIdRes, ProtoOaSymbolsListReq, ProtoOaSymbolsListRes, ProtoOaTickData,
+    ProtoOaTradeData, ProtoOaTrader, ProtoOaTraderReq, ProtoOaTraderRes, ProtoOaTrendbar,
+    ProtoOaUnsubscribeDepthQuotesReq, ProtoOaUnsubscribeDepthQuotesRes,
+    ProtoOaUnsubscribeLiveTrendbarReq, ProtoOaUnsubscribeLiveTrendbarRes,
+    ProtoOaUnsubscribeSpotsReq,
 };
 use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::symbols::{SymbolsParams, TradingMode};
@@ -1810,4 +1816,316 @@ async fn history_the_server_cannot_send_whole_is_an_error_and_never_a_part() {
         Some(ErrorCode::ChCtidTraderAccountNotFound)
     );
     client.shutdown().await;
+}
+
+const CASH_FLOW_REQ: u32 = 2143;
+const CASH_FLOW_RES: u32 = 2144;
+const MARGIN_CHANGED_EVENT: u32 = 2141;
+const MARGIN_CALL_LIST_REQ: u32 = 2167;
+const MARGIN_CALL_LIST_RES: u32 = 2168;
+const MARGIN_CALL_UPDATE_REQ: u32 = 2169;
+const MARGIN_CALL_UPDATE_RES: u32 = 2170;
+const MARGIN_CALL_UPDATE_EVENT: u32 = 2171;
+const MARGIN_CALL_TRIGGER_EVENT: u32 = 2172;
+
+fn cash_flow_data(payload_type: u32, payload: &[u8]) -> Answer {
+    if payload_type != CASH_FLOW_REQ {
+        return None;
+    }
+    let request = ProtoOaCashFlowHistoryListReq::decode(payload).ok()?;
+    let account = request.ctid_trader_account_id;
+    let (from, to) = (request.from_timestamp, request.to_timestamp);
+    if from >= to || to - from > WEEK {
+        return refuse("INCORRECT_BOUNDARIES", "Incorrect period boundaries");
+    }
+    if account == 108 {
+        return refuse("CH_CTID_TRADER_ACCOUNT_NOT_FOUND", "unknown account");
+    }
+    let deposit_withdraw = (1_i64..)
+        .zip(HISTORY_TIMES)
+        .filter(|(_, at)| from <= *at && *at <= to)
+        .map(|(id, at)| ProtoOaDepositWithdraw {
+            operation_type: if account == 107 && id == 1 {
+                2
+            } else {
+                i32::from(id % 2 == 0)
+            },
+            balance_history_id: id,
+            balance: 100_000 + id,
+            delta: 1_000 * id,
+            change_balance_timestamp: at,
+            external_note: (id == 1).then(|| "opening".to_owned()),
+            balance_version: Some(id),
+            equity: None,
+            money_digits: Some(2),
+        })
+        .collect();
+    answer(
+        CASH_FLOW_RES,
+        &ProtoOaCashFlowHistoryListRes {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            deposit_withdraw,
+        },
+    )
+}
+
+#[tokio::test]
+async fn cash_flow_history_is_asked_for_week_by_week_and_returned_oldest_first() {
+    let Session { server, client } = session(cash_flow_data).await;
+    let flows = client
+        .cash_flow_history(account(101), millis(0, 3 * WEEK))
+        .await
+        .expect("cash flow");
+    assert_eq!(
+        flows.iter().map(|flow| flow.id.get()).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6, 7, 8]
+    );
+    assert_eq!(flows[0].kind, CashFlowKind::Deposit);
+    assert_eq!(flows[1].kind, CashFlowKind::Withdraw);
+    assert!(flows[0].kind.is_deposit() && !flows[1].kind.is_deposit());
+    assert_eq!(flows[1].amount.to_string(), "20.00");
+    assert_eq!(flows[1].balance.to_string(), "1000.02");
+    assert_eq!(flows[0].note.as_deref(), Some("opening"));
+    assert_eq!(flows[1].equity, None);
+    let requests = asked(
+        &server,
+        CASH_FLOW_REQ,
+        |request: &ProtoOaCashFlowHistoryListReq| (request.from_timestamp, request.to_timestamp),
+    );
+    assert_eq!(
+        requests,
+        [
+            (2 * WEEK + 2, 3 * WEEK),
+            (WEEK + 1, 2 * WEEK + 1),
+            (0, WEEK)
+        ]
+    );
+    let one = client
+        .cash_flow_history(account(101), millis(2_500, 2_500))
+        .await
+        .expect("cash flow");
+    assert_eq!(
+        one.iter().map(|flow| flow.id.get()).collect::<Vec<_>>(),
+        [5]
+    );
+    assert!(matches!(
+        client
+            .cash_flow_history(account(107), millis(0, 3 * WEEK))
+            .await,
+        Err(ConnectorError::Value(ValueError::OutOfRange { .. }))
+    ));
+    assert_eq!(
+        server_code(client.cash_flow_history(account(108), millis(0, 10)).await),
+        Some(ErrorCode::ChCtidTraderAccountNotFound)
+    );
+    client.shutdown().await;
+}
+
+fn margin_call(kind: i32, threshold: f64) -> ProtoOaMarginCall {
+    ProtoOaMarginCall {
+        margin_call_type: kind,
+        margin_level_threshold: threshold,
+        utc_last_update_timestamp: Some(1_600_000_000_000),
+    }
+}
+
+fn margin_data(payload_type: u32, payload: &[u8]) -> Answer {
+    match payload_type {
+        MARGIN_CALL_LIST_REQ => {
+            let request = ProtoOaMarginCallListReq::decode(payload).ok()?;
+            let margin_call = match request.ctid_trader_account_id {
+                104 => vec![margin_call(64, 1.0)],
+                108 => return refuse("CH_CTID_TRADER_ACCOUNT_NOT_FOUND", "unknown account"),
+                _ => vec![
+                    margin_call(61, 1.5),
+                    margin_call(62, 1.0),
+                    margin_call(63, 0.8),
+                ],
+            };
+            answer(
+                MARGIN_CALL_LIST_RES,
+                &ProtoOaMarginCallListRes {
+                    payload_type: None,
+                    margin_call,
+                },
+            )
+        }
+        MARGIN_CALL_UPDATE_REQ => {
+            let request = ProtoOaMarginCallUpdateReq::decode(payload).ok()?;
+            if request.ctid_trader_account_id == 108 {
+                return refuse("CH_CTID_TRADER_ACCOUNT_NOT_FOUND", "unknown account");
+            }
+            answer(
+                MARGIN_CALL_UPDATE_RES,
+                &ProtoOaMarginCallUpdateRes { payload_type: None },
+            )
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn margin_calls_are_listed_and_updated_as_typed_values() {
+    let Session { server, client } = session(margin_data).await;
+    let calls = client.margin_calls(account(101)).await.expect("calls");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (call.level, call.threshold.to_string()))
+            .collect::<Vec<_>>(),
+        [
+            (MarginCallLevel::First, "1.5".to_owned()),
+            (MarginCallLevel::Second, "1".to_owned()),
+            (MarginCallLevel::Third, "0.8".to_owned())
+        ]
+    );
+    assert_eq!(
+        calls[0].updated,
+        Timestamp::from_millis(1_600_000_000_000).ok()
+    );
+    assert!(matches!(
+        client.margin_calls(account(104)).await,
+        Err(ConnectorError::Value(ValueError::OutOfRange { .. }))
+    ));
+    assert_eq!(
+        server_code(client.margin_calls(account(108)).await),
+        Some(ErrorCode::ChCtidTraderAccountNotFound)
+    );
+    let call = MarginCall::new(MarginCallLevel::Second, rust_decimal::Decimal::new(125, 2));
+    client
+        .update_margin_call(account(101), call)
+        .await
+        .expect("update");
+    let request: ProtoOaMarginCallUpdateReq = last_request(&server, MARGIN_CALL_UPDATE_REQ);
+    assert_eq!(request.ctid_trader_account_id, 101);
+    assert_eq!(request.margin_call.margin_call_type, 62);
+    assert_eq!(
+        request.margin_call.margin_level_threshold.to_bits(),
+        1.25_f64.to_bits()
+    );
+    assert_eq!(request.margin_call.utc_last_update_timestamp, None);
+    let negative = MarginCall::new(MarginCallLevel::First, rust_decimal::Decimal::new(-1, 0));
+    assert!(matches!(
+        client.update_margin_call(account(101), negative).await,
+        Err(ConnectorError::Value(ValueError::Unrepresentable { .. }))
+    ));
+    assert_eq!(server.count(MARGIN_CALL_UPDATE_REQ), 1);
+    assert_eq!(
+        server_code(client.update_margin_call(account(108), call).await),
+        Some(ErrorCode::ChCtidTraderAccountNotFound)
+    );
+    client.shutdown().await;
+}
+
+fn margin_changed(account: i64, position: u64, used: u64) -> ProtoMessage {
+    envelope(
+        MARGIN_CHANGED_EVENT,
+        &ProtoOaMarginChangedEvent {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            position_id: position,
+            used_margin: used,
+            money_digits: Some(2),
+        },
+        None,
+    )
+}
+
+fn margin_call_event(payload_type: u32, account: i64, kind: i32) -> ProtoMessage {
+    if payload_type == MARGIN_CALL_UPDATE_EVENT {
+        let event = ProtoOaMarginCallUpdateEvent {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            margin_call: margin_call(kind, 1.2),
+        };
+        envelope(payload_type, &event, None)
+    } else {
+        let event = ProtoOaMarginCallTriggerEvent {
+            payload_type: None,
+            ctid_trader_account_id: account,
+            margin_call: margin_call(kind, 0.8),
+        };
+        envelope(payload_type, &event, None)
+    }
+}
+
+#[tokio::test]
+async fn margin_stream_delivers_the_events_of_its_account_and_reports_a_loss() {
+    let Session { server, client } =
+        session_with(silent, |options| options.event_capacity(EVENT_CAPACITY)).await;
+    let mut stream = client.margin_events(account(101));
+    assert_eq!(stream.account(), account(101));
+    server.push(margin_changed(202, 7, 1));
+    server.push(margin_call_event(MARGIN_CALL_UPDATE_EVENT, 202, 61));
+    server.push(margin_call_event(MARGIN_CALL_TRIGGER_EVENT, 202, 61));
+    server.push(margin_changed(101, 7, 12_345));
+    server.push(margin_call_event(MARGIN_CALL_UPDATE_EVENT, 101, 62));
+    server.push(margin_changed(101, 0, 1));
+    server.push(margin_call_event(MARGIN_CALL_TRIGGER_EVENT, 101, 9));
+    server.push(margin_call_event(MARGIN_CALL_TRIGGER_EVENT, 101, 63));
+    let changed = soon("margin change", stream.next()).await.expect("event");
+    let MarginEvent::Changed(change) = changed else {
+        panic!("expected a change of margin, got {changed:?}");
+    };
+    assert_eq!(change.account, account(101));
+    assert_eq!(change.position.get(), 7);
+    assert_eq!(change.used_margin.to_string(), "123.45");
+    let updated = soon("margin call update", stream.next())
+        .await
+        .expect("event");
+    let MarginEvent::CallUpdated(call) = updated else {
+        panic!("expected an updated margin call, got {updated:?}");
+    };
+    assert_eq!(
+        (call.level, call.threshold.to_string().as_str()),
+        (MarginCallLevel::Second, "1.2")
+    );
+    for what in ["position", "triggered call"] {
+        assert!(
+            matches!(
+                soon(what, stream.next()).await,
+                Err(ConnectorError::Value(_))
+            ),
+            "{what}"
+        );
+    }
+    let triggered = soon("margin call trigger", stream.next())
+        .await
+        .expect("event");
+    let MarginEvent::CallTriggered(call) = triggered else {
+        panic!("expected a triggered margin call, got {triggered:?}");
+    };
+    assert_eq!(
+        (call.level, call.threshold.to_string().as_str()),
+        (MarginCallLevel::Third, "0.8")
+    );
+    flooded(
+        &server,
+        &client,
+        [
+            margin_changed(101, 8, 500),
+            margin_call_event(MARGIN_CALL_TRIGGER_EVENT, 101, 61),
+        ],
+    )
+    .await;
+    assert_eq!(
+        skipped(soon("lag", stream.next()).await),
+        FLOOD - u64::try_from(EVENT_CAPACITY).expect("capacity")
+    );
+    let after = soon("change after the loss", stream.next())
+        .await
+        .expect("event");
+    assert!(matches!(after, MarginEvent::Changed(change) if change.position.get() == 8));
+    let last = soon("trigger after the loss", stream.next())
+        .await
+        .expect("event");
+    assert!(
+        matches!(last, MarginEvent::CallTriggered(call) if call.level == MarginCallLevel::First)
+    );
+    client.shutdown().await;
+    assert_eq!(
+        soon("end", stream.next()).await,
+        Err(ConnectorError::Closed)
+    );
 }
