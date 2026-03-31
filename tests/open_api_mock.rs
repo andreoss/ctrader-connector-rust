@@ -5,7 +5,9 @@ mod support;
 use std::time::Duration;
 
 use ctrader_connector::common::config::{ConfigurationOpenApi, ConfigurationOpenApiBuilder};
-use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError, TransportError};
+use ctrader_connector::common::errors::{
+    ConnectorError, ErrorCode, SessionEndCause, SessionEnded, TokenError, TransportError,
+};
 use ctrader_connector::common::ids::{AccountId, SymbolId};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{
@@ -13,7 +15,8 @@ use ctrader_connector::open_api::connection::{
     MAX_EVENT_CAPACITY, ReplayKey, ReplayStage, SERVER_HEARTBEAT_INTERVAL,
 };
 use ctrader_connector::open_api::messages::{
-    ProtoHeartbeatEvent, ProtoOaAccountAuthReq, ProtoOaApplicationAuthReq,
+    ProtoHeartbeatEvent, ProtoOaAccountAuthReq, ProtoOaAccountDisconnectEvent,
+    ProtoOaAccountsTokenInvalidatedEvent, ProtoOaApplicationAuthReq, ProtoOaClientDisconnectEvent,
     ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTrendbarsReq, ProtoOaSpotEvent,
     ProtoOaSubscribeSpotsReq, ProtoOaVersionReq,
 };
@@ -1515,4 +1518,296 @@ async fn a_maximal_backoff_and_delay_hold_work_back_without_ending_the_task() {
     timeout(Duration::from_secs(2), connection.shutdown())
         .await
         .expect("shutdown in time");
+}
+
+async fn next_session_end(events: &mut broadcast::Receiver<Event>) -> SessionEnded {
+    loop {
+        if let Event::SessionEnded(ended) = next_event(events).await {
+            return ended;
+        }
+    }
+}
+
+async fn reconnected(client: &OpenApiClient, events: &mut broadcast::Receiver<Event>) {
+    client
+        .connection()
+        .force_reconnect()
+        .await
+        .expect("reconnection");
+    while next_event(events).await != (Event::Reconnected { attempt: 1 }) {}
+}
+
+async fn both_accounts_subscribed(server: &MockServer) -> OpenApiClient {
+    let client = client(builder(server)).await;
+    client.authorise_application().await.expect("application");
+    for id in [101, 102] {
+        client
+            .authorise_account(account(id))
+            .await
+            .expect("account");
+        client
+            .subscribe_spots(account(id), &[symbol(1)])
+            .await
+            .expect("subscription");
+    }
+    client
+}
+
+async fn refreshed_elsewhere(server: &MockServer) -> TokenPair {
+    let other = client(builder(server)).await;
+    other.authorise_application().await.expect("application");
+    let pair = other.refresh_token().await.expect("refresh elsewhere");
+    other.shutdown().await;
+    pair
+}
+
+#[tokio::test]
+async fn an_invalidated_token_ends_the_sessions_it_names_until_they_are_authorised_again() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = both_accounts_subscribed(&server).await;
+    let pair = refreshed_elsewhere(&server).await;
+    let mut events = client.events();
+    let mut executions = client.executions(account(101));
+    let pushed = envelope(
+        ProtoOaAccountsTokenInvalidatedEvent::PAYLOAD_TYPE,
+        &ProtoOaAccountsTokenInvalidatedEvent {
+            payload_type: None,
+            ctid_trader_account_ids: vec![101],
+            reason: Some("token refreshed".to_owned()),
+        },
+        None,
+    );
+    server.push(pushed.clone());
+    assert_eq!(next_event(&mut events).await, Event::Message(pushed));
+    let ended = SessionEnded::new(
+        Some(account(101)),
+        SessionEndCause::TokenInvalidated {
+            reason: Some("token refreshed".to_owned()),
+        },
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::SessionEnded(ended.clone())
+    );
+    assert_eq!(
+        executions.next().await.err(),
+        Some(ConnectorError::SessionEnded(ended.clone()))
+    );
+    let sent = server.count(SUBSCRIBE_SPOTS_REQ);
+    assert_eq!(
+        client.subscribe_spots(account(101), &[symbol(2)]).await,
+        Err(ConnectorError::SessionEnded(ended.clone()))
+    );
+    assert_eq!(server.count(SUBSCRIBE_SPOTS_REQ), sent);
+    client
+        .subscribe_spots(account(102), &[symbol(2)])
+        .await
+        .expect("the session of the other account is untouched");
+    client
+        .connection()
+        .force_reconnect()
+        .await
+        .expect("reconnection");
+    let refused = SessionEnded::new(
+        Some(account(102)),
+        SessionEndCause::TokenRefused(ErrorCode::ChAccessTokenInvalid),
+    );
+    assert_eq!(next_session_end(&mut events).await, refused);
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    assert_eq!(
+        server.types_on(3),
+        vec![APPLICATION_AUTH_REQ, ACCOUNT_AUTH_REQ]
+    );
+    assert_eq!(
+        client.subscribe_spots(account(102), &[symbol(3)]).await,
+        Err(ConnectorError::SessionEnded(refused))
+    );
+    reconnected(&client, &mut events).await;
+    assert_eq!(server.types_on(4), vec![APPLICATION_AUTH_REQ]);
+    assert_eq!(
+        client.subscribe_spots(account(101), &[symbol(2)]).await,
+        Err(ConnectorError::SessionEnded(ended))
+    );
+    client.set_tokens(&pair).await;
+    for id in [101, 102] {
+        client
+            .authorise_account(account(id))
+            .await
+            .expect("authorisation with the new token");
+        client
+            .subscribe_spots(account(id), &[symbol(2)])
+            .await
+            .expect("requests are sent again");
+    }
+    reconnected(&client, &mut events).await;
+    assert_eq!(
+        server.types_on(5),
+        vec![
+            APPLICATION_AUTH_REQ,
+            ACCOUNT_AUTH_REQ,
+            ACCOUNT_AUTH_REQ,
+            SUBSCRIBE_SPOTS_REQ,
+            SUBSCRIBE_SPOTS_REQ
+        ]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dropped_account_session_fails_its_requests_until_it_is_authorised_again() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server)).await;
+    client.authorise_application().await.expect("application");
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("account");
+    client
+        .subscribe_spots(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    let mut events = client.events();
+    server.push(envelope(
+        ProtoOaAccountDisconnectEvent::PAYLOAD_TYPE,
+        &ProtoOaAccountDisconnectEvent {
+            payload_type: None,
+            ctid_trader_account_id: 101,
+        },
+        None,
+    ));
+    let ended = SessionEnded::new(Some(account(101)), SessionEndCause::AccountDisconnected);
+    assert_eq!(next_session_end(&mut events).await, ended);
+    let sent = server.count(SUBSCRIBE_SPOTS_REQ);
+    assert_eq!(
+        client.subscribe_spots(account(101), &[symbol(2)]).await,
+        Err(ConnectorError::SessionEnded(ended))
+    );
+    assert_eq!(server.count(SUBSCRIBE_SPOTS_REQ), sent);
+    assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
+    reconnected(&client, &mut events).await;
+    assert_eq!(server.types_on(2), vec![APPLICATION_AUTH_REQ]);
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("authorisation of a new session");
+    client
+        .subscribe_spots(account(101), &[symbol(2)])
+        .await
+        .expect("requests are sent again");
+    reconnected(&client, &mut events).await;
+    assert_eq!(
+        server.types_on(3),
+        vec![APPLICATION_AUTH_REQ, ACCOUNT_AUTH_REQ, SUBSCRIBE_SPOTS_REQ]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_disconnect_ends_every_session_until_the_application_is_authorised_again() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = client(builder(&server)).await;
+    client.authorise_application().await.expect("application");
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("account");
+    client
+        .subscribe_spots(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    let mut events = client.events();
+    let mut margin = client.margin_events(account(101));
+    server.push(envelope(
+        ProtoOaClientDisconnectEvent::PAYLOAD_TYPE,
+        &ProtoOaClientDisconnectEvent {
+            payload_type: None,
+            reason: Some("maintenance".to_owned()),
+        },
+        None,
+    ));
+    let cause = SessionEndCause::ClientDisconnected {
+        reason: Some("maintenance".to_owned()),
+    };
+    let ended = SessionEnded::new(None, cause.clone());
+    assert_eq!(next_session_end(&mut events).await, ended);
+    assert_eq!(
+        margin.next().await.err(),
+        Some(ConnectorError::SessionEnded(ended.clone()))
+    );
+    let sent = server.received().len();
+    assert_eq!(
+        client.version().await,
+        Err(ConnectorError::SessionEnded(ended.clone()))
+    );
+    assert_eq!(
+        client.subscribe_spots(account(101), &[symbol(2)]).await,
+        Err(ConnectorError::SessionEnded(ended.clone()))
+    );
+    assert_eq!(
+        client.authorise_account(account(101)).await,
+        Err(ConnectorError::SessionEnded(ended))
+    );
+    assert_eq!(server.received().len(), sent);
+    reconnected(&client, &mut events).await;
+    assert_eq!(server.types_on(2), Vec::<u32>::new());
+    client
+        .authorise_application()
+        .await
+        .expect("authorisation of the application anew");
+    assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
+    assert_eq!(
+        client.subscribe_spots(account(101), &[symbol(2)]).await,
+        Err(ConnectorError::SessionEnded(SessionEnded::new(
+            Some(account(101)),
+            cause
+        )))
+    );
+    client
+        .authorise_account(account(101))
+        .await
+        .expect("authorisation of the account anew");
+    client
+        .subscribe_spots(account(101), &[symbol(2)])
+        .await
+        .expect("requests are sent again");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_session_ended_while_the_connection_is_restored_is_not_replayed() {
+    let server = MockServer::start(MockOptions::default()).await;
+    let client = both_accounts_subscribed(&server).await;
+    let mut events = client.events();
+    server.precede(
+        ACCOUNT_AUTH_REQ,
+        vec![envelope(
+            ProtoOaAccountDisconnectEvent::PAYLOAD_TYPE,
+            &ProtoOaAccountDisconnectEvent {
+                payload_type: None,
+                ctid_trader_account_id: 102,
+            },
+            None,
+        )],
+    );
+    client
+        .connection()
+        .force_reconnect()
+        .await
+        .expect("reconnection");
+    assert_eq!(
+        next_session_end(&mut events).await,
+        SessionEnded::new(Some(account(102)), SessionEndCause::AccountDisconnected)
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Reconnected { attempt: 1 }
+    );
+    assert_eq!(
+        server.types_on(2),
+        vec![APPLICATION_AUTH_REQ, ACCOUNT_AUTH_REQ, SUBSCRIBE_SPOTS_REQ]
+    );
+    client.shutdown().await;
 }

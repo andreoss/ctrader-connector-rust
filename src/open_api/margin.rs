@@ -208,6 +208,7 @@ impl MarginStream {
     /// # Errors
     ///
     /// Returns [`ConnectorError::Closed`] when the connection is shut down,
+    /// [`ConnectorError::SessionEnded`] when the server ended the authorisation of the account,
     /// [`ConnectorError::Lagged`] when events were dropped because the stream was read too
     /// slowly, and [`ConnectorError::Value`] when the server sends a value out of range; the
     /// stream can be read on after the last two.
@@ -242,7 +243,7 @@ impl OpenApiClient {
     #[must_use]
     pub fn margin_events(&self, account: AccountId) -> MarginStream {
         MarginStream {
-            feed: Feed::new(self.connection()),
+            feed: Feed::new(self.connection(), account),
             account,
         }
     }

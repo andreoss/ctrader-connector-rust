@@ -282,7 +282,7 @@ impl DepthStream {
         self.client
             .unsubscribe_depth(self.account, &symbols)
             .await?;
-        self.feed = Feed::new(self.client.connection());
+        self.feed = Feed::new(self.client.connection(), self.account);
         self.client.request_depth(self.account, &symbols).await?;
         self.stale = false;
         Ok(())
@@ -294,6 +294,7 @@ impl DepthStream {
     /// # Errors
     ///
     /// Returns [`ConnectorError::Closed`] when the connection is shut down,
+    /// [`ConnectorError::SessionEnded`] when the server ended the authorisation of the account,
     /// [`ConnectorError::Lagged`] when changes were dropped because the stream was read too
     /// slowly, and [`ConnectorError::Value`] when the server sends a value out of range.
     pub async fn next(&mut self) -> Result<DepthUpdate, ConnectorError> {
@@ -365,7 +366,7 @@ impl OpenApiClient {
     ) -> Result<DepthStream, ConnectorError> {
         let stream = DepthStream {
             client: self.clone(),
-            feed: Feed::new(self.connection()),
+            feed: Feed::new(self.connection(), account),
             account,
             symbols: symbols.iter().copied().collect(),
             books: BTreeMap::new(),

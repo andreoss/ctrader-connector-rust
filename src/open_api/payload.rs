@@ -2,7 +2,8 @@
 
 use prost::Message;
 
-use crate::common::errors::{ConnectorError, TransportError};
+use crate::common::errors::{ConnectorError, SessionEndCause, SessionEnded, TransportError};
+use crate::common::ids::AccountId;
 use crate::open_api::messages::{
     ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaAccountAuthReq, ProtoOaAccountAuthRes,
     ProtoOaAccountDisconnectEvent, ProtoOaAccountsTokenInvalidatedEvent, ProtoOaAmendOrderReq,
@@ -103,6 +104,62 @@ macro_rules! requests {
     };
 }
 
+#[derive(Clone, PartialEq, Eq, Message)]
+struct AccountScope {
+    #[prost(int64, optional, tag = "2")]
+    account: Option<i64>,
+}
+
+/// Returns the account the message of the payload type acts on, read from its encoded form.
+///
+/// Every message of the Open API that belongs to an account carries the account in its second
+/// field. The requests that belong to the application as a whole name no account.
+pub(crate) fn account_of(payload_type: u32, payload: &[u8]) -> Option<AccountId> {
+    let unscoped = [
+        ProtoHeartbeatEvent::PAYLOAD_TYPE,
+        ProtoOaApplicationAuthReq::PAYLOAD_TYPE,
+        ProtoOaVersionReq::PAYLOAD_TYPE,
+        ProtoOaGetAccountListByAccessTokenReq::PAYLOAD_TYPE,
+        ProtoOaRefreshTokenReq::PAYLOAD_TYPE,
+    ];
+    if unscoped.contains(&payload_type) {
+        return None;
+    }
+    let scope = AccountScope::decode(payload).ok()?;
+    AccountId::new(scope.account?).ok()
+}
+
+/// Returns the sessions whose authorisation the pushed message ends, one for every account
+/// it names, or the session of the application.
+pub(crate) fn sessions_ended_by(message: &ProtoMessage) -> Vec<SessionEnded> {
+    if let Ok(event) = ProtoOaAccountsTokenInvalidatedEvent::from_message(message) {
+        let cause = SessionEndCause::TokenInvalidated {
+            reason: event.reason,
+        };
+        event
+            .ctid_trader_account_ids
+            .into_iter()
+            .filter_map(|id| AccountId::new(id).ok())
+            .map(|account| SessionEnded::new(Some(account), cause.clone()))
+            .collect()
+    } else if let Ok(event) = ProtoOaAccountDisconnectEvent::from_message(message) {
+        AccountId::new(event.ctid_trader_account_id)
+            .ok()
+            .map(|account| SessionEnded::new(Some(account), SessionEndCause::AccountDisconnected))
+            .into_iter()
+            .collect()
+    } else if let Ok(event) = ProtoOaClientDisconnectEvent::from_message(message) {
+        vec![SessionEnded::new(
+            None,
+            SessionEndCause::ClientDisconnected {
+                reason: event.reason,
+            },
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 payloads! {
     ProtoErrorRes => ProtoPayloadType::ErrorRes,
     ProtoHeartbeatEvent => ProtoPayloadType::HeartbeatEvent,
@@ -198,11 +255,16 @@ requests! {
 
 #[cfg(test)]
 mod tests {
-    use super::{Payload, Request, declared, is_historical};
-    use crate::common::errors::{ConnectorError, TransportError};
+    use prost::Message as _;
+
+    use super::{Payload, Request, account_of, declared, is_historical, sessions_ended_by};
+    use crate::common::errors::{ConnectorError, SessionEndCause, SessionEnded, TransportError};
+    use crate::common::ids::AccountId;
     use crate::open_api::messages::{
-        ProtoHeartbeatEvent, ProtoMessage, ProtoOaGetTrendbarsReq, ProtoOaVersionReq,
-        ProtoOaVersionRes,
+        ProtoHeartbeatEvent, ProtoMessage, ProtoOaAccountAuthReq, ProtoOaAccountDisconnectEvent,
+        ProtoOaAccountsTokenInvalidatedEvent, ProtoOaClientDisconnectEvent,
+        ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTrendbarsReq, ProtoOaTraderReq,
+        ProtoOaVersionReq, ProtoOaVersionRes,
     };
 
     #[test]
@@ -226,6 +288,103 @@ mod tests {
         assert!(is_historical(ProtoOaGetTrendbarsReq::PAYLOAD_TYPE));
         assert!(!is_historical(ProtoOaVersionReq::PAYLOAD_TYPE));
         assert!(!is_historical(0));
+    }
+
+    #[test]
+    fn account_is_read_from_scoped_messages_only() {
+        let account = AccountId::new(7).expect("account id");
+        let scoped = ProtoOaTraderReq {
+            payload_type: None,
+            ctid_trader_account_id: 7,
+        };
+        assert_eq!(
+            account_of(ProtoOaTraderReq::PAYLOAD_TYPE, &scoped.encode_to_vec()),
+            Some(account)
+        );
+        let authorisation = ProtoOaAccountAuthReq {
+            payload_type: None,
+            ctid_trader_account_id: 7,
+            access_token: "token".to_owned(),
+        };
+        assert_eq!(
+            account_of(
+                ProtoOaAccountAuthReq::PAYLOAD_TYPE,
+                &authorisation.encode_to_vec()
+            ),
+            Some(account)
+        );
+        let list = ProtoOaGetAccountListByAccessTokenReq {
+            payload_type: None,
+            access_token: "token".to_owned(),
+        };
+        assert_eq!(
+            account_of(
+                ProtoOaGetAccountListByAccessTokenReq::PAYLOAD_TYPE,
+                &list.encode_to_vec()
+            ),
+            None
+        );
+        assert_eq!(account_of(ProtoOaVersionReq::PAYLOAD_TYPE, &[]), None);
+        assert_eq!(account_of(ProtoOaTraderReq::PAYLOAD_TYPE, &[0xff]), None);
+        let nobody = ProtoOaTraderReq {
+            payload_type: None,
+            ctid_trader_account_id: 0,
+        };
+        assert_eq!(
+            account_of(ProtoOaTraderReq::PAYLOAD_TYPE, &nobody.encode_to_vec()),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_three_events_end_sessions() {
+        let account = |id| AccountId::new(id).expect("account id");
+        let invalidated = ProtoOaAccountsTokenInvalidatedEvent {
+            payload_type: None,
+            ctid_trader_account_ids: vec![7, 0, 8],
+            reason: Some("refreshed".to_owned()),
+        };
+        let cause = SessionEndCause::TokenInvalidated {
+            reason: Some("refreshed".to_owned()),
+        };
+        assert_eq!(
+            sessions_ended_by(&invalidated.to_message(None)),
+            vec![
+                SessionEnded::new(Some(account(7)), cause.clone()),
+                SessionEnded::new(Some(account(8)), cause),
+            ]
+        );
+        let dropped = ProtoOaAccountDisconnectEvent {
+            payload_type: None,
+            ctid_trader_account_id: 7,
+        };
+        assert_eq!(
+            sessions_ended_by(&dropped.to_message(None)),
+            vec![SessionEnded::new(
+                Some(account(7)),
+                SessionEndCause::AccountDisconnected
+            )]
+        );
+        let nobody = ProtoOaAccountDisconnectEvent {
+            payload_type: None,
+            ctid_trader_account_id: -1,
+        };
+        assert_eq!(sessions_ended_by(&nobody.to_message(None)), Vec::new());
+        let client = ProtoOaClientDisconnectEvent {
+            payload_type: None,
+            reason: None,
+        };
+        assert_eq!(
+            sessions_ended_by(&client.to_message(None)),
+            vec![SessionEnded::new(
+                None,
+                SessionEndCause::ClientDisconnected { reason: None }
+            )]
+        );
+        assert_eq!(
+            sessions_ended_by(&ProtoOaVersionReq::default().to_message(None)),
+            Vec::new()
+        );
     }
 
     #[test]

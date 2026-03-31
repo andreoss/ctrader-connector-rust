@@ -112,7 +112,7 @@ impl QuoteStream {
     fn new(client: &OpenApiClient, account: AccountId, symbols: &[SymbolId]) -> Self {
         Self {
             client: client.clone(),
-            feed: Feed::new(client.connection()),
+            feed: Feed::new(client.connection(), account),
             account,
             symbols: symbols.iter().copied().collect(),
             last: BTreeMap::new(),
@@ -141,6 +141,7 @@ impl QuoteStream {
     /// # Errors
     ///
     /// Returns [`ConnectorError::Closed`] when the connection is shut down,
+    /// [`ConnectorError::SessionEnded`] when the server ended the authorisation of the account,
     /// [`ConnectorError::Lagged`] when events were dropped because the stream was read too
     /// slowly, and [`ConnectorError::Value`] when the server sends a value out of range.
     pub async fn next(&mut self) -> Result<Quote, ConnectorError> {

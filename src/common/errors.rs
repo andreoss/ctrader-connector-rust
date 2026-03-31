@@ -469,6 +469,62 @@ pub enum Interruption {
     Transport(TransportError),
 }
 
+/// What ended the authorisation of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SessionEndCause {
+    /// The server announced that the access token of the account is no longer valid, as
+    /// happens once the token pair was refreshed elsewhere or the access was revoked.
+    #[error("the access token was invalidated{}", detail(.reason.as_deref()))]
+    TokenInvalidated {
+        /// Explanation given by the server, when it gave one.
+        reason: Option<String>,
+    },
+    /// The server announced that it dropped the session of the account.
+    #[error("the server dropped the session of the account")]
+    AccountDisconnected,
+    /// The server announced that it ends the session of the application.
+    #[error("the server ended the session of the application{}", detail(.reason.as_deref()))]
+    ClientDisconnected {
+        /// Explanation given by the server, when it gave one.
+        reason: Option<String>,
+    },
+    /// The server refused the access token when the account was authorised again after a
+    /// reconnection.
+    #[error("the access token was refused after a reconnection: {0}")]
+    TokenRefused(ErrorCode),
+}
+
+/// A session that is no longer authorised on its connection.
+///
+/// Requests on the session fail with this error, without being sent, from the moment the
+/// server ends the authorisation until the session is authorised again.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{} is no longer authorised: {cause}", subject(.account.as_ref()))]
+#[non_exhaustive]
+pub struct SessionEnded {
+    /// Account whose session ended; `None` when the session of the application ended, which
+    /// ends the sessions of all its accounts.
+    pub account: Option<AccountId>,
+    /// What ended the authorisation.
+    pub cause: SessionEndCause,
+}
+
+impl SessionEnded {
+    /// Describes the end of the session of `account`, or of the application for `None`.
+    #[must_use]
+    pub const fn new(account: Option<AccountId>, cause: SessionEndCause) -> Self {
+        Self { account, cause }
+    }
+}
+
+fn subject(account: Option<&AccountId>) -> String {
+    account.map_or_else(
+        || "the session of the application".to_owned(),
+        |account| format!("the session of account {account}"),
+    )
+}
+
 /// Any failure reported by this library.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -495,6 +551,9 @@ pub enum ConnectorError {
     /// allowed ran out before the server answered: the server may or may not have acted on it.
     #[error("the request was sent and its outcome is unknown: {0}")]
     OutcomeUnknown(Interruption),
+    /// The server ended the authorisation of the session the request belongs to.
+    #[error(transparent)]
+    SessionEnded(#[from] SessionEnded),
     /// The connection is shut down and accepts no further requests.
     #[error("connection is shut down")]
     Closed,
@@ -531,8 +590,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConfigError, ConnectorError, ErrorCode, Interruption, ServerError, TransportError,
-        ValueError,
+        ConfigError, ConnectorError, ErrorCode, Interruption, ServerError, SessionEndCause,
+        SessionEnded, TransportError, ValueError,
     };
     use crate::common::ids::AccountId;
     use crate::common::time::Timestamp;
@@ -617,6 +676,46 @@ mod tests {
         assert_eq!(detailed.account_id, None);
         let account = AccountId::new(7).expect("positive id");
         assert_eq!(detailed.with_account_id(account).account_id, Some(account));
+    }
+
+    #[test]
+    fn session_end_names_the_session_and_the_cause() {
+        let account = AccountId::new(7).expect("positive id");
+        let invalidated = SessionEnded::new(
+            Some(account),
+            SessionEndCause::TokenInvalidated {
+                reason: Some("refreshed".to_owned()),
+            },
+        );
+        assert_eq!(
+            invalidated.to_string(),
+            "the session of account 7 is no longer authorised: the access token was invalidated: refreshed"
+        );
+        assert_eq!(
+            ConnectorError::from(invalidated.clone()),
+            ConnectorError::SessionEnded(invalidated.clone())
+        );
+        assert_eq!(
+            ConnectorError::from(invalidated.clone()).to_string(),
+            invalidated.to_string()
+        );
+        assert_eq!(
+            SessionEnded::new(Some(account), SessionEndCause::AccountDisconnected).to_string(),
+            "the session of account 7 is no longer authorised: the server dropped the session of the account"
+        );
+        assert_eq!(
+            SessionEnded::new(None, SessionEndCause::ClientDisconnected { reason: None })
+                .to_string(),
+            "the session of the application is no longer authorised: the server ended the session of the application"
+        );
+        assert_eq!(
+            SessionEnded::new(
+                Some(account),
+                SessionEndCause::TokenRefused(ErrorCode::ChAccessTokenInvalid)
+            )
+            .to_string(),
+            "the session of account 7 is no longer authorised: the access token was refused after a reconnection: CH_ACCESS_TOKEN_INVALID"
+        );
     }
 
     #[test]

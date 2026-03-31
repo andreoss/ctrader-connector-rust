@@ -352,6 +352,7 @@ impl TrendbarStream {
     /// # Errors
     ///
     /// Returns [`ConnectorError::Closed`] when the connection is shut down,
+    /// [`ConnectorError::SessionEnded`] when the server ended the authorisation of the account,
     /// [`ConnectorError::Lagged`] when events were dropped because the stream was read too
     /// slowly, and [`ConnectorError::Value`] when the server sends a value out of range.
     pub async fn next(&mut self) -> Result<Trendbar, ConnectorError> {
@@ -472,7 +473,7 @@ impl OpenApiClient {
     ) -> Result<TrendbarStream, ConnectorError> {
         let stream = TrendbarStream {
             client: self.clone(),
-            feed: Feed::new(self.connection()),
+            feed: Feed::new(self.connection(), account),
             account,
             symbol,
             period,

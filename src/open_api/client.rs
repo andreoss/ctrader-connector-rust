@@ -14,6 +14,29 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # When the server ends an authorisation
+//!
+//! The server can end the authorisation of a session while the connection stays up. It
+//! announces that the access token of some accounts is no longer valid, which happens to every
+//! session opened with a token once the pair it belongs to was refreshed; that it dropped the
+//! session of an account; or that it ends the session of the application. Each is reported as
+//! [`Event::SessionEnded`] to the readers of [`OpenApiClient::events`] and as
+//! [`ConnectorError::SessionEnded`] by the typed streams of the account, and every later request
+//! of the session fails with [`ConnectorError::SessionEnded`], which names the account and the
+//! cause, without being sent. Nothing of the session is replayed after a reconnection.
+//!
+//! To continue on the same client, authorise the session again:
+//!
+//! - after an invalidated or refused token, hand the client a valid pair with
+//!   [`OpenApiClient::set_tokens`], or obtain one with [`OpenApiClient::refresh_token`], and
+//!   call [`OpenApiClient::authorise_account`];
+//! - after a dropped account session, call [`OpenApiClient::authorise_account`];
+//! - after the end of the application session, call
+//!   [`OpenApiClient::authorise_application`] and then
+//!   [`OpenApiClient::authorise_account`] for every account.
+//!
+//! Subscriptions of the session are not restored by this: subscribe again afterwards.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -193,6 +216,8 @@ impl OpenApiClient {
     }
 
     /// Authorises a trading account with the access token.
+    ///
+    /// This also starts a new session for an account whose authorisation the server ended.
     ///
     /// # Errors
     ///

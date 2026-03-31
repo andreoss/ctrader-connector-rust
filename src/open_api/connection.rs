@@ -35,6 +35,17 @@
 //! is sent, so a registration removed meanwhile is not replayed and one added meanwhile is.
 //! Requests made while the connection is down fail at once with the reason of the loss.
 //!
+//! End of an authorisation: the server can end the authorisation of an account, or of the
+//! application, while the connection stays up: it announces that an access token is no longer
+//! valid, that it dropped the session of an account, or that it ends the session of the
+//! application. The same holds when it refuses the access token while an account is authorised
+//! again after a reconnection. The task then reports [`Event::SessionEnded`], forgets the
+//! registered requests of the session, so that nothing is replayed with a dead token, and
+//! answers every later request of the session with [`ConnectorError::SessionEnded`] without
+//! sending it. The session is usable again once it is authorised anew on this connection: an
+//! account with a valid access token, the application with its credentials followed by its
+//! accounts.
+//!
 //! Requests that must not arrive twice: a request made with [`Connection::request_once`], an
 //! order for one, is written at most once. It is neither sent again after a limit error nor
 //! replayed, and when the connection fails or the time allowed runs out after it was written
@@ -54,11 +65,16 @@ use crate::common::config::{
     ConfigurationOpenApi, DEFAULT_BACKOFF, DEFAULT_RECONNECT_DELAY, DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
 };
-use crate::common::errors::{ConnectorError, ErrorCode, Interruption, ServerError, TransportError};
-use crate::open_api::messages::{
-    ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaErrorRes,
+use crate::common::errors::{
+    ConnectorError, ErrorCode, Interruption, ServerError, SessionEndCause, SessionEnded,
+    TransportError,
 };
-use crate::open_api::payload::{Payload, Request, is_historical};
+use crate::common::ids::AccountId;
+use crate::open_api::messages::{
+    ProtoErrorRes, ProtoHeartbeatEvent, ProtoMessage, ProtoOaAccountAuthReq, ProtoOaAccountAuthRes,
+    ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaErrorRes,
+};
+use crate::open_api::payload::{Payload, Request, account_of, is_historical, sessions_ended_by};
 use crate::open_api::transport::{Connect, Framed};
 
 /// Pause after the last write before a heartbeat is sent.
@@ -289,6 +305,9 @@ pub enum Event {
         /// Failure of the replayed request.
         error: ConnectorError,
     },
+    /// The server ended the authorisation of a session; its requests fail with
+    /// [`ConnectorError::SessionEnded`] until it is authorised again.
+    SessionEnded(SessionEnded),
 }
 
 impl Event {
@@ -407,6 +426,58 @@ impl Outbound {
     }
 }
 
+#[derive(Default)]
+struct Ended {
+    application: Option<SessionEndCause>,
+    accounts: BTreeMap<AccountId, SessionEndCause>,
+}
+
+impl Ended {
+    fn refusal(&self, payload_type: u32, payload: &[u8]) -> Option<SessionEnded> {
+        if payload_type == ProtoOaApplicationAuthReq::PAYLOAD_TYPE {
+            return None;
+        }
+        if let Some(cause) = &self.application {
+            return Some(SessionEnded::new(None, cause.clone()));
+        }
+        if payload_type == ProtoOaAccountAuthReq::PAYLOAD_TYPE {
+            return None;
+        }
+        let account = account_of(payload_type, payload)?;
+        let cause = self.accounts.get(&account)?;
+        Some(SessionEnded::new(Some(account), cause.clone()))
+    }
+
+    fn granted(&mut self, answer: &ProtoMessage) {
+        if answer.payload_type == ProtoOaApplicationAuthRes::PAYLOAD_TYPE {
+            self.application = None;
+        } else if answer.payload_type == ProtoOaAccountAuthRes::PAYLOAD_TYPE {
+            let payload = answer.payload.as_deref().unwrap_or_default();
+            if let Some(account) = account_of(answer.payload_type, payload) {
+                self.accounts.remove(&account);
+            }
+        }
+    }
+}
+
+fn token_refused(key: &ReplayKey, stored: &Stored, error: &ConnectorError) -> Option<SessionEnded> {
+    let ConnectorError::Server(error) = error else {
+        return None;
+    };
+    let dead = matches!(
+        error.code,
+        ErrorCode::ChAccessTokenInvalid | ErrorCode::OaAuthTokenExpired
+    );
+    if !dead || key.stage() != ReplayStage::Account {
+        return None;
+    }
+    let account = account_of(stored.payload_type, &stored.payload)?;
+    Some(SessionEnded::new(
+        Some(account),
+        SessionEndCause::TokenRefused(error.code.clone()),
+    ))
+}
+
 enum Command {
     Request(Outbound),
     Replay(ReplayKey, Option<Stored>),
@@ -458,6 +529,7 @@ impl Connection {
             pending: HashMap::new(),
             deadlines: VecDeque::new(),
             replays: Replays::new(),
+            ended: Ended::default(),
             throttles: [Throttle::default(), Throttle::default()],
             paused_until: None,
             send_at: None,
@@ -672,6 +744,7 @@ struct Actor<C: Connect> {
     pending: HashMap<String, Outbound>,
     deadlines: VecDeque<(Instant, String)>,
     replays: Replays,
+    ended: Ended,
     throttles: [Throttle; 2],
     paused_until: Option<Instant>,
     send_at: Option<Instant>,
@@ -771,9 +844,32 @@ impl<C: Connect> Actor<C> {
             };
             sent.insert(key.clone(), stored.clone());
             let id = self.fresh_id();
-            let step = Box::pin(replay(&mut framed, id, key, stored, limit, &self.events));
-            if let Err(reason) = hold(&mut self.commands, &mut self.replays, reason, step).await? {
-                return Ok(Err(reason));
+            let mut pushed = Vec::new();
+            let step = Box::pin(replay(
+                &mut framed,
+                id,
+                stored.clone(),
+                limit,
+                &self.events,
+                &mut pushed,
+            ));
+            let answer = match hold(&mut self.commands, &mut self.replays, reason, step).await? {
+                Ok(answer) => answer,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            for session in pushed {
+                self.end(session);
+            }
+            match answer {
+                Ok(answer) => self.ended.granted(&answer),
+                Err(error) => {
+                    log_debug!(%error, "replayed request failed");
+                    let refused = token_refused(&key, &stored, &error);
+                    let _ = self.events.send(Event::ReplayFailed { key, error });
+                    if let Some(session) = refused {
+                        self.end(session);
+                    }
+                }
             }
             hold(
                 &mut self.commands,
@@ -810,6 +906,25 @@ impl<C: Connect> Actor<C> {
                 }
             }
         }
+    }
+
+    fn end(&mut self, session: SessionEnded) {
+        log_debug!(%session, "authorisation ended");
+        if let Some(account) = session.account {
+            self.replays.retain(|_, stored| {
+                account_of(stored.payload_type, &stored.payload) != Some(account)
+            });
+            self.ended.accounts.insert(account, session.cause.clone());
+        } else {
+            for stored in self.replays.values() {
+                if let Some(account) = account_of(stored.payload_type, &stored.payload) {
+                    self.ended.accounts.insert(account, session.cause.clone());
+                }
+            }
+            self.replays.clear();
+            self.ended.application = Some(session.cause.clone());
+        }
+        let _ = self.events.send(Event::SessionEnded(session));
     }
 
     fn fresh_id(&mut self) -> String {
@@ -872,6 +987,10 @@ impl<C: Connect> Actor<C> {
                 return Ok(());
             };
             if outbound.reply.is_closed() {
+                continue;
+            }
+            if let Some(ended) = self.ended.refusal(outbound.payload_type, &outbound.payload) {
+                let _ = outbound.reply.send(Err(ended.into()));
                 continue;
             }
             let id = self.fresh_id();
@@ -942,9 +1061,14 @@ impl<C: Connect> Actor<C> {
             .as_ref()
             .and_then(|id| self.pending.remove(id));
         let Some(mut outbound) = waiting else {
+            let sessions = sessions_ended_by(&message);
             let _ = self.events.send(Event::Message(message));
+            for session in sessions {
+                self.end(session);
+            }
             return;
         };
+        self.ended.granted(&message);
         if outbound.once {
             let _ = self.events.send(Event::Message(message.clone()));
         }
@@ -1099,32 +1223,30 @@ async fn hold<F: Future>(
 async fn replay<S: AsyncRead + AsyncWrite + Unpin>(
     framed: &mut Framed<S>,
     id: String,
-    key: ReplayKey,
     stored: Stored,
     limit: Duration,
     events: &broadcast::Sender<Event>,
-) -> Result<(), TransportError> {
+    pushed: &mut Vec<SessionEnded>,
+) -> Result<Result<ProtoMessage, ConnectorError>, TransportError> {
     let message = ProtoMessage {
         payload_type: stored.payload_type,
         payload: Some(stored.payload),
         client_msg_id: Some(id.clone()),
     };
     write(framed, &message, limit).await?;
-    let failure = match timeout(limit, answer_to(framed, &id, events)).await {
-        Ok(answer) => outcome(answer?).err(),
-        Err(_) => Some(ConnectorError::Timeout(limit)),
-    };
-    if let Some(error) = failure {
-        log_debug!(%error, "replayed request failed");
-        let _ = events.send(Event::ReplayFailed { key, error });
-    }
-    Ok(())
+    Ok(
+        match timeout(limit, answer_to(framed, &id, events, pushed)).await {
+            Ok(answer) => outcome(answer?),
+            Err(_) => Err(ConnectorError::Timeout(limit)),
+        },
+    )
 }
 
 async fn answer_to<S: AsyncRead + AsyncWrite + Unpin>(
     framed: &mut Framed<S>,
     id: &str,
     events: &broadcast::Sender<Event>,
+    pushed: &mut Vec<SessionEnded>,
 ) -> Result<ProtoMessage, TransportError> {
     loop {
         let message = framed.receive().await?;
@@ -1132,6 +1254,7 @@ async fn answer_to<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(message);
         }
         if message.payload_type != ProtoHeartbeatEvent::PAYLOAD_TYPE {
+            pushed.extend(sessions_ended_by(&message));
             let _ = events.send(Event::Message(message));
         }
     }
