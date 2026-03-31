@@ -16,14 +16,14 @@ use ctrader_connector::common::config::{
 };
 use ctrader_connector::common::decimals::{Price, Volume};
 use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
-use ctrader_connector::common::ids::{OrderId, PositionId, SymbolId};
+use ctrader_connector::common::ids::{AccountId, OrderId, PositionId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::account::AccessRights;
 use ctrader_connector::open_api::client::{Account, OpenApiClient};
 use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Event};
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::executions::{ExecutionStream, TradeEvent};
-use ctrader_connector::open_api::margin::{MarginChange, MarginEvent, MarginStream};
+use ctrader_connector::open_api::history::{CashFlow, CashFlowKind};
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
     ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq,
@@ -988,12 +988,17 @@ async fn live_tick_requests_end_before_the_millisecond_named_as_their_end() {
             "one millisecond fills half an answer"
         );
         let held = page.iter().filter(|at| **at == probe).count();
-        let (short, _) = raw_ticks(&client, &account, symbol, (probe - MINUTE, probe)).await;
+        let oldest = page[page.len() - 1];
+        let (short, _) = raw_ticks(&client, &account, symbol, (oldest, probe)).await;
+        assert!(
+            !short.is_empty(),
+            "no tick between the oldest of an answer and its middle"
+        );
         assert!(
             short.iter().all(|at| *at < probe),
             "a request includes the millisecond named as its end"
         );
-        let (ending, _) = raw_ticks(&client, &account, symbol, (probe - MINUTE, probe + 1)).await;
+        let (ending, _) = raw_ticks(&client, &account, symbol, (oldest, probe + 1)).await;
         assert_eq!(ending[..held], vec![probe; held]);
         assert_eq!(ending[held..], short);
         let (single, _) = raw_ticks(&client, &account, symbol, (probe, probe + 1)).await;
@@ -2181,100 +2186,84 @@ async fn live_history_holds_the_deals_and_orders_of_the_run() {
     .await;
 }
 
-async fn margin_of(stream: &mut MarginStream, position: PositionId) -> Option<MarginChange> {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match stream.next().await.expect("margin event") {
-                MarginEvent::Changed(change) if change.position == position => break change,
-                _ => {}
-            }
+const CASH_FLOW_WINDOW: Duration = Duration::from_secs(28 * 86_400);
+
+const CASH_FLOW_WINDOWS: u32 = 13;
+
+async fn latest_cash_flow(
+    client: &OpenApiClient,
+    account: AccountId,
+) -> (TimeRange, Vec<CashFlow>) {
+    let mut end = Timestamp::now();
+    for _ in 0..CASH_FLOW_WINDOWS {
+        let window = TimeRange::ending_at(end, CASH_FLOW_WINDOW);
+        let flows = client
+            .cash_flow_history(account, window)
+            .await
+            .expect("cash flow");
+        if !flows.is_empty() {
+            return (window, flows);
         }
-    })
-    .await
-    .ok()
+        end = window
+            .from()
+            .checked_sub(Duration::from_millis(1))
+            .expect("earlier window");
+    }
+    panic!(
+        "the demo account shows no deposit or withdrawal in {CASH_FLOW_WINDOWS} windows of four weeks"
+    );
 }
 
 #[tokio::test]
-async fn live_margin_changes_with_the_position_and_cash_flow_is_read() {
-    trading("ct28", |desk| async move {
-        let account = desk.account.id;
-        let part = desk.smallest();
-        let whole = Volume::new(part.value() + part.value()).expect("volume");
-        let mut margin = desk.client.margin_events(account);
-        let mut events = desk.client.events();
-        let market =
-            NewOrder::market(account, desk.symbol.id, TradeSide::Buy, whole).label(desk.label());
-        let accepted = desk
-            .client
-            .place_order(&market, &desk.symbol)
-            .await
-            .expect("market order")
-            .order
-            .expect("accepted order");
-        let opened = opened_by(&mut events, accepted.id).await;
-        let on_open = margin_of(&mut margin, opened.id).await;
-        assert!(on_open.is_none_or(|change| change.used_margin > Decimal::ZERO));
-        let closing = desk
-            .client
-            .close_position(account, &opened, part, &desk.symbol)
-            .await
-            .expect("partial close")
-            .order
-            .expect("closing order");
-        closed_by(&mut events, closing.id).await;
-        let on_part = margin_of(&mut margin, opened.id).await;
-        println!(
-            "live margin: change event on open {:?}, on partial close {:?}",
-            on_open.map(|change| change.used_margin.to_string()),
-            on_part.map(|change| change.used_margin.to_string()),
-        );
-        assert!(on_part.is_none_or(|change| change.used_margin > Decimal::ZERO));
-        let rest = desk.position(opened.id).await;
-        let closing = desk
-            .client
-            .close_position(account, &rest, rest.volume, &desk.symbol)
-            .await
-            .expect("close")
-            .order
-            .expect("closing order");
-        closed_by(&mut events, closing.id).await;
-        let calls = desk
-            .client
-            .margin_calls(account)
-            .await
-            .expect("margin calls");
-        println!(
-            "live margin calls: {:?}",
+async fn live_margin_calls_and_cash_flow_are_read() {
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let calls = client.margin_calls(account.id).await.expect("margin calls");
+    println!(
+        "live margin calls: {:?}",
+        calls
+            .iter()
+            .map(|call| (call.level, call.threshold.to_string()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !calls.is_empty(),
+        "the demo account states no margin call threshold"
+    );
+    for call in &calls {
+        assert!(call.threshold > Decimal::ZERO, "threshold of {call:?}");
+        assert_eq!(
             calls
                 .iter()
-                .map(|call| (call.level, call.threshold.to_string()))
-                .collect::<Vec<_>>()
+                .filter(|other| other.level == call.level)
+                .count(),
+            1,
+            "level stated twice: {:?}",
+            call.level
         );
-        assert!(calls.iter().all(|call| call.threshold > Decimal::ZERO));
-        assert!(calls.windows(2).all(|pair| pair[0].level != pair[1].level));
-        let month = TimeRange::ending_at(Timestamp::now(), Duration::from_secs(28 * 86_400));
-        let flows = desk
-            .client
-            .cash_flow_history(account, month)
-            .await
-            .expect("cash flow");
-        println!(
-            "live cash flow: {} changes in four weeks: {:?}",
-            flows.len(),
-            flows
-                .iter()
-                .map(|flow| (flow.kind, flow.amount.to_string(), flow.at.as_millis()))
-                .collect::<Vec<_>>()
-        );
+    }
+    let (window, flows) = latest_cash_flow(&client, account.id).await;
+    println!(
+        "live cash flow: {} changes in the four weeks up to {}: {:?}",
+        flows.len(),
+        window.to(),
+        flows
+            .iter()
+            .map(|flow| (flow.kind, flow.amount.to_string(), flow.at.as_millis()))
+            .collect::<Vec<_>>()
+    );
+    assert!(!flows.is_empty(), "no cash flow was read");
+    for flow in &flows {
         assert!(
-            flows
-                .iter()
-                .all(|flow| month.from() <= flow.at && flow.at <= month.to())
+            window.from() <= flow.at && flow.at <= window.to(),
+            "cash flow outside the window"
         );
-        assert!(flows.windows(2).all(|pair| pair[0].at <= pair[1].at));
-        assert!(flows.iter().all(|flow| flow.amount > Decimal::ZERO));
-        let (positions, orders) = desk.own().await;
-        assert!(positions.is_empty() && orders.is_empty());
-    })
-    .await;
+        assert!(flow.amount > Decimal::ZERO, "amount of a cash flow");
+    }
+    assert!(flows.windows(2).all(|pair| pair[0].at <= pair[1].at));
+    assert!(
+        flows.iter().any(|flow| flow.kind == CashFlowKind::Deposit),
+        "the demo account was funded by a deposit"
+    );
+    client.shutdown().await;
 }
