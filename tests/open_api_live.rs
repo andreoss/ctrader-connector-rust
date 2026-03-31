@@ -1210,43 +1210,129 @@ impl Desk {
             .collect();
         (positions, orders)
     }
+}
 
-    async fn sweep(&self) -> Result<(), String> {
-        let mut left = String::new();
-        for _ in 0..SWEEP_ROUNDS {
-            let (positions, orders) = self.own().await;
-            if positions.is_empty() && orders.is_empty() {
-                return Ok(());
-            }
-            left = format!(
-                "{} positions and {} orders labelled {}",
-                positions.len(),
-                orders.len(),
-                self.label
+async fn sweeper() -> Result<(OpenApiClient, AccountId), ConnectorError> {
+    let client = OpenApiClient::connect(configuration()).await?;
+    client.authorise_application().await?;
+    let demo = client
+        .accounts()
+        .await?
+        .into_iter()
+        .find(|account| !account.is_live);
+    let Some(account) = demo else {
+        client.shutdown().await;
+        return Err(ConnectorError::Closed);
+    };
+    match client.authorise_account(account.id).await {
+        Ok(()) => Ok((client, account.id)),
+        Err(error) => {
+            client.shutdown().await;
+            Err(error)
+        }
+    }
+}
+
+async fn sweep_once(
+    client: &OpenApiClient,
+    account: AccountId,
+    label: &str,
+) -> Result<usize, ConnectorError> {
+    let reconciled = client.reconcile(account).await?;
+    let own = Some(label);
+    let orders: Vec<&Order> = reconciled
+        .orders
+        .iter()
+        .filter(|order| order.label.as_deref() == own)
+        .collect();
+    let positions: Vec<&Position> = reconciled
+        .positions
+        .iter()
+        .filter(|position| position.label.as_deref() == own)
+        .collect();
+    for order in orders.iter().filter(|order| !order.closing) {
+        let outcome = client.cancel_order(account, order.id).await;
+        println!(
+            "live sweep: cancel order {} answered {:?}",
+            order.id,
+            outcome.map(|execution| execution.kind)
+        );
+    }
+    for position in &positions {
+        let symbol = client
+            .symbol_details(account, &[position.symbol])
+            .await?
+            .pop();
+        let Some(symbol) = symbol else {
+            println!(
+                "live sweep: no details of symbol {} to close position {}",
+                position.symbol, position.id
             );
-            for order in orders.iter().filter(|order| !order.closing) {
-                let outcome = self.client.cancel_order(self.account.id, order.id).await;
-                println!(
-                    "live sweep: cancel order {} answered {:?}",
-                    order.id,
-                    outcome.map(|execution| execution.kind)
-                );
-            }
-            for position in &positions {
-                let outcome = self
-                    .client
-                    .close_position(self.account.id, position, position.volume, &self.symbol)
-                    .await;
-                println!(
-                    "live sweep: close position {} answered {:?}",
-                    position.id,
-                    outcome.map(|execution| execution.kind)
-                );
-            }
+            continue;
+        };
+        let outcome = client
+            .close_position(account, position, position.volume, &symbol)
+            .await;
+        println!(
+            "live sweep: close position {} answered {:?}",
+            position.id,
+            outcome.map(|execution| execution.kind)
+        );
+    }
+    Ok(orders.len() + positions.len())
+}
+
+async fn sweep(label: &str) -> Result<(), String> {
+    let mut last = "the sweep did not run".to_owned();
+    let mut link: Option<(OpenApiClient, AccountId)> = None;
+    for round in 0..SWEEP_ROUNDS {
+        if round > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        Err(left)
+        let (client, account) = match link.take() {
+            Some(open) => open,
+            None => match sweeper().await {
+                Ok(open) => open,
+                Err(error) => {
+                    last = format!("no fresh connection for the sweep: {error}");
+                    continue;
+                }
+            },
+        };
+        match sweep_once(&client, account, label).await {
+            Ok(0) => {
+                client.shutdown().await;
+                return Ok(());
+            }
+            Ok(left) => {
+                last = format!("{left} orders or positions labelled {label} were still listed");
+                link = Some((client, account));
+            }
+            Err(error) => {
+                last = format!("the sweep of label {label} failed: {error}");
+                client.shutdown().await;
+            }
+        }
     }
+    if let Some((client, _)) = link {
+        client.shutdown().await;
+    }
+    Err(last)
+}
+
+fn panic_text(failure: tokio::task::JoinError) -> String {
+    let Ok(payload) = failure.try_into_panic() else {
+        return "the test was cancelled".to_owned();
+    };
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "the test panicked".to_owned())
 }
 
 async fn trading<B, F>(item: &str, body: B)
@@ -1279,12 +1365,16 @@ where
         label: format!("{item}-{}", Timestamp::now().as_millis()),
     };
     let outcome = tokio::spawn(body(desk.clone())).await;
-    let swept = desk.sweep().await;
     desk.client.shutdown().await;
-    if let Err(failure) = outcome {
-        std::panic::resume_unwind(failure.into_panic());
+    let swept = sweep(&desk.label).await;
+    match (outcome, swept) {
+        (Ok(()), swept) => assert_eq!(swept, Ok(()), "the test left orders or positions behind"),
+        (Err(failure), Ok(())) => panic!("{}", panic_text(failure)),
+        (Err(failure), Err(left)) => panic!(
+            "{}; and the sweep after the failure did not leave the account clean: {left}",
+            panic_text(failure)
+        ),
     }
-    assert_eq!(swept, Ok(()), "the test left orders or positions behind");
 }
 
 async fn next_execution(events: &mut broadcast::Receiver<Event>, order: OrderId) -> Execution {
@@ -2265,5 +2355,50 @@ async fn live_margin_calls_and_cash_flow_are_read() {
         flows.iter().any(|flow| flow.kind == CashFlowKind::Deposit),
         "the demo account was funded by a deposit"
     );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_sweep_cancels_what_a_failed_test_left_over_a_fresh_connection() {
+    const FAILURE: &str = "deliberate failure after the connection of the test was shut down";
+    let failed = tokio::spawn(trading("ct53", |desk| async move {
+        let (bid, _) = desk.market().await;
+        let order = NewOrder::limit(
+            desk.account.id,
+            desk.symbol.id,
+            TradeSide::Buy,
+            desk.smallest(),
+            desk.scaled(bid, 50),
+        )
+        .label(desk.label());
+        desk.client
+            .place_order(&order, &desk.symbol)
+            .await
+            .expect("limit order");
+        let (_, orders) = desk.own().await;
+        assert_eq!(orders.len(), 1);
+        desk.client.shutdown().await;
+        panic!("{FAILURE}");
+    }))
+    .await
+    .expect_err("the failure of the test is not masked");
+    assert_eq!(panic_text(failed), FAILURE);
+    let _guard = LIVE.lock().await;
+    let (client, account) = authorised().await;
+    let reconciled = client.reconcile(account.id).await.expect("reconcile");
+    let left = reconciled
+        .orders
+        .iter()
+        .filter_map(|order| order.label.as_deref())
+        .chain(
+            reconciled
+                .positions
+                .iter()
+                .filter_map(|position| position.label.as_deref()),
+        )
+        .filter(|label| label.starts_with("ct53-"))
+        .count();
+    println!("live sweep after a failed test: {left} orders or positions of the run are listed");
+    assert_eq!(left, 0);
     client.shutdown().await;
 }
