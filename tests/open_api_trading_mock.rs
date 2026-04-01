@@ -26,6 +26,7 @@ use ctrader_connector::open_api::trading::{
 };
 use ctrader_connector::open_api::transport::Plain;
 use prost::Message as _;
+use rust_decimal::Decimal;
 use support::{
     ACCESS_TOKEN, Answer, CLIENT_ID, CLIENT_SECRET, HOST, MockOptions, MockServer, REFRESH_TOKEN,
     Responder, answer, envelope, refuse,
@@ -859,11 +860,23 @@ async fn stop_limit_order_carries_its_stop_price_and_slippage_and_no_limit_price
     assert_eq!(placed.slippage_points, Some(25));
     assert_eq!(placed.time_in_force, TimeInForce::GoodTillCancel);
     assert_eq!(
-        value_error(client.place_order(&stop_limit(u32::MAX), &symbol).await),
-        Some(ValueError::OutOfRange {
-            kind: "slippage in points"
+        value_error(client.place_order(&stop_limit(0), &symbol).await),
+        Some(ValueError::BelowMinimum {
+            kind: "slippage in points",
+            value: Decimal::ZERO,
+            minimum: Decimal::ONE,
         })
     );
+    for absurd in [7_000_051, u32::MAX] {
+        assert_eq!(
+            value_error(client.place_order(&stop_limit(absurd), &symbol).await),
+            Some(ValueError::AboveMaximum {
+                kind: "slippage in points",
+                value: Decimal::from(absurd),
+                maximum: Decimal::from(7_000_050),
+            })
+        );
+    }
     let sent = sent_orders(&server);
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].order_type, 6);
@@ -1155,10 +1168,22 @@ async fn amendment_that_does_not_fit_is_refused_before_anything_is_sent() {
         refused(limit.clone().stop_loss(Some(price("0.001")))).await,
         Some(ValueError::TooFine { .. })
     ));
+    let slipping =
+        |points: u32| OrderAmendment::of(account(101), &pending(902, 6, 7)).slippage(points);
     assert!(matches!(
-        refused(OrderAmendment::of(account(101), &pending(902, 6, 7)).slippage(u32::MAX)).await,
-        Some(ValueError::OutOfRange { .. })
+        refused(slipping(0)).await,
+        Some(ValueError::BelowMinimum { .. })
     ));
+    for absurd in [6_000_051, u32::MAX] {
+        assert_eq!(
+            refused(slipping(absurd)).await,
+            Some(ValueError::AboveMaximum {
+                kind: "slippage in points",
+                value: Decimal::from(absurd),
+                maximum: Decimal::from(6_000_050),
+            })
+        );
+    }
     let position = PositionAmendment::of(account(101), &open(500, 7));
     assert!(matches!(
         value_error(

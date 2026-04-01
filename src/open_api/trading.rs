@@ -863,6 +863,31 @@ fn checked_digits(price: Price, kind: &'static str, symbol: &Symbol) -> Result<P
     Ok(price)
 }
 
+fn checked_slippage(points: u32, stop: Option<Price>, symbol: &Symbol) -> Result<i32, ValueError> {
+    let value = Decimal::from(points);
+    if points == 0 {
+        return Err(ValueError::BelowMinimum {
+            kind: SLIPPAGE,
+            value,
+            minimum: Decimal::ONE,
+        });
+    }
+    let point = Decimal::new(1, symbol.digits.min(PRICE_SCALE));
+    let furthest = stop
+        .and_then(|stop| stop.value().checked_div(point))
+        .map_or(Decimal::from(i32::MAX), |furthest| {
+            furthest.floor().min(Decimal::from(i32::MAX))
+        });
+    if value > furthest {
+        return Err(ValueError::AboveMaximum {
+            kind: SLIPPAGE,
+            value,
+            maximum: furthest,
+        });
+    }
+    i32::try_from(points).map_err(|_| ValueError::OutOfRange { kind: SLIPPAGE })
+}
+
 fn checked_distance(distance: Price, symbol: &Symbol) -> Result<i64, ValueError> {
     let distance = checked_digits(distance, DISTANCE, symbol)?;
     if distance.value().is_zero() {
@@ -1006,7 +1031,11 @@ impl NewOrder {
     /// price no further from it than the slippage, in points of the symbol.
     ///
     /// The server models the limit of a stop-limit order as that distance and takes no limit
-    /// price for it.
+    /// price for it. The server itself accepts any slippage up to the largest value of the
+    /// wire integer, so the bound is checked before the order is sent: the slippage is at
+    /// least one point and, taken as a distance in price, no larger than the stop price,
+    /// beyond which the limit of a sell order would not be a positive price. A slippage
+    /// outside that range yields [`ValueError::BelowMinimum`] or [`ValueError::AboveMaximum`].
     pub const fn stop_limit(
         account: AccountId,
         symbol: SymbolId,
@@ -1135,10 +1164,7 @@ impl NewOrder {
                 ProtoOaOrderType::StopLimit,
                 None,
                 Some(checked_price(stop, PRICE, symbol)?),
-                Some(
-                    i32::try_from(slippage)
-                        .map_err(|_| ValueError::OutOfRange { kind: SLIPPAGE })?,
-                ),
+                Some(checked_slippage(slippage, Some(stop), symbol)?),
             ),
         };
         let time_in_force = match (market, self.expiry) {
@@ -1263,6 +1289,9 @@ impl OrderAmendment {
     }
 
     /// Changes the slippage of a stop-limit order, in points of the symbol.
+    ///
+    /// The slippage is bound as that of [`NewOrder::stop_limit`], against the stop price the
+    /// amendment holds, before the amendment is sent.
     pub const fn slippage(mut self, points: u32) -> Self {
         self.slippage = Some(points);
         self
@@ -1305,9 +1334,7 @@ impl OrderAmendment {
             stop_loss: at(self.stop_loss)?,
             take_profit: at(self.take_profit)?,
             slippage_in_points: slippage
-                .map(|points| {
-                    i32::try_from(points).map_err(|_| ValueError::OutOfRange { kind: SLIPPAGE })
-                })
+                .map(|points| checked_slippage(points, self.price, symbol))
                 .transpose()?,
             relative_stop_loss: away(self.stop_loss)?,
             relative_take_profit: away(self.take_profit)?,
