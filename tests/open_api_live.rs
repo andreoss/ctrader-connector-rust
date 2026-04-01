@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ctrader_connector::common::config::{
@@ -46,6 +47,45 @@ use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 static LIVE: Mutex<()> = Mutex::const_new(());
+
+static ACCOUNTS: OnceLock<Vec<String>> = OnceLock::new();
+
+const VEIL: &str = "<account>";
+
+fn veiled(text: &str) -> String {
+    ACCOUNTS
+        .get()
+        .into_iter()
+        .flatten()
+        .fold(text.to_owned(), |text, known| text.replace(known, VEIL))
+}
+
+fn veil(accounts: &[Account]) {
+    let known = accounts
+        .iter()
+        .flat_map(|account| {
+            [
+                Some(account.id.to_string()),
+                account.login.map(|login| login.to_string()),
+            ]
+        })
+        .flatten()
+        .collect();
+    if ACCOUNTS.set(known).is_ok() {
+        std::panic::set_hook(Box::new(|panic| {
+            let payload = panic.payload();
+            let text = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a value that is no text".to_owned());
+            let place = panic.location().map_or_else(String::new, |place| {
+                format!(" at {}:{}", place.file(), place.line())
+            });
+            eprintln!("panicked{place}: {}", veiled(&text));
+        }));
+    }
+}
 
 const STEP: Duration = Duration::from_secs(20);
 
@@ -244,6 +284,7 @@ fn code(outcome: Result<(), ConnectorError>) -> Option<ErrorCode> {
 
 async fn demo_account(client: &OpenApiClient) -> Account {
     let accounts = client.accounts().await.expect("account list");
+    veil(&accounts);
     let demo: Vec<&Account> = accounts.iter().filter(|a| !a.is_live).collect();
     println!(
         "live accounts: {} in total, {} demo",
@@ -270,10 +311,16 @@ async fn live_application_and_demo_account_are_authorised() {
         .authorise_account(account.id)
         .await
         .expect("account authorisation");
-    println!(
-        "live authorisation: application and account {} authorised",
-        account.id
+    let named = format!("account {} of login {:?}", account.id, account.login);
+    let hidden = veiled(&named);
+    assert!(!hidden.contains(&account.id.to_string()));
+    assert!(
+        account
+            .login
+            .is_none_or(|login| !hidden.contains(&login.to_string()))
     );
+    assert!(hidden.contains(VEIL));
+    println!("live authorisation: application and {hidden} authorised");
     client.shutdown().await;
 }
 
@@ -354,13 +401,13 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
     let account = demo_account(&fresh).await;
     let authorised = fresh.authorise_account(account.id).await;
     println!(
-        "live refresh: token type {} expires in {} s, rotated {rotated}, persisted {persisted}, account {} with the new token: {}",
+        "live refresh: token type {} expires in {} s, rotated {rotated}, persisted {persisted}, account with the new token: {}",
         pair.token_type,
         pair.expires_in.as_secs(),
-        account.id,
-        authorised
-            .as_ref()
-            .map_or_else(ToString::to_string, |()| "authorised".to_owned())
+        authorised.as_ref().map_or_else(
+            |error| veiled(&error.to_string()),
+            |()| "authorised".to_owned()
+        )
     );
     assert!(persisted, "the stored pair differs from the pair received");
     assert!(
@@ -456,7 +503,9 @@ async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
             match events.recv().await.expect("event") {
                 Event::Disconnected(_) => disconnected = true,
                 Event::ReconnectFailed { reason, .. } => failures.push(reason.to_string()),
-                Event::ReplayFailed { key, error } => failures.push(format!("{key:?}: {error}")),
+                Event::ReplayFailed { key, error } => {
+                    failures.push(veiled(&format!("{key:?}: {error}")));
+                }
                 Event::Reconnected { attempt } => break attempt,
                 _ => {}
             }
@@ -579,8 +628,7 @@ async fn live_accounts_assets_symbols_and_details_parse_into_typed_values() {
             .map(|asset| asset.name.clone())
     };
     println!(
-        "live reference data: account {}, {} assets, {} symbols ({} enabled, {} archived), EURUSD id {} base {:?} quote {:?}",
-        account.id,
+        "live reference data: {} assets, {} symbols ({} enabled, {} archived), EURUSD id {} base {:?} quote {:?}",
         assets.len(),
         list.symbols.len(),
         list.symbols.iter().filter(|symbol| symbol.enabled).count(),
