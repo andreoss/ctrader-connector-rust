@@ -525,6 +525,53 @@ fn subject(account: Option<&AccountId>) -> String {
     )
 }
 
+/// Reasons a FIX message is rejected by this library.
+///
+/// No variant holds the value of a field, so no credential of a logon can reach a log through
+/// an error.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum FixError {
+    /// The bytes are not a FIX message.
+    #[error("the bytes are not a FIX message: {0}")]
+    Garbled(&'static str),
+    /// The checksum of a message does not match its bytes.
+    #[error("checksum is {found}, the bytes sum to {computed}")]
+    Checksum {
+        /// Checksum computed over the bytes received.
+        computed: u8,
+        /// Checksum the message carries.
+        found: u8,
+    },
+    /// The body of a message is longer than the limit.
+    #[error("body of {length} bytes exceeds the limit of {limit} bytes")]
+    TooLong {
+        /// Length of the body in bytes.
+        length: usize,
+        /// Largest length accepted.
+        limit: usize,
+    },
+    /// A required field is absent.
+    #[error("message {msg_type} lacks the required tag {tag}")]
+    MissingField {
+        /// Type of the message.
+        msg_type: String,
+        /// Tag that is absent.
+        tag: u32,
+    },
+    /// A field holds a value of the wrong form.
+    #[error("message {msg_type} holds an invalid value under tag {tag}")]
+    InvalidField {
+        /// Type of the message.
+        msg_type: String,
+        /// Tag whose value is invalid.
+        tag: u32,
+    },
+    /// The type of the message is not known to this library.
+    #[error("message type {0} is not supported")]
+    UnsupportedMessage(String),
+}
+
 /// Any failure reported by this library.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -544,6 +591,9 @@ pub enum ConnectorError {
     /// A token refresh failed.
     #[error(transparent)]
     Token(#[from] TokenError),
+    /// A FIX message was rejected, by this library or by the server.
+    #[error("FIX message rejected: {0}")]
+    Fix(#[from] FixError),
     /// The server did not answer a request in time.
     #[error("no response within {0:?}")]
     Timeout(Duration),
@@ -590,8 +640,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConfigError, ConnectorError, ErrorCode, Interruption, ServerError, SessionEndCause,
-        SessionEnded, TransportError, ValueError,
+        ConfigError, ConnectorError, ErrorCode, FixError, Interruption, ServerError,
+        SessionEndCause, SessionEnded, TransportError, ValueError,
     };
     use crate::common::ids::AccountId;
     use crate::common::time::Timestamp;
@@ -804,6 +854,51 @@ mod tests {
         assert_eq!(
             ConnectorError::Lagged { skipped: 3 }.to_string(),
             "3 events were dropped because their reader fell behind"
+        );
+    }
+
+    #[test]
+    fn fix_errors_name_the_message_and_the_tag_and_never_a_value() {
+        let missing = FixError::MissingField {
+            msg_type: "A".to_owned(),
+            tag: 108,
+        };
+        assert_eq!(missing.to_string(), "message A lacks the required tag 108");
+        assert_eq!(
+            ConnectorError::from(missing).to_string(),
+            "FIX message rejected: message A lacks the required tag 108"
+        );
+        assert_eq!(
+            FixError::InvalidField {
+                msg_type: "A".to_owned(),
+                tag: 554
+            }
+            .to_string(),
+            "message A holds an invalid value under tag 554"
+        );
+        assert_eq!(
+            FixError::Checksum {
+                computed: 7,
+                found: 8
+            }
+            .to_string(),
+            "checksum is 8, the bytes sum to 7"
+        );
+        assert_eq!(
+            FixError::TooLong {
+                length: 9,
+                limit: 8
+            }
+            .to_string(),
+            "body of 9 bytes exceeds the limit of 8 bytes"
+        );
+        assert_eq!(
+            FixError::Garbled("no opening").to_string(),
+            "the bytes are not a FIX message: no opening"
+        );
+        assert_eq!(
+            FixError::UnsupportedMessage("ZZ".to_owned()).to_string(),
+            "message type ZZ is not supported"
         );
     }
 }

@@ -56,6 +56,7 @@ const CLIENT_ID: &str = "client_id";
 const CLIENT_SECRET: &str = "client_secret";
 const ACCESS_TOKEN: &str = "access_token";
 const REFRESH_TOKEN: &str = "refresh_token";
+const FIX_PASSWORD: &str = "fix_password";
 const TIMEOUT: &str = "timeout";
 const BACKOFF: &str = "backoff";
 const RECONNECT_DELAY: &str = "reconnect_delay";
@@ -176,6 +177,11 @@ secret!(
     /// Token exchanged for a new access token.
     RefreshToken,
     REFRESH_TOKEN
+);
+secret!(
+    /// Password of the FIX sessions of a trading account.
+    FixPassword,
+    FIX_PASSWORD
 );
 
 fn filled(value: String, option: &'static str) -> Result<String, ConfigError> {
