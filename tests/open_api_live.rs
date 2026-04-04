@@ -25,10 +25,11 @@ use ctrader_connector::open_api::connection::{Connection, ConnectionOptions, Eve
 use ctrader_connector::open_api::depth::{DepthBook, DepthStream, DepthUpdate};
 use ctrader_connector::open_api::executions::{ExecutionStream, TradeEvent};
 use ctrader_connector::open_api::history::{CashFlow, CashFlowKind};
+use ctrader_connector::open_api::margin::MarginChange;
 use ctrader_connector::open_api::messages::{
     ProtoMessage, ProtoOaApplicationAuthReq, ProtoOaApplicationAuthRes, ProtoOaDepthEvent,
     ProtoOaExecutionEvent, ProtoOaGetAccountListByAccessTokenReq, ProtoOaGetTickDataReq,
-    ProtoOaSpotEvent, ProtoOaVersionReq,
+    ProtoOaMarginChangedEvent, ProtoOaSpotEvent, ProtoOaVersionReq,
 };
 use ctrader_connector::open_api::payload::Payload;
 use ctrader_connector::open_api::quotes::QuoteSide;
@@ -2449,4 +2450,136 @@ async fn live_sweep_cancels_what_a_failed_test_left_over_a_fresh_connection() {
     println!("live sweep after a failed test: {left} orders or positions of the run are listed");
     assert_eq!(left, 0);
     client.shutdown().await;
+}
+
+const SECOND_TRADED: &str = "ETHUSD";
+
+const MARGIN_SETTLE: Duration = Duration::from_secs(4);
+
+fn tally(
+    events: &mut broadcast::Receiver<Event>,
+    seen: &mut BTreeMap<u32, usize>,
+    changes: &mut Vec<MarginChange>,
+) {
+    loop {
+        match events.try_recv() {
+            Ok(Event::Message(message)) => {
+                *seen.entry(message.payload_type).or_default() += 1;
+                if message.payload_type == ProtoOaMarginChangedEvent::PAYLOAD_TYPE {
+                    let event = ProtoOaMarginChangedEvent::from_message(&message)
+                        .expect("margin-changed event");
+                    changes.push(MarginChange::try_from(event).expect("margin change"));
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("{skipped} raw events were dropped unread")
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+impl Desk {
+    async fn second_symbol(&self) -> Symbol {
+        let list = self
+            .client
+            .symbols(SymbolsParams::new(self.account.id))
+            .await
+            .expect("symbols");
+        let id = list
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.as_deref() == Some(SECOND_TRADED))
+            .unwrap_or_else(|| panic!("the demo account lists no symbol named {SECOND_TRADED}"))
+            .id;
+        self.client
+            .symbol_details(self.account.id, &[id])
+            .await
+            .expect("symbol details")
+            .pop()
+            .expect("details of the second symbol")
+    }
+
+    async fn bought(
+        &self,
+        events: &mut broadcast::Receiver<Event>,
+        symbol: &Symbol,
+        volume: Volume,
+    ) -> Position {
+        let market = NewOrder::market(self.account.id, symbol.id, TradeSide::Buy, volume)
+            .label(self.label());
+        let accepted = self
+            .client
+            .place_order(&market, symbol)
+            .await
+            .expect("market order")
+            .order
+            .expect("accepted order");
+        let opened = opened_by(events, accepted.id).await;
+        tokio::time::sleep(MARGIN_SETTLE).await;
+        opened
+    }
+
+    async fn sold(
+        &self,
+        events: &mut broadcast::Receiver<Event>,
+        position: &Position,
+        volume: Volume,
+        symbol: &Symbol,
+    ) {
+        let closing = self
+            .client
+            .close_position(self.account.id, position, volume, symbol)
+            .await
+            .expect("close")
+            .order
+            .expect("closing order");
+        closed_by(events, closing.id).await;
+        tokio::time::sleep(MARGIN_SETTLE).await;
+    }
+}
+
+#[tokio::test]
+async fn live_margin_changed_event_is_not_emitted_by_the_demo_server_while_the_exposure_changes() {
+    trading("ct28", |desk| async move {
+        let second = desk.second_symbol().await;
+        let smallest = desk.smallest();
+        let double = Volume::new(smallest.value() + smallest.value()).expect("volume");
+        let other = second.min_volume.expect("smallest volume of the second symbol");
+        let mut raw = desk.client.events();
+        let mut events = desk.client.events();
+        let mut margin = desk.client.margin_events(desk.account.id);
+        let first = desk.bought(&mut events, &desk.symbol, double).await;
+        let hedge = desk.bought(&mut events, &second, other).await;
+        let added = desk.bought(&mut events, &desk.symbol, smallest).await;
+        desk.sold(&mut events, &hedge, hedge.volume, &second).await;
+        desk.sold(&mut events, &first, smallest, &desk.symbol).await;
+        let mut seen = BTreeMap::new();
+        let mut changes = Vec::new();
+        tally(&mut raw, &mut seen, &mut changes);
+        let typed = timeout(Duration::from_millis(200), margin.next()).await;
+        println!(
+            "live margin change: positions {} {} {} opened, one closed, one halved; raw payload types and counts {seen:?}; {} margin-changed events; typed stream {}",
+            first.id,
+            hedge.id,
+            added.id,
+            changes.len(),
+            if typed.is_ok() { "delivered" } else { "silent" },
+        );
+        assert_eq!(
+            seen.keys().copied().collect::<Vec<u32>>(),
+            vec![ProtoOaExecutionEvent::PAYLOAD_TYPE],
+            "the demo server pushed something besides execution events"
+        );
+        assert!(
+            changes.is_empty(),
+            "the demo server now emits the margin-changed event: assert its content here"
+        );
+        assert!(
+            typed.is_err(),
+            "the typed margin stream delivered an event"
+        );
+    })
+    .await;
 }
