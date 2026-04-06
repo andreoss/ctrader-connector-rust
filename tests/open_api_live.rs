@@ -455,19 +455,24 @@ async fn live_refresh_over_http_with_an_unknown_token_is_refused() {
     client.shutdown().await;
 }
 
-async fn next_spot(events: &mut broadcast::Receiver<Event>, symbol: SymbolId) -> ProtoOaSpotEvent {
+async fn next_spot(
+    events: &mut broadcast::Receiver<Event>,
+    symbols: &[SymbolId],
+) -> ProtoOaSpotEvent {
     timeout(STEP, async {
         loop {
             let event = events.recv().await.expect("event");
             if let Some(spot) = event.decode::<ProtoOaSpotEvent>() {
-                if spot.symbol_id == symbol.get() {
+                if symbols.iter().any(|symbol| symbol.get() == spot.symbol_id) {
                     return spot;
                 }
             }
         }
     })
     .await
-    .expect("spot event in time")
+    .unwrap_or_else(|_| {
+        panic!("none of {QUOTING_CANDIDATES:?} sent a spot event in {STEP:?}; the markets may be closed")
+    })
 }
 
 #[tokio::test]
@@ -485,13 +490,17 @@ async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
         .authorise_account(account.id)
         .await
         .expect("account authorisation");
-    let symbol = SymbolId::new(1).expect("symbol id");
+    let symbols: Vec<SymbolId> = candidates(&client, &account)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     let mut events = client.events();
     client
-        .subscribe_spots(account.id, &[symbol])
+        .subscribe_spots(account.id, &symbols)
         .await
         .expect("spot subscription");
-    let before = next_spot(&mut events, symbol).await;
+    let before = next_spot(&mut events, &symbols).await;
     client
         .connection()
         .force_reconnect()
@@ -514,12 +523,14 @@ async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
     })
     .await
     .expect("reconnection in time");
-    let after = next_spot(&mut events, symbol).await;
+    let after = next_spot(&mut events, &symbols).await;
     let version = client.version().await.expect("version after reconnection");
     let reconnects = client.connection().stats().reconnects;
     println!(
-        "live reconnect: disconnected {disconnected}, reconnected on attempt {attempt}, failures {failures:?}, reconnects {reconnects}, spot for symbol {symbol} before {} and after {}, version {version}",
+        "live reconnect: disconnected {disconnected}, reconnected on attempt {attempt}, failures {failures:?}, reconnects {reconnects}, spot for symbol {} before {} and for symbol {} after {}, version {version}",
+        before.symbol_id,
         before.bid.is_some() || before.ask.is_some(),
+        after.symbol_id,
         after.bid.is_some() || after.ask.is_some()
     );
     assert!(disconnected);
