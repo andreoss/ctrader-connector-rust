@@ -59,5 +59,9 @@ name = "fix_market_mock"
 required-features = ["fix"]
 
 [[test]]
+name = "fix_live_trading"
+required-features = ["fix", "open-api"]
+
+[[test]]
 name = "fix_live"
 required-features = ["fix"]

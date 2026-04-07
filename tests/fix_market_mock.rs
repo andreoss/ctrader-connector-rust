@@ -12,8 +12,9 @@ use ctrader_connector::fix::messages::{
     MarketDataRequest, MarketDataSnapshot, MarketDepth, Message, Reject, SnapshotEntry,
 };
 use ctrader_connector::fix::quotes::{Book, SpotQuote};
+use ctrader_connector::fix::securities::Security;
 use ctrader_connector::fix::session::{Event, SessionKind};
-use fix_support::{Peer, STEP, session};
+use fix_support::{Peer, STEP, session, wire};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
@@ -394,4 +395,68 @@ fn book_takes_snapshots_and_changes_of_its_own_symbol_only() {
         entries: Vec::new(),
     });
     assert!(book.is_empty());
+}
+
+#[tokio::test]
+async fn securities_are_listed_whole_or_not_at_all() {
+    let (client, mut peer) = session(SessionKind::Quote).await;
+    let server = tokio::spawn(async move {
+        let mut ids = Vec::new();
+        for answer in [
+            "322=responce:1|560=0|146=2|55=1|1007=EURUSD|1008=5|55=22395|1007=BTCUSD|1008=3",
+            "322=responce:2|560=2",
+            "322=responce:3|560=0|146=2|55=1|1007=EURUSD|1008=5|55=2|1008=3",
+            "322=responce:4|560=0|146=1|55=1|1007=EURUSD",
+        ] {
+            let (_, message) = peer.request().await;
+            let Message::SecurityListRequest(request) = message else {
+                panic!("expected a security list request, got {message:?}");
+            };
+            assert_eq!((request.request_type, request.symbol), (0, None));
+            peer.send(wire("y", &format!("320=another|{answer}"))).await;
+            peer.send(wire(
+                "y",
+                &format!("320={}|{answer}", request.security_req_id),
+            ))
+            .await;
+            ids.push(request.security_req_id);
+        }
+        (peer, ids)
+    });
+    assert_eq!(
+        client.securities().await,
+        Ok(vec![
+            Security {
+                id: symbol(1),
+                name: "EURUSD".to_owned(),
+                digits: 5,
+            },
+            Security {
+                id: symbol(22_395),
+                name: "BTCUSD".to_owned(),
+                digits: 3,
+            },
+        ])
+    );
+    assert!(matches!(
+        client.securities().await,
+        Err(ConnectorError::Fix(FixError::BusinessRejected {
+            reason: Some(2),
+            text: None,
+            ..
+        }))
+    ));
+    let lacking = |tag| {
+        Err(ConnectorError::Fix(FixError::MissingField {
+            msg_type: "y".to_owned(),
+            tag,
+        }))
+    };
+    assert_eq!(client.securities().await, lacking(1007));
+    assert_eq!(client.securities().await, lacking(1008));
+    let (_peer, ids) = server.await.expect("server");
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        4
+    );
 }

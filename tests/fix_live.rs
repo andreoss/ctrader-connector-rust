@@ -8,7 +8,7 @@ use ctrader_connector::common::config::ConfigurationFix;
 use ctrader_connector::common::errors::ConnectorError;
 use ctrader_connector::common::ids::SymbolId;
 use ctrader_connector::fix::client::FixClient;
-use ctrader_connector::fix::messages::{Message, SecurityListRequest};
+use ctrader_connector::fix::messages::Message;
 use ctrader_connector::fix::session::{Event, SessionKind};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
@@ -92,24 +92,14 @@ async fn live_sessions_log_on_stay_up_across_heartbeats_and_log_out() {
 const QUOTED: &str = "BTCUSD";
 
 async fn symbol_named(client: &FixClient, name: &str) -> SymbolId {
-    let id = client.next_id("list");
-    let request = SecurityListRequest {
-        security_req_id: id.clone(),
-        request_type: 0,
-        symbol: None,
-    };
-    let list = client
-        .request(request.into(), &id, |message| match message {
-            Message::SecurityList(list) if list.security_req_id == id => Some(Ok(list.clone())),
-            _ => None,
-        })
+    client
+        .securities()
         .await
-        .expect("security list");
-    list.symbols
+        .expect("security list")
         .iter()
-        .find(|listed| listed.name.as_deref() == Some(name))
+        .find(|security| security.name == name)
         .unwrap_or_else(|| panic!("the server lists no symbol named {name}"))
-        .symbol
+        .id
 }
 
 #[tokio::test]
