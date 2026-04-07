@@ -12,20 +12,9 @@ use ctrader_connector::fix::messages::{
     BusinessReject, Heartbeat, Logout, Message, Reject, TestRequest,
 };
 use ctrader_connector::fix::session::{Event, SessionKind};
-use fix_support::{PASSWORD, Peer, SENDER, STEP, Server, USERNAME};
+use fix_support::{PASSWORD, SENDER, STEP, Server, USERNAME, session};
 use tokio::sync::broadcast::Receiver;
 use tokio::time::{Instant, timeout};
-
-async fn session(kind: SessionKind) -> (FixClient, Peer) {
-    let server = Server::bind().await;
-    let configuration = server.configuration();
-    let (client, peer) = tokio::join!(FixClient::connect(configuration, kind), async {
-        let mut peer = server.accept().await;
-        peer.logon().await;
-        peer
-    });
-    (client.expect("logon"), peer)
-}
 
 async fn next(events: &mut Receiver<Event>) -> Event {
     timeout(STEP, events.recv())

@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use ctrader_connector::common::config::{ConfigurationFix, ConfigurationFixBuilder};
 use ctrader_connector::common::time::Timestamp;
-use ctrader_connector::fix::codec::{Frame, Header, decode, encode};
+use ctrader_connector::fix::client::FixClient;
+use ctrader_connector::fix::codec::{Field, Frame, Header, decode, encode};
 use ctrader_connector::fix::messages::{Logon, Message};
+use ctrader_connector::fix::session::SessionKind;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -23,6 +25,30 @@ pub const USERNAME: &str = "4242";
 pub const PASSWORD: &str = "open-sesame";
 /// Longest wait for anything a test expects.
 pub const STEP: Duration = Duration::from_secs(8);
+
+/// Logs a client on to a scripted server and returns both ends of the session.
+pub async fn session(kind: SessionKind) -> (FixClient, Peer) {
+    let server = Server::bind().await;
+    let configuration = server.configuration();
+    let (client, peer) = tokio::join!(FixClient::connect(configuration, kind), async {
+        let mut peer = server.accept().await;
+        peer.logon().await;
+        peer
+    });
+    (client.expect("logon"), peer)
+}
+
+/// Reads a message of the given type from fields written as `tag=value` and joined by bars.
+pub fn wire(msg_type: &str, fields: &str) -> Message {
+    let body: Vec<Field> = fields
+        .split('|')
+        .map(|field| {
+            let (tag, value) = field.split_once('=').expect("tag and value");
+            Field::new(tag.parse().expect("tag"), value)
+        })
+        .collect();
+    Message::parse(msg_type, &body).expect("message")
+}
 
 /// Listening side of the scripted server.
 pub struct Server {

@@ -90,6 +90,12 @@ impl FixClient {
         self.kind
     }
 
+    /// Returns the longest wait for an answer of the server.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Subscribes to the events of the session from this moment on.
     ///
     /// A reader that falls behind loses the oldest events and is told how many.

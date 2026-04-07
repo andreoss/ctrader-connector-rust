@@ -601,6 +601,14 @@ pub enum FixError {
         /// Explanation the server gave.
         text: Option<String>,
     },
+    /// The server refused a subscription to prices.
+    #[error("the server refused the market data request: {}", explained(text.as_deref()))]
+    MarketDataRejected {
+        /// Reason code of the server.
+        reason: Option<u32>,
+        /// Explanation the server gave.
+        text: Option<String>,
+    },
 }
 
 fn explained(text: Option<&str>) -> &str {

@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use ctrader_connector::common::config::ConfigurationFix;
 use ctrader_connector::common::errors::ConnectorError;
+use ctrader_connector::common::ids::SymbolId;
 use ctrader_connector::fix::client::FixClient;
-use ctrader_connector::fix::messages::Message;
+use ctrader_connector::fix::messages::{Message, SecurityListRequest};
 use ctrader_connector::fix::session::{Event, SessionKind};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
@@ -86,4 +87,171 @@ async fn live_sessions_log_on_stay_up_across_heartbeats_and_log_out() {
         );
         leave(&client).await;
     }
+}
+
+const QUOTED: &str = "BTCUSD";
+
+async fn symbol_named(client: &FixClient, name: &str) -> SymbolId {
+    let id = client.next_id("list");
+    let request = SecurityListRequest {
+        security_req_id: id.clone(),
+        request_type: 0,
+        symbol: None,
+    };
+    let list = client
+        .request(request.into(), &id, |message| match message {
+            Message::SecurityList(list) if list.security_req_id == id => Some(Ok(list.clone())),
+            _ => None,
+        })
+        .await
+        .expect("security list");
+    list.symbols
+        .iter()
+        .find(|listed| listed.name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("the server lists no symbol named {name}"))
+        .symbol
+}
+
+#[tokio::test]
+async fn live_spot_prices_arrive_as_snapshots_until_unsubscribed() {
+    let _guard = LIVE.lock().await;
+    let client = session(SessionKind::Quote).await;
+    let symbol = symbol_named(&client, QUOTED).await;
+    let mut events = client.events();
+    let mut spots = timeout(STEP, client.subscribe_spot(symbol))
+        .await
+        .expect("first prices in time")
+        .expect("spot subscription");
+    let first = spots.last();
+    assert_eq!(first.symbol, symbol);
+    let mut later = Vec::new();
+    while later.len() < 3 {
+        let quote = timeout(Duration::from_secs(60), spots.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{QUOTED} sent no further prices in 60 s; the market may be closed")
+            })
+            .expect("prices");
+        assert_eq!(quote.symbol, symbol);
+        let (bid, offer) = (quote.bid.expect("bid"), quote.offer.expect("offer"));
+        assert!(bid <= offer, "bid above offer: {quote:?}");
+        later.push(quote);
+    }
+    let mut snapshots = 0_usize;
+    let mut incrementals = 0_usize;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            Event::Message(inbound) => match inbound.message {
+                Message::MarketDataSnapshot(_) => snapshots += 1,
+                Message::MarketDataIncremental(_) => incrementals += 1,
+                _ => {}
+            },
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    spots.unsubscribe().await.expect("end of subscription");
+    let quiet = Duration::from_secs(8);
+    let settle = Duration::from_secs(2);
+    let ended = Instant::now();
+    let mut late = 0_usize;
+    while let Ok(event) = timeout(quiet.saturating_sub(ended.elapsed()), events.recv()).await {
+        if let Event::Message(inbound) = event.expect("event") {
+            if matches!(inbound.message, Message::MarketDataSnapshot(_)) && ended.elapsed() > settle
+            {
+                late += 1;
+            }
+        }
+    }
+    println!(
+        "live spot: {QUOTED} is symbol {symbol}; first bid {:?} offer {:?}; {} later reports; {snapshots} snapshots and {incrementals} incremental messages while subscribed; {late} price messages later than {settle:?} after unsubscribing, watched for {quiet:?}",
+        first.bid.map(|price| price.to_string()),
+        first.offer.map(|price| price.to_string()),
+        later.len()
+    );
+    assert!(snapshots >= 4, "{snapshots}");
+    assert_eq!(incrementals, 0);
+    assert_eq!(late, 0);
+    leave(&client).await;
+}
+
+#[tokio::test]
+async fn live_depth_fills_a_book_by_changes_until_unsubscribed() {
+    let _guard = LIVE.lock().await;
+    let client = session(SessionKind::Quote).await;
+    let symbol = symbol_named(&client, QUOTED).await;
+    let mut events = client.events();
+    let mut depth = timeout(STEP, client.subscribe_depth(symbol))
+        .await
+        .expect("first book in time")
+        .expect("depth subscription");
+    let first = depth.book().len();
+    let window = Instant::now() + Duration::from_secs(60);
+    let mut changes = 0_usize;
+    while changes < 5 || depth.book().bids().is_empty() || depth.book().offers().is_empty() {
+        tokio::time::timeout_at(window, depth.next())
+            .await
+            .unwrap_or_else(|_| panic!("{QUOTED} sent no five changes with both sides in 60 s ({changes} received); the market may be closed"))
+            .expect("book");
+        changes += 1;
+    }
+    let book = depth.book().clone();
+    let (bids, offers) = (book.bids(), book.offers());
+    let best_bid = bids.first().expect("best bid");
+    let best_offer = offers.first().expect("best offer");
+    assert!(
+        best_bid.price < best_offer.price,
+        "{best_bid:?} {best_offer:?}"
+    );
+    assert!(
+        bids.windows(2)
+            .all(|pair| matches!(pair, [above, below] if above.price >= below.price))
+    );
+    assert!(
+        offers
+            .windows(2)
+            .all(|pair| matches!(pair, [below, above] if below.price <= above.price))
+    );
+    assert!(
+        book.bids()
+            .iter()
+            .chain(&book.offers())
+            .all(|entry| entry.size.is_some())
+    );
+    let mut snapshots = 0_usize;
+    let mut incrementals = 0_usize;
+    while let Ok(event) = events.try_recv() {
+        if let Event::Message(inbound) = event {
+            match inbound.message {
+                Message::MarketDataSnapshot(_) => snapshots += 1,
+                Message::MarketDataIncremental(_) => incrementals += 1,
+                _ => {}
+            }
+        }
+    }
+    depth.unsubscribe().await.expect("end of subscription");
+    let quiet = Duration::from_secs(8);
+    let settle = Duration::from_secs(2);
+    let ended = Instant::now();
+    let mut late = 0_usize;
+    while let Ok(event) = timeout(quiet.saturating_sub(ended.elapsed()), events.recv()).await {
+        if let Event::Message(inbound) = event.expect("event") {
+            if matches!(inbound.message, Message::MarketDataIncremental(_))
+                && ended.elapsed() > settle
+            {
+                late += 1;
+            }
+        }
+    }
+    println!(
+        "live depth: {QUOTED} is symbol {symbol}; first book of {first} entries; after {changes} changes {} bids and {} offers, best bid {} below best offer {}; {snapshots} snapshots and {incrementals} incremental messages while subscribed; {late} changes later than {settle:?} after unsubscribing, watched for {quiet:?}",
+        bids.len(),
+        offers.len(),
+        best_bid.price,
+        best_offer.price
+    );
+    assert_eq!(first, 0);
+    assert_eq!(snapshots, 1);
+    assert!(incrementals >= 5, "{incrementals}");
+    assert_eq!(late, 0);
+    leave(&client).await;
 }

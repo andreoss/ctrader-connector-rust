@@ -55,5 +55,9 @@ name = "fix_mock"
 required-features = ["fix"]
 
 [[test]]
+name = "fix_market_mock"
+required-features = ["fix"]
+
+[[test]]
 name = "fix_live"
 required-features = ["fix"]
