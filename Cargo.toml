@@ -15,7 +15,7 @@ path = "src/lib.rs"
 [features]
 default = []
 open-api = ["dep:prost", "dep:serde_json", "dep:tokio", "dep:tokio-rustls", "dep:webpki-roots"]
-fix = []
+fix = ["dep:tokio", "dep:tokio-rustls", "dep:webpki-roots"]
 logging = ["dep:tracing"]
 
 [dependencies]
@@ -49,3 +49,11 @@ required-features = ["open-api"]
 [[test]]
 name = "open_api_live"
 required-features = ["open-api"]
+
+[[test]]
+name = "fix_mock"
+required-features = ["fix"]
+
+[[test]]
+name = "fix_live"
+required-features = ["fix"]

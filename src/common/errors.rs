@@ -570,6 +570,41 @@ pub enum FixError {
     /// The type of the message is not known to this library.
     #[error("message type {0} is not supported")]
     UnsupportedMessage(String),
+    /// The server answered the logon with a logout.
+    #[error("the server refused the logon: {}", explained(text.as_deref()))]
+    LogonRefused {
+        /// Explanation the server gave.
+        text: Option<String>,
+    },
+    /// A message of this type arrived where another was due.
+    #[error("message of type {0} arrived where another was due")]
+    UnexpectedMessage(String),
+    /// The server rejected a message at the session level.
+    #[error("the server rejected message {ref_seq_num}: {}", explained(text.as_deref()))]
+    Rejected {
+        /// Sequence number of the message rejected.
+        ref_seq_num: u64,
+        /// Tag the server objects to.
+        tag: Option<u32>,
+        /// Reason code of the server.
+        reason: Option<u32>,
+        /// Explanation the server gave.
+        text: Option<String>,
+    },
+    /// The server refused a request at the application level.
+    #[error("the server refused the request: {}", explained(text.as_deref()))]
+    BusinessRejected {
+        /// Identifier of the request refused.
+        ref_id: Option<String>,
+        /// Reason code of the server.
+        reason: Option<u32>,
+        /// Explanation the server gave.
+        text: Option<String>,
+    },
+}
+
+fn explained(text: Option<&str>) -> &str {
+    text.unwrap_or("no explanation given")
 }
 
 /// Any failure reported by this library.
@@ -592,7 +627,7 @@ pub enum ConnectorError {
     #[error(transparent)]
     Token(#[from] TokenError),
     /// A FIX message was rejected, by this library or by the server.
-    #[error("FIX message rejected: {0}")]
+    #[error("FIX failure: {0}")]
     Fix(#[from] FixError),
     /// The server did not answer a request in time.
     #[error("no response within {0:?}")]
@@ -858,6 +893,44 @@ mod tests {
     }
 
     #[test]
+    fn fix_refusals_carry_the_explanation_of_the_server_or_say_that_none_came() {
+        assert_eq!(
+            FixError::LogonRefused {
+                text: Some("RET_INVALID_DATA".to_owned())
+            }
+            .to_string(),
+            "the server refused the logon: RET_INVALID_DATA"
+        );
+        assert_eq!(
+            FixError::LogonRefused { text: None }.to_string(),
+            "the server refused the logon: no explanation given"
+        );
+        assert_eq!(
+            FixError::UnexpectedMessage("0".to_owned()).to_string(),
+            "message of type 0 arrived where another was due"
+        );
+        assert_eq!(
+            FixError::Rejected {
+                ref_seq_num: 7,
+                tag: Some(55),
+                reason: Some(5),
+                text: Some("Value is incorrect".to_owned())
+            }
+            .to_string(),
+            "the server rejected message 7: Value is incorrect"
+        );
+        assert_eq!(
+            FixError::BusinessRejected {
+                ref_id: Some("a".to_owned()),
+                reason: None,
+                text: None
+            }
+            .to_string(),
+            "the server refused the request: no explanation given"
+        );
+    }
+
+    #[test]
     fn fix_errors_name_the_message_and_the_tag_and_never_a_value() {
         let missing = FixError::MissingField {
             msg_type: "A".to_owned(),
@@ -866,7 +939,7 @@ mod tests {
         assert_eq!(missing.to_string(), "message A lacks the required tag 108");
         assert_eq!(
             ConnectorError::from(missing).to_string(),
-            "FIX message rejected: message A lacks the required tag 108"
+            "FIX failure: message A lacks the required tag 108"
         );
         assert_eq!(
             FixError::InvalidField {

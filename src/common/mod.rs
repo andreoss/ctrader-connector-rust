@@ -6,3 +6,5 @@ pub mod decimals;
 pub mod errors;
 pub mod ids;
 pub mod time;
+#[cfg(any(feature = "open-api", feature = "fix"))]
+pub mod transport;

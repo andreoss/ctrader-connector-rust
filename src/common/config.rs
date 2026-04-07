@@ -511,6 +511,325 @@ impl ConfigurationOpenApiBuilder {
     }
 }
 
+/// Host of the FIX sessions; every broker has its own.
+pub const ENV_FIX_HOST: &str = "BROKER_FIX_HOST";
+/// Port of the price session over TLS.
+pub const ENV_FIX_QUOTE_PORT: &str = "BROKER_FIX_QUOTE_PORT";
+/// Port of the trade session over TLS.
+pub const ENV_FIX_TRADE_PORT: &str = "BROKER_FIX_TRADE_PORT";
+/// Identifier the client sends as its sender (49).
+pub const ENV_FIX_SENDER_COMP_ID: &str = "BROKER_FIX_SENDER_COMP_ID";
+/// Identifier of the server (56).
+pub const ENV_FIX_TARGET_COMP_ID: &str = "BROKER_FIX_TARGET_COMP_ID";
+/// Login of the trading account (553).
+pub const ENV_FIX_USERNAME: &str = "BROKER_FIX_USERNAME";
+/// Password of the FIX sessions of the account (554).
+pub const ENV_FIX_PASSWORD: &str = "BROKER_FIX_PASSWORD";
+
+/// Default port of the price session over TLS.
+pub const DEFAULT_FIX_QUOTE_PORT: u16 = 5211;
+/// Default port of the trade session over TLS.
+pub const DEFAULT_FIX_TRADE_PORT: u16 = 5212;
+/// Default port of the price session without encryption.
+pub const DEFAULT_FIX_QUOTE_PLAIN_PORT: u16 = 5201;
+/// Default port of the trade session without encryption.
+pub const DEFAULT_FIX_TRADE_PLAIN_PORT: u16 = 5202;
+/// Identifier of the server the specification names.
+pub const DEFAULT_FIX_TARGET_COMP_ID: &str = "CSERVER";
+/// Default interval between heartbeats.
+pub const DEFAULT_FIX_HEARTBEAT: Duration = Duration::from_secs(30);
+
+const FIX_HOST: &str = "host";
+const FIX_SENDER_COMP_ID: &str = "sender_comp_id";
+const FIX_TARGET_COMP_ID: &str = "target_comp_id";
+const FIX_USERNAME: &str = "username";
+const HEARTBEAT: &str = "heartbeat";
+
+fn port_number(text: &str) -> Result<u16, ConfigError> {
+    match text.trim().parse::<u16>() {
+        Ok(port) if port > 0 => Ok(port),
+        _ => Err(ConfigError::InvalidPort),
+    }
+}
+
+fn nonzero_port(port: u16) -> Result<u16, ConfigError> {
+    if port == 0 {
+        Err(ConfigError::InvalidPort)
+    } else {
+        Ok(port)
+    }
+}
+
+/// Validated configuration of the FIX sessions of one trading account.
+///
+/// The password never appears in `Debug` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationFix {
+    host: String,
+    quote_port: u16,
+    trade_port: u16,
+    encrypted: bool,
+    sender_comp_id: String,
+    target_comp_id: String,
+    username: String,
+    password: FixPassword,
+    heartbeat: Duration,
+    timeout: Duration,
+    reconnect_delay: Duration,
+}
+
+impl ConfigurationFix {
+    /// Starts a configuration; the sessions run over TLS unless
+    /// [`ConfigurationFixBuilder::unencrypted`] is called.
+    pub fn builder() -> ConfigurationFixBuilder {
+        ConfigurationFixBuilder::new()
+    }
+
+    /// Builds a configuration from the process environment.
+    ///
+    /// See [`ConfigurationFix::from_lookup`] for the variables read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] when a required variable is absent or a value is rejected.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Builds a configuration from variables resolved by `lookup`.
+    ///
+    /// [`ENV_FIX_HOST`], [`ENV_FIX_SENDER_COMP_ID`], [`ENV_FIX_USERNAME`] and
+    /// [`ENV_FIX_PASSWORD`] are required. [`ENV_FIX_QUOTE_PORT`] and [`ENV_FIX_TRADE_PORT`]
+    /// replace the default TLS ports. [`ENV_FIX_TARGET_COMP_ID`] replaces
+    /// [`DEFAULT_FIX_TARGET_COMP_ID`] and is sent as given; the server reads it without regard
+    /// to case. An empty value counts as absent. The sessions run over TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] when a required variable is absent or a value is rejected.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let optional = |key: &str| lookup(key).filter(|value| !value.trim().is_empty());
+        let required = |key: &'static str| optional(key).ok_or(ConfigError::Missing(key));
+        let mut builder = Self::builder()
+            .host(required(ENV_FIX_HOST)?)
+            .sender_comp_id(required(ENV_FIX_SENDER_COMP_ID)?)
+            .username(required(ENV_FIX_USERNAME)?)
+            .password(required(ENV_FIX_PASSWORD)?);
+        if let Some(port) = optional(ENV_FIX_QUOTE_PORT) {
+            builder = builder.quote_port(port_number(&port)?);
+        }
+        if let Some(port) = optional(ENV_FIX_TRADE_PORT) {
+            builder = builder.trade_port(port_number(&port)?);
+        }
+        if let Some(target) = optional(ENV_FIX_TARGET_COMP_ID) {
+            builder = builder.target_comp_id(target);
+        }
+        builder.build()
+    }
+
+    /// Returns the host.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Returns the port of the price session.
+    #[must_use]
+    pub const fn quote_port(&self) -> u16 {
+        self.quote_port
+    }
+
+    /// Returns the port of the trade session.
+    #[must_use]
+    pub const fn trade_port(&self) -> u16 {
+        self.trade_port
+    }
+
+    /// Tells whether the sessions run over TLS.
+    #[must_use]
+    pub const fn encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    /// Returns the identifier the client sends as its sender (49).
+    #[must_use]
+    pub fn sender_comp_id(&self) -> &str {
+        &self.sender_comp_id
+    }
+
+    /// Returns the identifier of the server (56).
+    #[must_use]
+    pub fn target_comp_id(&self) -> &str {
+        &self.target_comp_id
+    }
+
+    /// Returns the login of the trading account (553).
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Returns the password of the sessions (554).
+    #[must_use]
+    pub const fn password(&self) -> &FixPassword {
+        &self.password
+    }
+
+    /// Returns the interval between heartbeats.
+    #[must_use]
+    pub const fn heartbeat(&self) -> Duration {
+        self.heartbeat
+    }
+
+    /// Returns the time allowed for an answer of the server and for a write.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Returns the pause before a lost session is opened again.
+    #[must_use]
+    pub const fn reconnect_delay(&self) -> Duration {
+        self.reconnect_delay
+    }
+}
+
+/// Builder of a [`ConfigurationFix`].
+///
+/// Values are checked by [`ConfigurationFixBuilder::build`], not by the setters.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ConfigurationFixBuilder {
+    host: Option<String>,
+    quote_port: Option<u16>,
+    trade_port: Option<u16>,
+    encrypted: bool,
+    sender_comp_id: Option<String>,
+    target_comp_id: String,
+    username: Option<String>,
+    password: Option<FixPassword>,
+    heartbeat: Duration,
+    timeout: Duration,
+    reconnect_delay: Duration,
+}
+
+impl ConfigurationFixBuilder {
+    fn new() -> Self {
+        Self {
+            host: None,
+            quote_port: None,
+            trade_port: None,
+            encrypted: true,
+            sender_comp_id: None,
+            target_comp_id: DEFAULT_FIX_TARGET_COMP_ID.to_owned(),
+            username: None,
+            password: None,
+            heartbeat: DEFAULT_FIX_HEARTBEAT,
+            timeout: DEFAULT_TIMEOUT,
+            reconnect_delay: DEFAULT_RECONNECT_DELAY,
+        }
+    }
+
+    /// Sets the host.
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    /// Sets the port of the price session, replacing the default of the transport.
+    pub const fn quote_port(mut self, port: u16) -> Self {
+        self.quote_port = Some(port);
+        self
+    }
+
+    /// Sets the port of the trade session, replacing the default of the transport.
+    pub const fn trade_port(mut self, port: u16) -> Self {
+        self.trade_port = Some(port);
+        self
+    }
+
+    /// Runs the sessions without encryption: the password and every order cross the network
+    /// in the clear. TLS is the default; this is an explicit choice for networks that are
+    /// trusted, and it moves the default ports to the unencrypted ones.
+    pub const fn unencrypted(mut self) -> Self {
+        self.encrypted = false;
+        self
+    }
+
+    /// Sets the identifier the client sends as its sender (49).
+    pub fn sender_comp_id(mut self, sender_comp_id: impl Into<String>) -> Self {
+        self.sender_comp_id = Some(sender_comp_id.into());
+        self
+    }
+
+    /// Sets the identifier of the server (56), replacing [`DEFAULT_FIX_TARGET_COMP_ID`].
+    pub fn target_comp_id(mut self, target_comp_id: impl Into<String>) -> Self {
+        self.target_comp_id = target_comp_id.into();
+        self
+    }
+
+    /// Sets the login of the trading account (553).
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    /// Sets the password of the sessions (554).
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = FixPassword::new(password).ok();
+        self
+    }
+
+    /// Sets the interval between heartbeats; the wire carries it in whole seconds.
+    pub const fn heartbeat(mut self, heartbeat: Duration) -> Self {
+        self.heartbeat = heartbeat;
+        self
+    }
+
+    /// Sets the time allowed for an answer of the server and for a write.
+    pub const fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Sets the pause before a lost session is opened again.
+    pub const fn reconnect_delay(mut self, reconnect_delay: Duration) -> Self {
+        self.reconnect_delay = reconnect_delay;
+        self
+    }
+
+    /// Checks every value and returns the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] when the host, the sender, the target, the login or the
+    /// password is absent or empty, the host is not a bare host name, a port is zero, the
+    /// heartbeat is shorter than one second, or another duration is zero.
+    pub fn build(self) -> Result<ConfigurationFix, ConfigError> {
+        let (quote, trade) = if self.encrypted {
+            (DEFAULT_FIX_QUOTE_PORT, DEFAULT_FIX_TRADE_PORT)
+        } else {
+            (DEFAULT_FIX_QUOTE_PLAIN_PORT, DEFAULT_FIX_TRADE_PLAIN_PORT)
+        };
+        if self.heartbeat.as_secs() == 0 {
+            return Err(ConfigError::ZeroDuration(HEARTBEAT));
+        }
+        Ok(ConfigurationFix {
+            host: host_name(filled(self.host.unwrap_or_default(), FIX_HOST)?)?,
+            quote_port: nonzero_port(self.quote_port.unwrap_or(quote))?,
+            trade_port: nonzero_port(self.trade_port.unwrap_or(trade))?,
+            encrypted: self.encrypted,
+            sender_comp_id: filled(self.sender_comp_id.unwrap_or_default(), FIX_SENDER_COMP_ID)?,
+            target_comp_id: filled(self.target_comp_id, FIX_TARGET_COMP_ID)?,
+            username: filled(self.username.unwrap_or_default(), FIX_USERNAME)?,
+            password: self.password.ok_or(ConfigError::Missing(FIX_PASSWORD))?,
+            heartbeat: Duration::from_secs(self.heartbeat.as_secs()),
+            timeout: positive(self.timeout, TIMEOUT)?,
+            reconnect_delay: positive(self.reconnect_delay, RECONNECT_DELAY)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -522,6 +841,13 @@ mod tests {
         DEFAULT_TOKEN_URL, DEMO_HOST, ENV_ACCESS_TOKEN, ENV_CLIENT_ID, ENV_CLIENT_SECRET,
         ENV_DEMO_HOST, ENV_ENVIRONMENT, ENV_REFRESH_TOKEN, ENV_TOKEN_URL, Environment, LIVE_HOST,
         RefreshToken,
+    };
+    use super::{
+        ConfigurationFix, ConfigurationFixBuilder, DEFAULT_FIX_HEARTBEAT,
+        DEFAULT_FIX_QUOTE_PLAIN_PORT, DEFAULT_FIX_QUOTE_PORT, DEFAULT_FIX_TARGET_COMP_ID,
+        DEFAULT_FIX_TRADE_PLAIN_PORT, DEFAULT_FIX_TRADE_PORT, ENV_FIX_HOST, ENV_FIX_PASSWORD,
+        ENV_FIX_QUOTE_PORT, ENV_FIX_SENDER_COMP_ID, ENV_FIX_TARGET_COMP_ID, ENV_FIX_TRADE_PORT,
+        ENV_FIX_USERNAME,
     };
     use crate::common::errors::ConfigError;
 
@@ -849,5 +1175,164 @@ mod tests {
             ConfigError::ZeroDuration("timeout").to_string(),
             "timeout must be longer than zero"
         );
+    }
+
+    fn fix() -> ConfigurationFixBuilder {
+        ConfigurationFix::builder()
+            .host("fix.example.com")
+            .sender_comp_id("demo.broker.4242")
+            .username("4242")
+            .password("open-sesame")
+    }
+
+    const FIX_REQUIRED: [(&str, &str); 4] = [
+        (ENV_FIX_HOST, "fix.example.com"),
+        (ENV_FIX_SENDER_COMP_ID, "demo.broker.4242"),
+        (ENV_FIX_USERNAME, "4242"),
+        (ENV_FIX_PASSWORD, "open-sesame"),
+    ];
+
+    fn fix_with(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        FIX_REQUIRED.iter().chain(extra).copied().collect()
+    }
+
+    #[test]
+    fn fix_builder_defaults_to_tls_and_the_documented_ports() -> Result<(), ConfigError> {
+        let configuration = fix().build()?;
+        assert_eq!(configuration.host(), "fix.example.com");
+        assert!(configuration.encrypted());
+        assert_eq!(configuration.quote_port(), DEFAULT_FIX_QUOTE_PORT);
+        assert_eq!(configuration.trade_port(), DEFAULT_FIX_TRADE_PORT);
+        assert_eq!(configuration.sender_comp_id(), "demo.broker.4242");
+        assert_eq!(configuration.target_comp_id(), DEFAULT_FIX_TARGET_COMP_ID);
+        assert_eq!(configuration.username(), "4242");
+        assert_eq!(configuration.password().expose(), "open-sesame");
+        assert_eq!(configuration.heartbeat(), DEFAULT_FIX_HEARTBEAT);
+        assert_eq!(configuration.timeout(), DEFAULT_TIMEOUT);
+        assert_eq!(configuration.reconnect_delay(), DEFAULT_RECONNECT_DELAY);
+        Ok(())
+    }
+
+    #[test]
+    fn fix_sessions_run_unencrypted_only_on_request() -> Result<(), ConfigError> {
+        let plain = fix().unencrypted().build()?;
+        assert!(!plain.encrypted());
+        assert_eq!(plain.quote_port(), DEFAULT_FIX_QUOTE_PLAIN_PORT);
+        assert_eq!(plain.trade_port(), DEFAULT_FIX_TRADE_PLAIN_PORT);
+        let chosen = fix().unencrypted().quote_port(1).trade_port(2).build()?;
+        assert_eq!((chosen.quote_port(), chosen.trade_port()), (1, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn fix_builder_takes_every_setting() -> Result<(), ConfigError> {
+        let configuration = fix()
+            .target_comp_id("cServer")
+            .heartbeat(Duration::from_millis(5_900))
+            .timeout(Duration::from_secs(3))
+            .reconnect_delay(Duration::from_secs(4))
+            .build()?;
+        assert_eq!(configuration.target_comp_id(), "cServer");
+        assert_eq!(configuration.heartbeat(), Duration::from_secs(5));
+        assert_eq!(configuration.timeout(), Duration::from_secs(3));
+        assert_eq!(configuration.reconnect_delay(), Duration::from_secs(4));
+        Ok(())
+    }
+
+    #[test]
+    fn fix_builder_rejects_absent_and_invalid_values() {
+        let cases = [
+            (
+                ConfigurationFix::builder().build(),
+                ConfigError::Missing("host"),
+            ),
+            (
+                fix().host("a host").build(),
+                ConfigError::InvalidHost("a host".to_owned()),
+            ),
+            (
+                fix().sender_comp_id(" ").build(),
+                ConfigError::Missing("sender_comp_id"),
+            ),
+            (
+                fix().target_comp_id("").build(),
+                ConfigError::Missing("target_comp_id"),
+            ),
+            (fix().username("").build(), ConfigError::Missing("username")),
+            (
+                fix().password("").build(),
+                ConfigError::Missing("fix_password"),
+            ),
+            (fix().quote_port(0).build(), ConfigError::InvalidPort),
+            (fix().trade_port(0).build(), ConfigError::InvalidPort),
+            (
+                fix().heartbeat(Duration::from_millis(999)).build(),
+                ConfigError::ZeroDuration("heartbeat"),
+            ),
+            (
+                fix().timeout(Duration::ZERO).build(),
+                ConfigError::ZeroDuration("timeout"),
+            ),
+            (
+                fix().reconnect_delay(Duration::ZERO).build(),
+                ConfigError::ZeroDuration("reconnect_delay"),
+            ),
+        ];
+        for (built, expected) in cases {
+            assert_eq!(built, Err(expected));
+        }
+    }
+
+    #[test]
+    fn fix_configuration_is_read_from_variables() -> Result<(), ConfigError> {
+        let plain = ConfigurationFix::from_lookup(lookup(&FIX_REQUIRED))?;
+        assert_eq!(plain, fix().build()?);
+        let full = ConfigurationFix::from_lookup(lookup(&fix_with(&[
+            (ENV_FIX_QUOTE_PORT, " 6001 "),
+            (ENV_FIX_TRADE_PORT, "6002"),
+            (ENV_FIX_TARGET_COMP_ID, "cServer"),
+        ])))?;
+        assert_eq!((full.quote_port(), full.trade_port()), (6001, 6002));
+        assert_eq!(full.target_comp_id(), "cServer");
+        let blank = ConfigurationFix::from_lookup(lookup(&fix_with(&[
+            (ENV_FIX_QUOTE_PORT, " "),
+            (ENV_FIX_TARGET_COMP_ID, ""),
+        ])))?;
+        assert_eq!(blank, plain);
+        Ok(())
+    }
+
+    #[test]
+    fn fix_variables_that_are_absent_or_invalid_are_rejected() {
+        for (index, (key, _)) in FIX_REQUIRED.iter().enumerate() {
+            let rest: Vec<_> = FIX_REQUIRED
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, pair)| *pair)
+                .collect();
+            assert_eq!(
+                ConfigurationFix::from_lookup(lookup(&rest)),
+                Err(ConfigError::Missing(key))
+            );
+        }
+        for (key, value) in [
+            (ENV_FIX_QUOTE_PORT, "0"),
+            (ENV_FIX_QUOTE_PORT, "70000"),
+            (ENV_FIX_TRADE_PORT, "port"),
+        ] {
+            assert_eq!(
+                ConfigurationFix::from_lookup(lookup(&fix_with(&[(key, value)]))),
+                Err(ConfigError::InvalidPort)
+            );
+        }
+    }
+
+    #[test]
+    fn fix_password_never_appears_in_debug_output() -> Result<(), ConfigError> {
+        let shown = format!("{:?} {:?}", fix(), fix().build()?);
+        assert!(!shown.contains("open-sesame"), "{shown}");
+        assert!(shown.contains("FixPassword(***)"), "{shown}");
+        Ok(())
     }
 }
