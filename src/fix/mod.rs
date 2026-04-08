@@ -10,3 +10,4 @@ pub mod messages;
 pub mod quotes;
 pub mod securities;
 pub mod session;
+pub mod trading;

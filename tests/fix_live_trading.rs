@@ -3,6 +3,8 @@
 //! The tests need the variables of the FIX sessions and the `BROKER_*` credentials of the
 //! Open API in the environment, and run one at a time. Both interfaces reach the same demo
 //! account: the tests pick the account whose login is the user name of the FIX sessions.
+//! Whatever a test creates carries a label of its own and is swept away afterwards over a
+//! fresh connection, also when the test fails.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,12 +13,18 @@ use std::time::Duration;
 use ctrader_connector::common::config::{
     ConfigurationFix, ConfigurationOpenApi, ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN, Environment,
 };
+use ctrader_connector::common::decimals::Price;
 use ctrader_connector::common::errors::ConnectorError;
-use ctrader_connector::common::ids::{AccountId, SymbolId};
+use ctrader_connector::common::ids::{AccountId, OrderId, SymbolId};
+use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::fix::client::FixClient;
+use ctrader_connector::fix::messages::{ExecType, OrderKind, OrderStatus, Side};
 use ctrader_connector::fix::session::SessionKind;
+use ctrader_connector::fix::trading::NewOrder;
 use ctrader_connector::open_api::client::OpenApiClient;
-use ctrader_connector::open_api::symbols::SymbolsParams;
+use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
+use ctrader_connector::open_api::trading::{Order, OrderType, Position, TimeInForce, TradeSide};
+use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
@@ -25,6 +33,7 @@ static LIVE: Mutex<()> = Mutex::const_new(());
 const STEP: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 const TRADED: &str = "BTCUSD";
+const SWEEP_ROUNDS: usize = 10;
 const DETAILS_CHUNK: usize = 200;
 
 fn env_file() -> PathBuf {
@@ -127,6 +136,174 @@ async fn reader() -> Result<(OpenApiClient, AccountId), ConnectorError> {
     }
 }
 
+#[derive(Clone)]
+struct Desk {
+    open: OpenApiClient,
+    account: AccountId,
+    symbol: Symbol,
+    label: String,
+}
+
+impl Desk {
+    async fn own(&self) -> (Vec<Position>, Vec<Order>) {
+        let reconciled = self.open.reconcile(self.account).await.expect("reconcile");
+        let label = Some(self.label.as_str());
+        let positions = reconciled
+            .positions
+            .into_iter()
+            .filter(|position| position.label.as_deref() == label)
+            .collect();
+        let orders = reconciled
+            .orders
+            .into_iter()
+            .filter(|order| order.label.as_deref() == label)
+            .collect();
+        (positions, orders)
+    }
+}
+
+async fn sweep_once(
+    client: &OpenApiClient,
+    account: AccountId,
+    label: &str,
+) -> Result<usize, ConnectorError> {
+    let reconciled = client.reconcile(account).await?;
+    let own = Some(label);
+    let orders: Vec<&Order> = reconciled
+        .orders
+        .iter()
+        .filter(|order| order.label.as_deref() == own)
+        .collect();
+    let positions: Vec<&Position> = reconciled
+        .positions
+        .iter()
+        .filter(|position| position.label.as_deref() == own)
+        .collect();
+    for order in orders.iter().filter(|order| !order.closing) {
+        let outcome = client.cancel_order(account, order.id).await;
+        println!(
+            "live sweep: cancel order {} answered {:?}",
+            order.id,
+            outcome.map(|execution| execution.kind)
+        );
+    }
+    for position in &positions {
+        let Some(symbol) = client
+            .symbol_details(account, &[position.symbol])
+            .await?
+            .pop()
+        else {
+            continue;
+        };
+        let outcome = client
+            .close_position(account, position, position.volume, &symbol)
+            .await;
+        println!(
+            "live sweep: close position {} answered {:?}",
+            position.id,
+            outcome.map(|execution| execution.kind)
+        );
+    }
+    Ok(orders.len() + positions.len())
+}
+
+async fn sweep(label: &str) -> Result<(), String> {
+    let mut last = "the sweep did not run".to_owned();
+    let mut link: Option<(OpenApiClient, AccountId)> = None;
+    for round in 0..SWEEP_ROUNDS {
+        if round > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let (client, account) = match link.take() {
+            Some(open) => open,
+            None => match reader().await {
+                Ok(open) => open,
+                Err(error) => {
+                    last = format!("no fresh connection for the sweep: {error}");
+                    continue;
+                }
+            },
+        };
+        match sweep_once(&client, account, label).await {
+            Ok(0) => {
+                client.shutdown().await;
+                return Ok(());
+            }
+            Ok(left) => {
+                last = format!("{left} orders or positions labelled {label} were still listed");
+                link = Some((client, account));
+            }
+            Err(error) => {
+                last = format!("the sweep of label {label} failed: {error}");
+                client.shutdown().await;
+            }
+        }
+    }
+    if let Some((client, _)) = link {
+        client.shutdown().await;
+    }
+    Err(last)
+}
+
+fn panic_text(failure: tokio::task::JoinError) -> String {
+    let Ok(payload) = failure.try_into_panic() else {
+        return "the test was cancelled".to_owned();
+    };
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "the test panicked".to_owned())
+}
+
+async fn trading<B, F>(item: &str, body: B)
+where
+    B: FnOnce(Desk) -> F,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let _guard = LIVE.lock().await;
+    let (open, account) = reader()
+        .await
+        .expect("the demo account of the FIX sessions");
+    let list = open
+        .symbols(SymbolsParams::new(account))
+        .await
+        .expect("symbols");
+    let traded = list
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name.as_deref() == Some(TRADED))
+        .unwrap_or_else(|| panic!("the demo account lists no symbol named {TRADED}"))
+        .id;
+    let symbol = open
+        .symbol_details(account, &[traded])
+        .await
+        .expect("symbol details")
+        .pop()
+        .expect("details of the traded symbol");
+    let desk = Desk {
+        open,
+        account,
+        symbol,
+        label: format!("{item}-{}", Timestamp::now().as_millis()),
+    };
+    let outcome = tokio::spawn(body(desk.clone())).await;
+    desk.open.shutdown().await;
+    let swept = sweep(&desk.label).await;
+    match (outcome, swept) {
+        (Ok(()), swept) => assert_eq!(swept, Ok(()), "the test left orders or positions behind"),
+        (Err(failure), Ok(())) => panic!("{}", panic_text(failure)),
+        (Err(failure), Err(left)) => panic!(
+            "{}; and the sweep after the failure did not leave the account clean: {left}",
+            panic_text(failure)
+        ),
+    }
+}
+
 #[tokio::test]
 async fn live_security_list_matches_the_symbols_of_the_same_account() {
     let _guard = LIVE.lock().await;
@@ -180,4 +357,193 @@ async fn live_security_list_matches_the_symbols_of_the_same_account() {
         traded.digits
     );
     assert_eq!(found, expected);
+}
+
+async fn bid(symbol: SymbolId) -> Price {
+    let quote = session(SessionKind::Quote).await;
+    let spots = timeout(STEP, quote.subscribe_spot(symbol))
+        .await
+        .expect("prices in time")
+        .expect("spot subscription");
+    let bid = spots.last().bid.expect("bid");
+    spots.unsubscribe().await.expect("end of subscription");
+    leave(&quote).await;
+    bid
+}
+
+fn scaled(price: Price, by: Decimal) -> Price {
+    Price::new((price.value() * by).round_dp(0)).expect("price")
+}
+
+fn whole_seconds_from_now(seconds: i64) -> Timestamp {
+    let second = Timestamp::now().as_millis() / 1_000 + seconds;
+    Timestamp::from_millis(second * 1_000).expect("moment")
+}
+
+async fn places_waiting_orders(desk: &Desk, trade: &FixClient, bid: Price) -> [OrderId; 2] {
+    let symbol = desk.symbol.id;
+    let quantity = desk
+        .symbol
+        .min_volume
+        .expect("the traded symbol states its smallest volume");
+    let below = scaled(bid, Decimal::new(5, 1));
+    let limit = timeout(
+        STEP,
+        trade.place(NewOrder::limit(symbol, Side::Buy, quantity, below).label(&desk.label)),
+    )
+    .await
+    .expect("report in time")
+    .expect("limit order");
+    assert_eq!(
+        (limit.exec_type, limit.status),
+        (ExecType::New, OrderStatus::New)
+    );
+    assert_eq!(
+        (limit.symbol, limit.side, limit.quantity),
+        (symbol, Side::Buy, quantity)
+    );
+    assert_eq!(
+        (limit.kind, limit.price),
+        (Some(OrderKind::Limit), Some(below))
+    );
+    assert_eq!(limit.label.as_deref(), Some(desk.label.as_str()));
+
+    let above = scaled(bid, Decimal::TWO);
+    let expiry = whole_seconds_from_now(3_600);
+    let stop = timeout(
+        STEP,
+        trade.place(
+            NewOrder::stop(symbol, Side::Buy, quantity, above)
+                .label(&desk.label)
+                .expires(expiry),
+        ),
+    )
+    .await
+    .expect("report in time")
+    .expect("stop order");
+    assert_eq!(
+        (stop.exec_type, stop.status),
+        (ExecType::New, OrderStatus::New)
+    );
+    assert_eq!(
+        (stop.kind, stop.stop_price),
+        (Some(OrderKind::Stop), Some(above))
+    );
+    assert_eq!(stop.expiry, Some(expiry));
+
+    let (positions, orders) = desk.own().await;
+    assert!(positions.is_empty(), "{positions:?}");
+    assert_eq!(orders.len(), 2, "{orders:?}");
+    let read = |id| {
+        orders
+            .iter()
+            .find(|order| order.id == id)
+            .expect("the order is listed")
+    };
+    let waiting = read(limit.order_id);
+    assert_eq!((waiting.symbol, waiting.side), (symbol, TradeSide::Buy));
+    assert_eq!((waiting.kind, waiting.volume), (OrderType::Limit, quantity));
+    assert_eq!(waiting.limit_price, Some(below));
+    let stopped = read(stop.order_id);
+    assert_eq!((stopped.symbol, stopped.side), (symbol, TradeSide::Buy));
+    assert_eq!((stopped.kind, stopped.volume), (OrderType::Stop, quantity));
+    assert_eq!(stopped.stop_price, Some(above));
+    assert_eq!(stopped.time_in_force, TimeInForce::GoodTillDate(expiry));
+    println!(
+        "live FIX orders: quantity {quantity} of {TRADED} (lot size {:?}) sent as OrderQty and read back as volume {} and {}; limit {} at {below} and stop {} at {above} until {} are listed by reconcile with the same side, kind, volume and price",
+        desk.symbol.lot_size.map(|lot| lot.to_string()),
+        waiting.volume,
+        stopped.volume,
+        limit.order_id,
+        stop.order_id,
+        expiry.as_millis()
+    );
+
+    [limit.order_id, stop.order_id]
+}
+
+async fn fills_and_closes_a_position(desk: &Desk, trade: &FixClient) {
+    let symbol = desk.symbol.id;
+    let quantity = desk
+        .symbol
+        .min_volume
+        .expect("the traded symbol states its smallest volume");
+    let bought = timeout(
+        STEP,
+        trade.place(NewOrder::market(symbol, Side::Buy, quantity).label(&desk.label)),
+    )
+    .await
+    .expect("report in time")
+    .expect("market order");
+    assert_eq!(
+        (bought.exec_type, bought.status),
+        (ExecType::Trade, OrderStatus::Filled)
+    );
+    assert_eq!(
+        (bought.kind, bought.side),
+        (Some(OrderKind::Market), Side::Buy)
+    );
+    assert_eq!(
+        (bought.filled, bought.last_quantity),
+        (Some(quantity), Some(quantity))
+    );
+    let opened = bought.position.expect("position of the fill");
+    let (positions, _) = desk.own().await;
+    assert_eq!(positions.len(), 1, "{positions:?}");
+    let held = positions.first().expect("position");
+    assert_eq!((held.id, held.symbol), (opened, symbol));
+    assert_eq!((held.side, held.volume), (TradeSide::Buy, quantity));
+    assert_eq!(held.price, bought.average_price);
+
+    let sold = timeout(
+        STEP,
+        trade.place(
+            NewOrder::market(symbol, Side::Sell, quantity)
+                .label(&desk.label)
+                .position(opened),
+        ),
+    )
+    .await
+    .expect("report in time")
+    .expect("closing order");
+    assert_eq!(
+        (sold.exec_type, sold.status),
+        (ExecType::Trade, OrderStatus::Filled)
+    );
+    assert_eq!(sold.position, Some(opened));
+    let (positions, orders) = desk.own().await;
+    assert!(positions.is_empty(), "{positions:?}");
+    assert_eq!(orders.len(), 2, "{orders:?}");
+    println!(
+        "live FIX market order: order {} filled {quantity} at {:?} and opened position {opened}, read back as a buy position of volume {} at {:?}; order {} sold it at {:?} and reconcile lists the position no longer",
+        bought.order_id,
+        bought.average_price.map(|price| price.to_string()),
+        held.volume,
+        held.price.map(|price| price.to_string()),
+        sold.order_id,
+        sold.average_price.map(|price| price.to_string())
+    );
+}
+
+#[tokio::test]
+async fn live_orders_placed_over_fix_are_read_back_through_the_open_api() {
+    trading("fix33", |desk| async move {
+        let bid = bid(desk.symbol.id).await;
+        let trade = session(SessionKind::Trade).await;
+        let waiting = places_waiting_orders(&desk, &trade, bid).await;
+        fills_and_closes_a_position(&desk, &trade).await;
+        for order in waiting {
+            desk.open
+                .cancel_order(desk.account, order)
+                .await
+                .expect("cancellation");
+        }
+        let (positions, orders) = desk.own().await;
+        assert!(
+            positions.is_empty() && orders.is_empty(),
+            "{positions:?} {orders:?}"
+        );
+        leave(&trade).await;
+    })
+    .await;
 }

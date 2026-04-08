@@ -609,6 +609,16 @@ pub enum FixError {
         /// Explanation the server gave.
         text: Option<String>,
     },
+    /// The server took an order and then refused, cancelled or expired it.
+    #[error("the server refused the order: {}", explained(text.as_deref()))]
+    OrderRejected {
+        /// Identifier the client gave the order.
+        cl_ord_id: Option<String>,
+        /// Reason code of the server.
+        reason: Option<u32>,
+        /// Explanation the server gave.
+        text: Option<String>,
+    },
 }
 
 fn explained(text: Option<&str>) -> &str {
