@@ -4,19 +4,34 @@
 //! receives, keeps the session alive with heartbeats and test requests, and hands every
 //! message received to the readers of its events. Commands reach it over a channel, so the
 //! socket has a single owner and a single writer.
+//!
+//! Sequence numbers: a message of the server that arrives ahead of its turn is set aside and
+//! the missing ones are asked for again with a resend request; the session goes on once the
+//! server has repeated them or has skipped them with a sequence reset. When the server asks
+//! for messages again, the task answers with a sequence reset that skips them all: no
+//! message, and above all no order, is ever sent twice. [`Event::Skipped`] names the range.
+//!
+//! Reconnection: when the connection is lost the task reports [`Event::Disconnected`], then
+//! connects and logs on again, a handful of times at most, and reports
+//! [`Event::Reconnected`]. Both sides count from one again after every logon, so no gap
+//! outlives a connection. Nothing sent over the lost connection is sent again, and the
+//! server has forgotten its subscriptions. When no attempt succeeds the task reports
+//! [`Event::Ended`] and the session is over.
 
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
 
 use crate::common::config::ConfigurationFix;
 use crate::common::errors::{ConnectorError, FixError, TransportError};
 use crate::common::time::Timestamp;
 use crate::common::transport::Connect;
 use crate::fix::codec::{Frame, Header, decode, encode};
-use crate::fix::messages::{Heartbeat, Logon, Logout, Message, TestRequest};
+use crate::fix::messages::{
+    Heartbeat, Logon, Logout, Message, ResendRequest, SequenceReset, TestRequest,
+};
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 4096;
@@ -24,6 +39,8 @@ const READ_CHUNK: usize = 8 * 1024;
 const SHORTEST_TICK: Duration = Duration::from_millis(20);
 const LONGEST_TICK: Duration = Duration::from_secs(1);
 const PROBE: &str = "alive";
+const RECONNECT_ATTEMPTS: u32 = 5;
+const EVERY_LATER_MESSAGE: u64 = 0;
 
 /// Which of the two sessions of an account a connection serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,8 +86,37 @@ pub enum Event {
         /// Explanation the server gave.
         text: Option<String>,
     },
-    /// The connection was lost.
+    /// The connection was lost; the session tries to connect again.
     Disconnected(TransportError),
+    /// An attempt to connect again failed.
+    ReconnectFailed {
+        /// Number of the attempt, from one.
+        attempt: u32,
+        /// What failed.
+        error: ConnectorError,
+    },
+    /// The session is logged on again over a new connection. Both sides count from one
+    /// again, and the server has forgotten the subscriptions of the lost connection.
+    Reconnected {
+        /// Number of the attempt that succeeded, from one.
+        attempt: u32,
+    },
+    /// The session gave up connecting again and is over.
+    Ended,
+    /// Messages of the server are missing and were asked for again.
+    Gap {
+        /// Sequence number that was expected.
+        expected: u64,
+        /// Sequence number that arrived.
+        received: u64,
+    },
+    /// The server asked for messages again and was told to skip them; none is sent twice.
+    Skipped {
+        /// First sequence number skipped.
+        from: u64,
+        /// Last sequence number skipped.
+        to: u64,
+    },
 }
 
 pub(crate) enum Command {
@@ -81,12 +127,22 @@ pub(crate) enum Command {
     Logout {
         reply: oneshot::Sender<Result<(), ConnectorError>>,
     },
+    Reconnect {
+        reply: oneshot::Sender<Result<(), ConnectorError>>,
+    },
 }
 
 pub(crate) struct Started {
     pub(crate) commands: mpsc::Sender<Command>,
     pub(crate) events: broadcast::Sender<Event>,
     pub(crate) closed: watch::Receiver<bool>,
+}
+
+enum Order {
+    InTurn,
+    Repeated,
+    Behind,
+    Ahead,
 }
 
 enum End {
@@ -103,6 +159,7 @@ struct Live<S> {
     last_sent: Instant,
     last_received: Instant,
     probed: bool,
+    awaited: Option<(u64, Instant)>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Live<S> {
@@ -116,6 +173,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Live<S> {
             last_sent: now,
             last_received: now,
             probed: false,
+            awaited: None,
+        }
+    }
+
+    fn advance(&mut self, next_in: u64) {
+        self.next_in = next_in;
+        if self.awaited.is_some_and(|(last, _)| last < next_in) {
+            self.awaited = None;
         }
     }
 
@@ -146,7 +211,6 @@ struct Actor<C: Connect> {
     connector: C,
     configuration: ConfigurationFix,
     kind: SessionKind,
-    commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,
     closed: watch::Sender<bool>,
 }
@@ -162,8 +226,20 @@ impl<C: Connect> Actor<C> {
         message: &Message,
     ) -> Result<u64, ConnectorError> {
         let seq = live.next_out;
+        self.write(live, seq, false, message).await?;
+        live.next_out = seq.saturating_add(1);
+        Ok(seq)
+    }
+
+    async fn write(
+        &self,
+        live: &mut Live<C::Stream>,
+        seq: u64,
+        repeated: bool,
+        message: &Message,
+    ) -> Result<(), ConnectorError> {
         let qualifier = self.kind.as_str();
-        let header = Header::new(
+        let mut header = Header::new(
             "",
             self.configuration.sender_comp_id(),
             self.configuration.target_comp_id(),
@@ -171,6 +247,10 @@ impl<C: Connect> Actor<C> {
             Timestamp::now(),
         )
         .qualified(qualifier, qualifier);
+        if repeated {
+            header.poss_dup = true;
+            header.orig_sending_time = Some(header.sending_time);
+        }
         let bytes = encode(&message.to_frame(header))?;
         let limit = self.configuration.timeout();
         let written = timeout(limit, async {
@@ -182,9 +262,8 @@ impl<C: Connect> Actor<C> {
             Err(_) => Err(TransportError::WriteTimeout(limit).into()),
             Ok(Err(error)) => Err(TransportError::from(error).into()),
             Ok(Ok(())) => {
-                live.next_out = seq.saturating_add(1);
                 live.last_sent = Instant::now();
-                Ok(seq)
+                Ok(())
             }
         }
     }
@@ -254,18 +333,88 @@ impl<C: Connect> Actor<C> {
         }
     }
 
+    async fn ask_again(&self, live: &mut Live<C::Stream>, received: u64) -> Option<End> {
+        if let Some((last, since)) = live.awaited {
+            live.awaited = Some((last.max(received), since));
+            return None;
+        }
+        let expected = live.next_in;
+        self.emit(Event::Gap { expected, received });
+        live.awaited = Some((received, Instant::now()));
+        let request = ResendRequest {
+            begin_seq_no: expected,
+            end_seq_no: EVERY_LATER_MESSAGE,
+        };
+        match self.transmit(live, &request.into()).await {
+            Err(ConnectorError::Transport(error)) => Some(End::Lost(error)),
+            _ => None,
+        }
+    }
+
+    async fn skip(&self, live: &mut Live<C::Stream>, from: u64) -> Option<End> {
+        let to = live.next_out.checked_sub(1).filter(|to| *to >= from)?;
+        let reset = SequenceReset {
+            gap_fill: Some(true),
+            new_seq_no: live.next_out,
+        };
+        let written = self.write(live, from, true, &reset.into()).await;
+        self.emit(Event::Skipped { from, to });
+        match written {
+            Err(ConnectorError::Transport(error)) => Some(End::Lost(error)),
+            _ => None,
+        }
+    }
+
+    fn sequence(live: &mut Live<C::Stream>, frame: &Frame, message: Option<&Message>) -> Order {
+        let seq = frame.header.seq;
+        if let Some(Message::SequenceReset(reset)) = message {
+            if reset.gap_fill != Some(true) {
+                live.advance(reset.new_seq_no.max(live.next_in));
+                return Order::InTurn;
+            }
+        }
+        if seq < live.next_in {
+            return if frame.header.poss_dup {
+                Order::Repeated
+            } else {
+                Order::Behind
+            };
+        }
+        if seq > live.next_in {
+            return Order::Ahead;
+        }
+        let next = seq.saturating_add(1);
+        match message {
+            Some(Message::SequenceReset(reset)) => live.advance(reset.new_seq_no.max(next)),
+            _ => live.advance(next),
+        }
+        Order::InTurn
+    }
+
     async fn accept(&self, live: &mut Live<C::Stream>, frame: Frame) -> Option<End> {
         live.last_received = Instant::now();
         live.probed = false;
         let seq = frame.header.seq;
-        if seq < live.next_in && !frame.header.poss_dup {
-            return Some(End::Lost(TransportError::Decode(format!(
-                "sequence number {seq} is below the expected {}",
-                live.next_in
-            ))));
+        let parsed = Message::from_frame(&frame);
+        match Self::sequence(live, &frame, parsed.as_ref().ok()) {
+            Order::InTurn => {}
+            Order::Repeated => return None,
+            Order::Behind => {
+                return Some(End::Lost(TransportError::Decode(format!(
+                    "sequence number {seq} is below the expected {}",
+                    live.next_in
+                ))));
+            }
+            Order::Ahead => {
+                let asked = self.ask_again(live, seq).await;
+                if asked.is_some()
+                    || !matches!(parsed, Ok(Message::Logout(_) | Message::ResendRequest(_)))
+                {
+                    return asked;
+                }
+            }
         }
-        live.next_in = live.next_in.max(seq.saturating_add(1));
-        let message = match Message::from_frame(&frame) {
+        let message = match parsed {
             Ok(message) => message,
             Err(error) => {
                 self.emit(Event::Unparsed(error));
@@ -283,11 +432,18 @@ impl<C: Connect> Actor<C> {
             Message::Logout(logout) => Some(logout.text.clone()),
             _ => None,
         };
+        let asked_from = match &message {
+            Message::ResendRequest(request) => Some(request.begin_seq_no),
+            _ => None,
+        };
         self.emit(Event::Message(Inbound {
             seq,
             poss_dup: frame.header.poss_dup,
             message,
         }));
+        if let Some(from) = asked_from {
+            return self.skip(live, from).await;
+        }
         if let Some(answer) = answer {
             match self.transmit(live, &answer).await {
                 Err(ConnectorError::Transport(error)) if logged_out.is_none() => {
@@ -306,6 +462,15 @@ impl<C: Connect> Actor<C> {
         let limit = heartbeat.saturating_mul(5) / 2;
         if silent >= limit {
             return Some(End::Lost(TransportError::Idle(limit)));
+        }
+        let patience = self.configuration.timeout();
+        if let Some((_, since)) = live.awaited {
+            if now.saturating_duration_since(since) >= patience {
+                return Some(End::Lost(TransportError::Decode(format!(
+                    "the messages from {} on were not sent again",
+                    live.next_in
+                ))));
+            }
         }
         let message = if silent >= heartbeat.saturating_mul(3) / 2 && !live.probed {
             live.probed = true;
@@ -334,6 +499,10 @@ impl<C: Connect> Actor<C> {
                 let _ = reply.send(self.leave(live).await);
                 Some(End::Shutdown)
             }
+            Some(Command::Reconnect { reply }) => {
+                let _ = reply.send(Ok(()));
+                Some(End::Lost(TransportError::Closed))
+            }
             Some(Command::Send { message, reply }) => {
                 let result = self.transmit(live, &message).await;
                 let lost = match &result {
@@ -346,13 +515,17 @@ impl<C: Connect> Actor<C> {
         }
     }
 
-    async fn serve(&mut self, live: &mut Live<C::Stream>) -> End {
+    async fn serve(
+        &self,
+        live: &mut Live<C::Stream>,
+        commands: &mut mpsc::Receiver<Command>,
+    ) -> End {
         let period = (self.configuration.heartbeat() / 4).clamp(SHORTEST_TICK, LONGEST_TICK);
         let mut ticker = interval(period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             let end = tokio::select! {
-                command = self.commands.recv() => self.command(live, command).await,
+                command = commands.recv() => self.command(live, command).await,
                 received = live.receive() => match received {
                     Err(error) => Some(End::Lost(error)),
                     Ok(Err(error)) => {
@@ -369,16 +542,68 @@ impl<C: Connect> Actor<C> {
         }
     }
 
-    async fn run(mut self, mut live: Live<C::Stream>) {
-        match self.serve(&mut live).await {
-            End::Shutdown => {}
-            End::LoggedOut(text) => {
-                live.close().await;
-                self.emit(Event::LoggedOut { text });
+    async fn recover(&self, commands: &mut mpsc::Receiver<Command>) -> Option<Live<C::Stream>> {
+        for attempt in 1..=RECONNECT_ATTEMPTS {
+            let pause = self.configuration.reconnect_delay().saturating_mul(attempt);
+            let attempted = async {
+                sleep(pause).await;
+                self.establish().await
+            };
+            tokio::pin!(attempted);
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut attempted => break outcome,
+                    command = commands.recv() => match command {
+                        None => return None,
+                        Some(Command::Logout { reply }) => {
+                            let _ = reply.send(Ok(()));
+                            return None;
+                        }
+                        Some(Command::Reconnect { reply }) => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        Some(Command::Send { reply, .. }) => {
+                            let _ = reply.send(Err(ConnectorError::Closed));
+                        }
+                    },
+                }
+            };
+            match outcome {
+                Ok(live) => {
+                    self.emit(Event::Reconnected { attempt });
+                    return Some(live);
+                }
+                Err(error) => {
+                    let refused =
+                        matches!(error, ConnectorError::Fix(FixError::LogonRefused { .. }));
+                    self.emit(Event::ReconnectFailed { attempt, error });
+                    if refused {
+                        break;
+                    }
+                }
             }
-            End::Lost(error) => {
-                live.close().await;
-                self.emit(Event::Disconnected(error));
+        }
+        self.emit(Event::Ended);
+        None
+    }
+
+    async fn run(self, mut live: Live<C::Stream>, mut commands: mpsc::Receiver<Command>) {
+        loop {
+            match self.serve(&mut live, &mut commands).await {
+                End::Shutdown => break,
+                End::LoggedOut(text) => {
+                    live.close().await;
+                    self.emit(Event::LoggedOut { text });
+                    break;
+                }
+                End::Lost(error) => {
+                    live.close().await;
+                    self.emit(Event::Disconnected(error));
+                    match self.recover(&mut commands).await {
+                        Some(fresh) => live = fresh,
+                        None => break,
+                    }
+                }
             }
         }
         let _ = self.closed.send(true);
@@ -398,12 +623,11 @@ pub(crate) async fn start<C: Connect>(
         connector,
         configuration,
         kind,
-        commands: receiver,
         events: events.clone(),
         closed,
     };
     let live = actor.establish().await?;
-    tokio::spawn(actor.run(live));
+    tokio::spawn(actor.run(live, receiver));
     Ok(Started {
         commands,
         events,

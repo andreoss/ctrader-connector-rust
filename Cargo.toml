@@ -63,6 +63,10 @@ name = "fix_amend_mock"
 required-features = ["fix"]
 
 [[test]]
+name = "fix_recovery_mock"
+required-features = ["fix"]
+
+[[test]]
 name = "fix_reports_mock"
 required-features = ["fix"]
 

@@ -325,7 +325,7 @@ async fn streams_end_typed_when_the_session_ends_or_the_reader_falls_behind() {
     })
     .await
     .expect("in time");
-    assert_eq!(ended, ConnectorError::Transport(TransportError::Closed));
+    assert!(matches!(ended, ConnectorError::Transport(_)), "{ended:?}");
     assert_eq!(stream.unsubscribe().await, Err(ConnectorError::Closed));
 
     let (client, mut peer) = session(SessionKind::Quote).await;
@@ -344,6 +344,7 @@ async fn streams_end_typed_when_the_session_ends_or_the_reader_falls_behind() {
         timeout(STEP, stream.next()).await.expect("in time").err(),
         Some(ConnectorError::Transport(TransportError::Closed))
     );
+    assert_eq!(stream.next().await.err(), Some(ConnectorError::Closed));
 }
 
 #[test]

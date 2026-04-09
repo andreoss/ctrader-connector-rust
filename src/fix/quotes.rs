@@ -7,6 +7,10 @@
 //! mix. It sends the best prices as full snapshots, and the depth as an empty snapshot
 //! followed by changes.
 //!
+//! A stream outlives a lost connection: it reports the loss once as an error, and when the
+//! session is logged on again it subscribes anew, since the server has forgotten the
+//! subscription. The depth then starts over from an empty book.
+//!
 //! ```no_run
 //! use ctrader_connector::common::config::ConfigurationFix;
 //! use ctrader_connector::common::ids::SymbolId;
@@ -188,6 +192,7 @@ struct Feed {
     symbol: SymbolId,
     depth: MarketDepth,
     seq: u64,
+    ended: bool,
 }
 
 impl Feed {
@@ -214,6 +219,7 @@ impl Feed {
             symbol,
             depth,
             seq: 0,
+            ended: false,
         };
         feed.seq = client.send(feed.request(true)).await?;
         Ok(feed)
@@ -224,12 +230,20 @@ impl Feed {
     }
 
     async fn step(&mut self) -> Result<Step, ConnectorError> {
+        if self.ended {
+            return Err(ConnectorError::Closed);
+        }
         loop {
             let inbound = match self.events.recv().await {
                 Ok(Event::Message(inbound)) => inbound,
                 Ok(Event::Disconnected(error)) => return Err(error.into()),
-                Ok(Event::LoggedOut { .. }) | Err(RecvError::Closed) => {
+                Ok(Event::LoggedOut { .. } | Event::Ended) | Err(RecvError::Closed) => {
+                    self.ended = true;
                     return Err(TransportError::Closed.into());
+                }
+                Ok(Event::Reconnected { .. }) => {
+                    self.seq = self.client.send(self.request(true)).await?;
+                    continue;
                 }
                 Ok(_) => continue,
                 Err(RecvError::Lagged(skipped)) => {
@@ -338,7 +352,9 @@ impl SpotStream {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectorError::Transport`] when the session ends,
+    /// Returns [`ConnectorError::Transport`] when the connection is lost, after which the
+    /// stream goes on once the session is logged on again, or when the session ends,
+    /// [`ConnectorError::Closed`] when it has ended before,
     /// [`ConnectorError::Lagged`] when the reader fell behind and reports were skipped, and
     /// [`ConnectorError::Fix`] when the server refuses the subscription.
     pub async fn next(&mut self) -> Result<SpotQuote, ConnectorError> {
@@ -399,7 +415,9 @@ impl DepthStream {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectorError::Transport`] when the session ends,
+    /// Returns [`ConnectorError::Transport`] when the connection is lost, after which the
+    /// stream goes on from an empty book once the session is logged on again, or when the
+    /// session ends, [`ConnectorError::Closed`] when it has ended before,
     /// [`ConnectorError::Lagged`] when the reader fell behind, and [`ConnectorError::Fix`]
     /// when the server refuses the subscription. After changes were skipped the book is no
     /// longer that of the server; the subscription has to be opened anew.

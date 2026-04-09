@@ -245,3 +245,83 @@ async fn live_depth_fills_a_book_by_changes_until_unsubscribed() {
     assert_eq!(late, 0);
     leave(&client).await;
 }
+
+async fn reconnected(client: &FixClient) -> Vec<Event> {
+    let mut events = client.events();
+    client.force_reconnect().await.expect("forced disconnect");
+    let mut seen = Vec::new();
+    loop {
+        let event = timeout(STEP, events.recv())
+            .await
+            .expect("an event in time")
+            .expect("event");
+        let done = matches!(event, Event::Reconnected { .. });
+        seen.push(event);
+        if done {
+            return seen;
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_forced_disconnect_recovers_the_numbering_and_the_spot_subscription() {
+    let _guard = LIVE.lock().await;
+    let client = session(SessionKind::Quote).await;
+    let symbol = symbol_named(&client, QUOTED).await;
+    let mut spots = timeout(STEP, client.subscribe_spot(symbol))
+        .await
+        .expect("first prices in time")
+        .expect("spot subscription");
+    let seen = reconnected(&client).await;
+    assert!(
+        matches!(seen.first(), Some(Event::Disconnected(_))),
+        "{seen:?}"
+    );
+    assert_eq!(seen.last(), Some(&Event::Reconnected { attempt: 1 }));
+    let mut events = client.events();
+    let lost = spots.next().await;
+    assert!(
+        matches!(lost, Err(ConnectorError::Transport(_))),
+        "{lost:?}"
+    );
+    let quote = timeout(Duration::from_secs(60), spots.next())
+        .await
+        .unwrap_or_else(|_| panic!("{QUOTED} sent no prices in 60 s after the reconnection"))
+        .expect("prices after the reconnection");
+    assert_eq!(quote.symbol, symbol);
+    assert_eq!(symbol_named(&client, QUOTED).await, symbol);
+    let mut numbers = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            Event::Message(inbound) => numbers.push(inbound.seq),
+            other => panic!("unexpected event after the reconnection: {other:?}"),
+        }
+    }
+    assert_eq!(numbers.first(), Some(&2), "{numbers:?}");
+    assert!(
+        numbers
+            .windows(2)
+            .all(|pair| matches!(pair, [a, b] if a + 1 == *b)),
+        "{numbers:?}"
+    );
+    spots.unsubscribe().await.expect("end of subscription");
+    leave(&client).await;
+
+    let trade = session(SessionKind::Trade).await;
+    let again = reconnected(&trade).await;
+    assert_eq!(again.last(), Some(&Event::Reconnected { attempt: 1 }));
+    let positions = timeout(STEP, trade.positions())
+        .await
+        .expect("positions in time")
+        .expect("positions after the reconnection");
+    leave(&trade).await;
+    println!(
+        "live FIX reconnection: quote session lost with {:?} and logged on again at attempt 1; the spot stream reported the loss once and then {:?}/{:?}; messages {:?}..={:?} followed without a gap; trade session reconnected likewise and listed {} positions",
+        seen.first(),
+        quote.bid.map(|price| price.to_string()),
+        quote.offer.map(|price| price.to_string()),
+        numbers.first(),
+        numbers.last(),
+        positions.len()
+    );
+}

@@ -110,7 +110,8 @@ impl FixClient {
     ///
     /// Returns [`ConnectorError::Fix`] when the message cannot be encoded,
     /// [`ConnectorError::Transport`] when the write fails, and [`ConnectorError::Closed`]
-    /// when the session has ended.
+    /// when the session has ended or is between two connections; the message was not sent
+    /// then.
     pub async fn send(&self, message: Message) -> Result<u64, ConnectorError> {
         let (reply, answer) = oneshot::channel();
         self.commands
@@ -137,6 +138,20 @@ impl FixClient {
         answer.await.map_err(|_| ConnectorError::Closed)?
     }
 
+    /// Drops the connection on this side, which starts a reconnection as a loss would.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Closed`] when the session has ended.
+    pub async fn force_reconnect(&self) -> Result<(), ConnectorError> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Reconnect { reply })
+            .await
+            .map_err(|_| ConnectorError::Closed)?;
+        answer.await.map_err(|_| ConnectorError::Closed)?
+    }
+
     /// Waits until the session has ended.
     pub async fn closed(&self) {
         let mut closed = self.closed.clone();
@@ -154,7 +169,9 @@ impl FixClient {
     /// Returns [`ConnectorError::Fix`] with [`FixError::Rejected`] or
     /// [`FixError::BusinessRejected`] when the server refuses the request,
     /// [`ConnectorError::Timeout`] when no answer arrives in time,
-    /// [`ConnectorError::Transport`] when the session ends first,
+    /// [`ConnectorError::OutcomeUnknown`] when the server asks for the request again, which
+    /// the library never sends twice,
+    /// [`ConnectorError::Transport`] when the connection is lost first,
     /// [`ConnectorError::Lagged`] when the reader fell behind and the answer may have been
     /// skipped, and [`ConnectorError::Closed`] when the session has ended already.
     pub async fn request<T>(
@@ -206,6 +223,7 @@ impl FixClient {
             (true, interruption) => ConnectorError::OutcomeUnknown(interruption),
             (false, Interruption::Timeout(limit)) => ConnectorError::Timeout(limit),
             (false, Interruption::Transport(error)) => ConnectorError::Transport(error),
+            (false, Interruption::Skipped) => ConnectorError::OutcomeUnknown(Interruption::Skipped),
         };
         let mut events = self.events.subscribe();
         let seq = match self.send(message).await {
@@ -222,8 +240,11 @@ impl FixClient {
                     Ok(Event::Disconnected(error)) => {
                         return Err(interrupted(Interruption::Transport(error)));
                     }
-                    Ok(Event::LoggedOut { .. }) | Err(RecvError::Closed) => {
+                    Ok(Event::LoggedOut { .. } | Event::Ended) | Err(RecvError::Closed) => {
                         return Err(interrupted(Interruption::Transport(TransportError::Closed)));
+                    }
+                    Ok(Event::Skipped { from, to }) if (from..=to).contains(&seq) => {
+                        return Err(ConnectorError::OutcomeUnknown(Interruption::Skipped));
                     }
                     Ok(_) => continue,
                     Err(RecvError::Lagged(skipped)) => {

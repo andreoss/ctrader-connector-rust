@@ -421,6 +421,7 @@ impl Outbound {
             match by {
                 Interruption::Timeout(limit) => ConnectorError::Timeout(limit),
                 Interruption::Transport(reason) => ConnectorError::Transport(reason),
+                Interruption::Skipped => ConnectorError::OutcomeUnknown(by),
             }
         }
     }

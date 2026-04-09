@@ -467,6 +467,10 @@ pub enum Interruption {
     /// The connection failed while the answer was awaited.
     #[error("transport failed: {0}")]
     Transport(TransportError),
+    /// The server asked for the request again and was told to skip it, because no request
+    /// is sent twice.
+    #[error("the server asked for the request again and it was not repeated")]
+    Skipped,
 }
 
 /// What ended the authorisation of a session.
