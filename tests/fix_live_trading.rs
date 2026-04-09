@@ -627,3 +627,98 @@ async fn live_replace_and_cancel_over_fix_are_read_back_through_the_open_api() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn live_reports_of_orders_and_positions_match_what_the_test_created() {
+    trading("fix35", |desk| async move {
+        let symbol = desk.symbol.id;
+        let quantity = desk
+            .symbol
+            .min_volume
+            .expect("the traded symbol states its smallest volume");
+        let bid = bid(symbol).await;
+        let trade = session(SessionKind::Trade).await;
+        let below = scaled(bid, Decimal::new(5, 1));
+        let place = |order: NewOrder| async {
+            timeout(STEP, trade.place(order.label(&desk.label)))
+                .await
+                .expect("report in time")
+                .expect("order")
+        };
+        let limit = place(NewOrder::limit(symbol, Side::Buy, quantity, below)).await;
+        let stop = place(NewOrder::stop(symbol, Side::Sell, quantity, below)).await;
+        let bought = place(NewOrder::market(symbol, Side::Buy, quantity)).await;
+        let opened = bought.position.expect("position of the fill");
+
+        let listed = timeout(STEP, trade.open_orders())
+            .await
+            .expect("orders in time")
+            .expect("orders");
+        let own: Vec<_> = listed
+            .iter()
+            .filter(|order| [limit.order_id, stop.order_id].contains(&order.order_id))
+            .collect();
+        assert_eq!(own.len(), 2, "{listed:?}");
+        for (placed, kind) in [(&limit, OrderKind::Limit), (&stop, OrderKind::Stop)] {
+            let report = own
+                .iter()
+                .find(|order| order.order_id == placed.order_id)
+                .expect("the order is listed");
+            assert_eq!(report.exec_type, ExecType::OrderStatus);
+            assert_eq!((report.symbol, report.side), (symbol, placed.side));
+            assert_eq!((report.quantity, report.kind), (quantity, Some(kind)));
+            assert_eq!((report.price, report.stop_price), (placed.price, placed.stop_price));
+        }
+
+        let status = timeout(STEP, trade.order_status(&limit.cl_ord_id))
+            .await
+            .expect("status in time")
+            .expect("status");
+        assert_eq!((status.order_id, status.status), (limit.order_id, OrderStatus::New));
+        assert_eq!((status.side, status.quantity), (Side::Buy, quantity));
+        assert_eq!((status.kind, status.price), (Some(OrderKind::Limit), Some(below)));
+
+        let held = timeout(STEP, trade.positions())
+            .await
+            .expect("positions in time")
+            .expect("positions");
+        let position = held
+            .iter()
+            .find(|position| position.id == opened)
+            .unwrap_or_else(|| panic!("position {opened} is not among {held:?}"));
+        assert_eq!((position.symbol, position.side), (symbol, Side::Buy));
+        assert_eq!(position.quantity, quantity);
+        assert_eq!(position.entry_price, bought.average_price);
+
+        let (positions, orders) = desk.own().await;
+        assert_eq!((positions.len(), orders.len()), (1, 2), "{positions:?} {orders:?}");
+        println!(
+            "live FIX reports: mass status listed {} orders, among them limit {} and stop {} with side, kind, quantity and price as placed; status of {} is {:?}; positions listed {} with position {opened} bought {} at {:?}; reconcile lists the same 2 orders and 1 position",
+            listed.len(),
+            limit.order_id,
+            stop.order_id,
+            limit.cl_ord_id,
+            status.status,
+            held.len(),
+            position.quantity,
+            position.entry_price.map(|price| price.to_string())
+        );
+
+        place(NewOrder::market(symbol, Side::Sell, quantity).position(opened)).await;
+        for order in [&limit, &stop] {
+            timeout(STEP, trade.cancel(&order.cl_ord_id))
+                .await
+                .expect("report in time")
+                .expect("cancellation");
+        }
+        let none = timeout(STEP, trade.positions())
+            .await
+            .expect("positions in time")
+            .expect("positions");
+        assert!(none.iter().all(|position| position.id != opened), "{none:?}");
+        let (positions, orders) = desk.own().await;
+        assert!(positions.is_empty() && orders.is_empty(), "{positions:?} {orders:?}");
+        leave(&trade).await;
+    })
+    .await;
+}

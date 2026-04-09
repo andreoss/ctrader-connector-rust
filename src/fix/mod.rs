@@ -9,6 +9,7 @@ pub mod client;
 pub mod codec;
 pub mod messages;
 pub mod quotes;
+pub mod reports;
 pub mod securities;
 pub mod session;
 pub mod trading;
