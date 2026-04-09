@@ -4,6 +4,7 @@
 //! stream. [`messages`] gives every supported message a type. [`session`] keeps one logged-on
 //! session alive, and [`client`] is the handle through which a program uses it.
 
+pub mod amend;
 pub mod client;
 pub mod codec;
 pub mod messages;

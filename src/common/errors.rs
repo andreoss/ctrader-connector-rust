@@ -619,6 +619,27 @@ pub enum FixError {
         /// Explanation the server gave.
         text: Option<String>,
     },
+    /// The server refused to cancel or to replace an order, which stays as it was.
+    #[error("the server refused to change the order: {}", explained(text.as_deref()))]
+    CancelRejected {
+        /// Identifier the client gave the refused request.
+        cl_ord_id: String,
+        /// Identifier of the order the request named.
+        orig_cl_ord_id: Option<String>,
+        /// Whether a cancellation or a replacement was refused.
+        change: RefusedChange,
+        /// Explanation the server gave.
+        text: Option<String>,
+    },
+}
+
+/// Change of an order the server refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedChange {
+    /// A cancellation.
+    Cancel,
+    /// A replacement of the terms.
+    Replace,
 }
 
 fn explained(text: Option<&str>) -> &str {

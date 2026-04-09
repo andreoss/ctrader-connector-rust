@@ -13,10 +13,11 @@ use std::time::Duration;
 use ctrader_connector::common::config::{
     ConfigurationFix, ConfigurationOpenApi, ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN, Environment,
 };
-use ctrader_connector::common::decimals::Price;
-use ctrader_connector::common::errors::ConnectorError;
+use ctrader_connector::common::decimals::{Price, Volume};
+use ctrader_connector::common::errors::{ConnectorError, FixError, RefusedChange};
 use ctrader_connector::common::ids::{AccountId, OrderId, SymbolId};
 use ctrader_connector::common::time::Timestamp;
+use ctrader_connector::fix::amend::Replacement;
 use ctrader_connector::fix::client::FixClient;
 use ctrader_connector::fix::messages::{ExecType, OrderKind, OrderStatus, Side};
 use ctrader_connector::fix::session::SessionKind;
@@ -542,6 +543,85 @@ async fn live_orders_placed_over_fix_are_read_back_through_the_open_api() {
         assert!(
             positions.is_empty() && orders.is_empty(),
             "{positions:?} {orders:?}"
+        );
+        leave(&trade).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn live_replace_and_cancel_over_fix_are_read_back_through_the_open_api() {
+    trading("fix34", |desk| async move {
+        let symbol = desk.symbol.id;
+        let quantity = desk
+            .symbol
+            .min_volume
+            .expect("the traded symbol states its smallest volume");
+        let doubled = Volume::new(quantity.value() * Decimal::TWO).expect("volume");
+        let bid = bid(symbol).await;
+        let trade = session(SessionKind::Trade).await;
+        let first = scaled(bid, Decimal::new(5, 1));
+        let second = scaled(bid, Decimal::new(4, 1));
+        let placed = timeout(
+            STEP,
+            trade.place(NewOrder::limit(symbol, Side::Buy, quantity, first).label(&desk.label)),
+        )
+        .await
+        .expect("report in time")
+        .expect("limit order");
+
+        let replaced = timeout(
+            STEP,
+            trade.replace(&placed.cl_ord_id, Replacement::new(doubled).price(second)),
+        )
+        .await
+        .expect("report in time")
+        .expect("replacement");
+        assert_eq!(replaced.exec_type, ExecType::Replaced);
+        assert_eq!(replaced.order_id, placed.order_id);
+        assert_eq!((replaced.quantity, replaced.price), (doubled, Some(second)));
+        let (_, orders) = desk.own().await;
+        assert_eq!(orders.len(), 1, "{orders:?}");
+        let read = orders.first().expect("order");
+        assert_eq!((read.id, read.kind), (placed.order_id, OrderType::Limit));
+        assert_eq!((read.volume, read.limit_price), (doubled, Some(second)));
+
+        let refused = timeout(STEP, trade.cancel(&replaced.cl_ord_id))
+            .await
+            .expect("answer in time")
+            .expect_err("refusal");
+        assert!(
+            matches!(
+                &refused,
+                ConnectorError::Fix(FixError::CancelRejected {
+                    change: RefusedChange::Cancel,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        let (_, orders) = desk.own().await;
+        assert_eq!(orders.len(), 1, "{orders:?}");
+
+        let cancelled = timeout(STEP, trade.cancel(&placed.cl_ord_id))
+            .await
+            .expect("report in time")
+            .expect("cancellation");
+        assert_eq!(
+            (cancelled.exec_type, cancelled.status),
+            (ExecType::Canceled, OrderStatus::Canceled)
+        );
+        assert_eq!(cancelled.order_id, placed.order_id);
+        let (positions, orders) = desk.own().await;
+        assert!(positions.is_empty() && orders.is_empty(), "{positions:?} {orders:?}");
+        println!(
+            "live FIX change: order {} placed as {} for {quantity} at {first}, replaced under {} and read back by reconcile with volume {} at {:?}; cancel under the identifier of the replacement refused with {refused}; cancel under the first identifier reported {:?} and reconcile lists the order no longer",
+            placed.order_id,
+            placed.cl_ord_id,
+            replaced.cl_ord_id,
+            read.volume,
+            read.limit_price.map(|price| price.to_string()),
+            cancelled.status
         );
         leave(&trade).await;
     })
