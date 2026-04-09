@@ -81,3 +81,98 @@ required-features = ["fix", "open-api"]
 [[test]]
 name = "fix_live"
 required-features = ["fix"]
+
+[[example]]
+name = "open_api_connect"
+path = "examples/open_api/connect.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_token_refresh"
+path = "examples/open_api/token_refresh.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_symbols"
+path = "examples/open_api/symbols.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_quotes"
+path = "examples/open_api/quotes.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_depth"
+path = "examples/open_api/depth.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_trendbars"
+path = "examples/open_api/trendbars.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_ticks"
+path = "examples/open_api/ticks.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_trading"
+path = "examples/open_api/trading.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_reconcile"
+path = "examples/open_api/reconcile.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_executions"
+path = "examples/open_api/executions.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_trader"
+path = "examples/open_api/trader.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_history"
+path = "examples/open_api/history.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "open_api_margin"
+path = "examples/open_api/margin.rs"
+required-features = ["open-api"]
+
+[[example]]
+name = "fix_spot"
+path = "examples/fix/spot.rs"
+required-features = ["fix"]
+
+[[example]]
+name = "fix_depth"
+path = "examples/fix/depth.rs"
+required-features = ["fix"]
+
+[[example]]
+name = "fix_securities"
+path = "examples/fix/securities.rs"
+required-features = ["fix"]
+
+[[example]]
+name = "fix_orders"
+path = "examples/fix/orders.rs"
+required-features = ["fix"]
+
+[[example]]
+name = "fix_reports"
+path = "examples/fix/reports.rs"
+required-features = ["fix"]
+
+[[example]]
+name = "fix_reconnect"
+path = "examples/fix/reconnect.rs"
+required-features = ["fix"]
