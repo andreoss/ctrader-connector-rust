@@ -4,44 +4,249 @@ A Rust library for the cTrader Open API (Protobuf over TLS) and the cTrader
 FIX 4.4 API: connection and authorisation, market data, trading and account
 data.
 
-Each protocol sits behind its own feature, `open-api` and `fix`. Clients are
-built from a configuration builder and target the demo environment unless
-the live one is requested.
+Prices, volumes and money are exact decimals, never floats. An order is
+written to the wire at most once and is never sent again by the library.
+
+== Features
+
+No feature is on by default.
+
+[cols="1,3"]
+|===
+|Feature |Enables
+
+|`open-api`
+|The Open API client: application and account authorisation, token refresh,
+symbols, spot quotes, depth, trendbars, ticks, orders and positions,
+reconcile, execution events, trader details, deal and order history, margin
+calls and cash flow.
+
+|`fix`
+|The FIX 4.4 client: quote session (security list, spot prices, depth) and
+trade session (orders, replacement, cancellation, order status, mass status,
+positions), with reconnection.
+
+|`logging`
+|Diagnostic events of the Open API connection through `tracing`.
+|===
 
 == Requirements
-- Rust 1.86 or later, edition 2024.
+
+- Rust 1.86 or later (the minimum supported version), edition 2024.
 - A tokio runtime in the calling application.
 
-== Build
-[source,sh]
-----
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --all-features
-----
+== Use
 
-== Test
-[source,sh]
-----
-cargo test --all-features
-cargo llvm-cov --all-features --fail-under-lines 85
-----
-
-Live tests read demo account credentials from the environment.
-
-== Run
 The crate is a library. Add it to an application with the protocol features
 needed:
 
 [source,toml]
 ----
 [dependencies]
-ctrader-connector = { version = "0.1", features = ["open-api", "fix"] }
+ctrader-connector = { version = "0.2", features = ["open-api", "fix"] }
 ----
 
-Runnable examples live under `examples/`:
+=== Open API
+
+[source,rust]
+----
+use ctrader_connector::common::config::ConfigurationOpenApi;
+use ctrader_connector::open_api::client::OpenApiClient;
+
+let client = OpenApiClient::connect(ConfigurationOpenApi::from_env()?).await?;
+client.authorise_application().await?;
+for account in client.accounts().await? {
+    client.authorise_account(account.id).await?;
+}
+client.shutdown().await;
+----
+
+One connection serves the application and every account of the access token.
+The connection sends heartbeats, keeps within the request limits of the
+server, reconnects after a loss and restores authorisations and
+subscriptions.
+
+=== FIX
+
+[source,rust]
+----
+use ctrader_connector::common::config::ConfigurationFix;
+use ctrader_connector::fix::client::FixClient;
+use ctrader_connector::fix::session::SessionKind;
+
+let quote = FixClient::connect(ConfigurationFix::from_env()?, SessionKind::Quote).await?;
+let securities = quote.securities().await?;
+quote.logout().await?;
+----
+
+An account has a quote session and a trade session, each a client of its
+own. A session answers heartbeats, closes gaps in the sequence numbers and
+logs on again after a loss.
+
+The module documentation covers configuration, connection lifecycle, error
+handling, streams, rate limits, logging, testing and protocol facts for each
+protocol:
 
 [source,sh]
 ----
-cargo run --example <name> --features open-api
+cargo doc --all-features --no-deps --open
 ----
+
+== Environment variables
+
+Both clients can be configured from the environment. Values are secrets or
+account details and belong in no file under version control.
+
+[cols="2,1,3"]
+|===
+|Variable |Required |Meaning
+
+|`BROKER_CLIENT_ID`
+|Open API
+|Client identifier of the application.
+
+|`BROKER_CLIENT_SECRET`
+|Open API
+|Client secret of the application.
+
+|`BROKER_ACCESS_TOKEN`
+|Open API
+|Access token that grants the trading accounts.
+
+|`BROKER_REFRESH_TOKEN`
+|no
+|Refresh token; needed to refresh the pair.
+
+|`BROKER_ENVIRONMENT`
+|no
+|`demo` or `live`; `demo` when absent.
+
+|`BROKER_DEMO_HOST`
+|no
+|Host of the demo environment in place of the default one.
+
+|`BROKER_TOKEN_URL`
+|no
+|Token endpoint in place of the default one.
+
+|`BROKER_FIX_HOST`
+|FIX
+|Host of the FIX sessions.
+
+|`BROKER_FIX_SENDER_COMP_ID`
+|FIX
+|Sender identifier of the sessions.
+
+|`BROKER_FIX_USERNAME`
+|FIX
+|User name of the sessions.
+
+|`BROKER_FIX_PASSWORD`
+|FIX
+|Password of the sessions.
+
+|`BROKER_FIX_QUOTE_PORT`
+|no
+|TLS port of the quote session; 5211 when absent.
+
+|`BROKER_FIX_TRADE_PORT`
+|no
+|TLS port of the trade session; 5212 when absent.
+
+|`BROKER_FIX_TARGET_COMP_ID`
+|no
+|Target identifier; `CSERVER` when absent.
+
+|`BROKER_ENV_FILE`
+|live tests
+|Absolute path of the file that holds the token pair as `export` lines; the
+live tests read the pair from it and write a refreshed pair back. The token
+refresh example needs it when asked to rotate.
+
+|`BROKER_EXAMPLE_SYMBOL`
+|no
+|Symbol the examples work with; `BTCUSD` when absent.
+
+|`BROKER_EXAMPLE_QUANTITY`
+|no
+|Quantity the FIX trading examples order, in units; `0.01` when absent.
+
+|`BROKER_EXAMPLE_ROTATE`
+|no
+|Set to `1` to let the token refresh example rotate the pair.
+
+|`BROKER_EXAMPLE_MARKET`
+|no
+|Set to `1` to let the FIX order example also trade at market.
+|===
+
+== Examples
+
+One runnable program per group of requests, each behind the feature of its
+protocol:
+
+----
+examples/
+├── open_api/
+│   ├── connect.rs         connect and authorise
+│   ├── token_refresh.rs   token pair; rotates only when asked to
+│   ├── symbols.rs         assets, symbols and trading details
+│   ├── quotes.rs          spot quotes
+│   ├── depth.rs           market depth
+│   ├── trendbars.rs       historical and live bars
+│   ├── ticks.rs           tick history
+│   ├── trading.rs         market, limit, stop, stop-limit, amend, cancel, close
+│   ├── reconcile.rs       open positions and waiting orders
+│   ├── executions.rs      execution events
+│   ├── trader.rs          account details
+│   ├── history.rs         deal and order history
+│   └── margin.rs          margin calls and cash flow
+├── fix/
+│   ├── spot.rs            spot prices of the quote session
+│   ├── depth.rs           depth of the quote session
+│   ├── securities.rs      security list
+│   ├── orders.rs          limit order: place, replace, cancel; market on request
+│   ├── reports.rs         order status, mass status and positions
+│   └── reconnect.rs       recovery after a lost connection
+└── support/               pieces the examples share
+----
+
+An example is named after its protocol and its file:
+
+[source,sh]
+----
+cargo run --example open_api_connect --features open-api
+cargo run --example fix_spot --features fix
+----
+
+Every example reads its configuration from the environment, prints a short
+result without secrets and exits with a non-zero status and the kind of the
+error on failure. The trading examples run against a demo account, order the
+smallest volume, place waiting orders far from the market and remove what
+they created.
+
+== Build
+
+[source,sh]
+----
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all-features
+cargo build --all-features --examples
+----
+
+== Test
+
+[source,sh]
+----
+cargo test --all-features
+cargo llvm-cov --all-features --fail-under-lines 85
+----
+
+- Unit tests and the tests against scripted mock servers need no
+  credentials and no network beyond the loopback interface.
+- Live tests run against the demo environment only and need the variables
+  above, `BROKER_ENV_FILE` included. They trade the smallest volume, label
+  what they create and remove it afterwards.
+- The live test of the token refresh rotates the pair and writes the new one
+  to the file `BROKER_ENV_FILE` names; the old pair stops working at once.

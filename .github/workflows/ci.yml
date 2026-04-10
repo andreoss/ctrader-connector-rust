@@ -27,6 +27,10 @@ jobs:
           cargo build --no-default-features --features open-api
       - name: Build examples
         run: cargo build --all-features --examples
+      - name: Documentation
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       # Live tests need demo credentials: they are compiled here, not run.
       - name: Test
         run: |

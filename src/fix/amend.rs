@@ -1,8 +1,8 @@
 //! Changes to waiting orders of the trade session: cancelling and replacing.
 //!
-//! Both requests name the order by the identifier the client gave it. After a replacement
-//! the order answers to the identifier of the replacement request, which the report returned
-//! carries.
+//! Both requests name the order by the identifier the client gave it. The report of a
+//! replacement carries the identifier of the replacement request, but the order goes on
+//! answering to the identifier it was placed under.
 //!
 //! The server refuses a change with an order cancel reject or, for an order it does not
 //! know, with a business message reject; both are reported as
