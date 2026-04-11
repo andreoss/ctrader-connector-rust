@@ -2,6 +2,9 @@
 //!
 //! They need the variables of the FIX sessions in the environment and run one at a time.
 
+#[macro_use]
+mod live_support;
+
 use std::time::Duration;
 
 use ctrader_connector::common::config::ConfigurationFix;
@@ -10,16 +13,15 @@ use ctrader_connector::common::ids::SymbolId;
 use ctrader_connector::fix::client::FixClient;
 use ctrader_connector::fix::messages::Message;
 use ctrader_connector::fix::session::{Event, SessionKind};
-use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
-
-static LIVE: Mutex<()> = Mutex::const_new(());
 
 const STEP: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 
 fn configuration() -> ConfigurationFix {
     let read = ConfigurationFix::from_env().expect("variables of the FIX sessions");
+    live_support::veil(read.sender_comp_id());
+    live_support::veil(read.username());
     assert!(read.encrypted());
     ConfigurationFix::builder()
         .host(read.host())
@@ -51,7 +53,7 @@ async fn leave(client: &FixClient) {
 
 #[tokio::test]
 async fn live_sessions_log_on_stay_up_across_heartbeats_and_log_out() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     for kind in [SessionKind::Quote, SessionKind::Trade] {
         let client = session(kind).await;
         let mut events = client.events();
@@ -80,7 +82,7 @@ async fn live_sessions_log_on_stay_up_across_heartbeats_and_log_out() {
                 .eq((2_u64..).take(beats.len())),
             "{beats:?}"
         );
-        println!(
+        say!(
             "{} session up for {:?} with a heartbeat of {HEARTBEAT:?}; heartbeats of the server (sequence number, milliseconds): {beats:?}",
             kind.as_str(),
             started.elapsed()
@@ -104,7 +106,7 @@ async fn symbol_named(client: &FixClient, name: &str) -> SymbolId {
 
 #[tokio::test]
 async fn live_spot_prices_arrive_as_snapshots_until_unsubscribed() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let client = session(SessionKind::Quote).await;
     let symbol = symbol_named(&client, QUOTED).await;
     let mut events = client.events();
@@ -152,7 +154,7 @@ async fn live_spot_prices_arrive_as_snapshots_until_unsubscribed() {
             }
         }
     }
-    println!(
+    say!(
         "live spot: {QUOTED} is symbol {symbol}; first bid {:?} offer {:?}; {} later reports; {snapshots} snapshots and {incrementals} incremental messages while subscribed; {late} price messages later than {settle:?} after unsubscribing, watched for {quiet:?}",
         first.bid.map(|price| price.to_string()),
         first.offer.map(|price| price.to_string()),
@@ -166,7 +168,7 @@ async fn live_spot_prices_arrive_as_snapshots_until_unsubscribed() {
 
 #[tokio::test]
 async fn live_depth_fills_a_book_by_changes_until_unsubscribed() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let client = session(SessionKind::Quote).await;
     let symbol = symbol_named(&client, QUOTED).await;
     let mut events = client.events();
@@ -232,7 +234,7 @@ async fn live_depth_fills_a_book_by_changes_until_unsubscribed() {
             }
         }
     }
-    println!(
+    say!(
         "live depth: {QUOTED} is symbol {symbol}; first book of {first} entries; after {changes} changes {} bids and {} offers, best bid {} below best offer {}; {snapshots} snapshots and {incrementals} incremental messages while subscribed; {late} changes later than {settle:?} after unsubscribing, watched for {quiet:?}",
         bids.len(),
         offers.len(),
@@ -265,7 +267,7 @@ async fn reconnected(client: &FixClient) -> Vec<Event> {
 
 #[tokio::test]
 async fn live_forced_disconnect_recovers_the_numbering_and_the_spot_subscription() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let client = session(SessionKind::Quote).await;
     let symbol = symbol_named(&client, QUOTED).await;
     let mut spots = timeout(STEP, client.subscribe_spot(symbol))
@@ -315,7 +317,7 @@ async fn live_forced_disconnect_recovers_the_numbering_and_the_spot_subscription
         .expect("positions in time")
         .expect("positions after the reconnection");
     leave(&trade).await;
-    println!(
+    say!(
         "live FIX reconnection: quote session lost with {:?} and logged on again at attempt 1; the spot stream reported the loss once and then {:?}/{:?}; messages {:?}..={:?} followed without a gap; trade session reconnected likewise and listed {} positions",
         seen.first(),
         quote.bid.map(|price| price.to_string()),

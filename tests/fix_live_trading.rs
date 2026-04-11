@@ -6,6 +6,9 @@
 //! Whatever a test creates carries a label of its own and is swept away afterwards over a
 //! fresh connection, also when the test fails.
 
+#[macro_use]
+mod live_support;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,10 +29,7 @@ use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
 use ctrader_connector::open_api::trading::{Order, OrderType, Position, TimeInForce, TradeSide};
 use rust_decimal::Decimal;
-use tokio::sync::Mutex;
 use tokio::time::timeout;
-
-static LIVE: Mutex<()> = Mutex::const_new(());
 
 const STEP: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(5);
@@ -80,6 +80,8 @@ fn open_api_configuration() -> ConfigurationOpenApi {
 
 fn fix_configuration() -> ConfigurationFix {
     let read = ConfigurationFix::from_env().expect("variables of the FIX sessions");
+    live_support::veil(read.sender_comp_id());
+    live_support::veil(read.username());
     assert!(read.encrypted());
     ConfigurationFix::builder()
         .host(read.host())
@@ -111,6 +113,12 @@ async fn leave(client: &FixClient) {
 async fn shared_account(client: &OpenApiClient) -> Result<Option<AccountId>, ConnectorError> {
     let login = fix_configuration().username().parse::<i64>().ok();
     let accounts = client.accounts().await?;
+    for account in &accounts {
+        live_support::veil(account.id);
+        if let Some(login) = account.login {
+            live_support::veil(login);
+        }
+    }
     Ok(accounts
         .iter()
         .find(|account| !account.is_live && login.is_some() && account.login == login)
@@ -182,7 +190,7 @@ async fn sweep_once(
         .collect();
     for order in orders.iter().filter(|order| !order.closing) {
         let outcome = client.cancel_order(account, order.id).await;
-        println!(
+        say!(
             "live sweep: cancel order {} answered {:?}",
             order.id,
             outcome.map(|execution| execution.kind)
@@ -199,7 +207,7 @@ async fn sweep_once(
         let outcome = client
             .close_position(account, position, position.volume, &symbol)
             .await;
-        println!(
+        say!(
             "live sweep: close position {} answered {:?}",
             position.id,
             outcome.map(|execution| execution.kind)
@@ -266,7 +274,7 @@ where
     B: FnOnce(Desk) -> F,
     F: Future<Output = ()> + Send + 'static,
 {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (open, account) = reader()
         .await
         .expect("the demo account of the FIX sessions");
@@ -307,7 +315,7 @@ where
 
 #[tokio::test]
 async fn live_security_list_matches_the_symbols_of_the_same_account() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (open, account) = reader()
         .await
         .expect("the demo account of the FIX sessions");
@@ -350,7 +358,7 @@ async fn live_security_list_matches_the_symbols_of_the_same_account() {
         .iter()
         .find(|security| security.name == TRADED)
         .expect("the traded symbol");
-    println!(
+    say!(
         "live security list: {} symbols over FIX, {} enabled and not archived over the Open API; {TRADED} is {} with {} digits",
         found.len(),
         expected.len(),
@@ -450,7 +458,7 @@ async fn places_waiting_orders(desk: &Desk, trade: &FixClient, bid: Price) -> [O
     assert_eq!((stopped.kind, stopped.volume), (OrderType::Stop, quantity));
     assert_eq!(stopped.stop_price, Some(above));
     assert_eq!(stopped.time_in_force, TimeInForce::GoodTillDate(expiry));
-    println!(
+    say!(
         "live FIX orders: quantity {quantity} of {TRADED} (lot size {:?}) sent as OrderQty and read back as volume {} and {}; limit {} at {below} and stop {} at {above} until {} are listed by reconcile with the same side, kind, volume and price",
         desk.symbol.lot_size.map(|lot| lot.to_string()),
         waiting.volume,
@@ -515,7 +523,7 @@ async fn fills_and_closes_a_position(desk: &Desk, trade: &FixClient) {
     let (positions, orders) = desk.own().await;
     assert!(positions.is_empty(), "{positions:?}");
     assert_eq!(orders.len(), 2, "{orders:?}");
-    println!(
+    say!(
         "live FIX market order: order {} filled {quantity} at {:?} and opened position {opened}, read back as a buy position of volume {} at {:?}; order {} sold it at {:?} and reconcile lists the position no longer",
         bought.order_id,
         bought.average_price.map(|price| price.to_string()),
@@ -614,7 +622,7 @@ async fn live_replace_and_cancel_over_fix_are_read_back_through_the_open_api() {
         assert_eq!(cancelled.order_id, placed.order_id);
         let (positions, orders) = desk.own().await;
         assert!(positions.is_empty() && orders.is_empty(), "{positions:?} {orders:?}");
-        println!(
+        say!(
             "live FIX change: order {} placed as {} for {quantity} at {first}, replaced under {} and read back by reconcile with volume {} at {:?}; cancel under the identifier of the replacement refused with {refused}; cancel under the first identifier reported {:?} and reconcile lists the order no longer",
             placed.order_id,
             placed.cl_ord_id,
@@ -692,7 +700,7 @@ async fn live_reports_of_orders_and_positions_match_what_the_test_created() {
 
         let (positions, orders) = desk.own().await;
         assert_eq!((positions.len(), orders.len()), (1, 2), "{positions:?} {orders:?}");
-        println!(
+        say!(
             "live FIX reports: mass status listed {} orders, among them limit {} and stop {} with side, kind, quantity and price as placed; status of {} is {:?}; positions listed {} with position {opened} bought {} at {:?}; reconcile lists the same 2 orders and 1 position",
             listed.len(),
             limit.order_id,

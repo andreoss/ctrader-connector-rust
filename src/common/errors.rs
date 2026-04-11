@@ -199,7 +199,12 @@ impl From<&str> for ErrorCode {
 }
 
 /// Error reported by the server in reply to a request.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+///
+/// The `Debug` output masks the account: it prints `<masked>` in place of the identifier, so
+/// an error printed to a log or to the output of a test names no account. The `Display`
+/// output carries the code and the explanation only. The [`account_id`](Self::account_id)
+/// field itself stays readable.
+#[derive(Clone, PartialEq, Eq, Error)]
 #[error("server error {code}{}", detail(.description.as_deref()))]
 #[non_exhaustive]
 pub struct ServerError {
@@ -211,6 +216,25 @@ pub struct ServerError {
     pub account_id: Option<AccountId>,
     /// End of the maintenance window in milliseconds since the Unix epoch, when announced.
     pub maintenance_end_timestamp: Option<i64>,
+}
+
+struct Masked;
+
+impl fmt::Debug for Masked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<masked>")
+    }
+}
+
+impl fmt::Debug for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerError")
+            .field("code", &self.code)
+            .field("description", &self.description)
+            .field("account_id", &self.account_id.map(|_| Masked))
+            .field("maintenance_end_timestamp", &self.maintenance_end_timestamp)
+            .finish()
+    }
 }
 
 impl ServerError {
@@ -804,6 +828,24 @@ mod tests {
         assert_eq!(detailed.account_id, None);
         let account = AccountId::new(7).expect("positive id");
         assert_eq!(detailed.with_account_id(account).account_id, Some(account));
+    }
+
+    #[test]
+    fn server_error_debug_masks_the_account_and_keeps_the_field() {
+        let account = AccountId::new(987_654_321).expect("positive id");
+        let error = ServerError::new(ErrorCode::MarketClosed)
+            .with_description("closed")
+            .with_account_id(account);
+        let printed = format!("{error:?} {error:#?} {error}");
+        assert!(!printed.contains("987654321"), "{printed}");
+        assert!(printed.contains("account_id: Some(<masked>)"), "{printed}");
+        assert!(printed.contains("MarketClosed"), "{printed}");
+        assert!(printed.contains("closed"), "{printed}");
+        assert_eq!(error.account_id, Some(account));
+        let wrapped = format!("{:?}", ConnectorError::from(error));
+        assert!(!wrapped.contains("987654321"), "{wrapped}");
+        let bare = format!("{:?}", ServerError::new(ErrorCode::MarketClosed));
+        assert!(bare.contains("account_id: None"), "{bare}");
     }
 
     #[test]

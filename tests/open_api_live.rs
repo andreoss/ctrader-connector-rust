@@ -7,9 +7,11 @@
 //! `BROKER_ENV_FILE` and the refresh test writes the new pair back there before it checks
 //! anything else.
 
+#[macro_use]
+mod live_support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use ctrader_connector::common::config::{
@@ -43,48 +45,15 @@ use ctrader_connector::open_api::transport::{Connect, Framed, Tls};
 use ctrader_connector::open_api::trendbars::{Period, TrendbarsParams};
 use prost::Message;
 use rust_decimal::Decimal;
-use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
-static LIVE: Mutex<()> = Mutex::const_new(());
-
-static ACCOUNTS: OnceLock<Vec<String>> = OnceLock::new();
-
-const VEIL: &str = "<account>";
-
-fn veiled(text: &str) -> String {
-    ACCOUNTS
-        .get()
-        .into_iter()
-        .flatten()
-        .fold(text.to_owned(), |text, known| text.replace(known, VEIL))
-}
-
 fn veil(accounts: &[Account]) {
-    let known = accounts
-        .iter()
-        .flat_map(|account| {
-            [
-                Some(account.id.to_string()),
-                account.login.map(|login| login.to_string()),
-            ]
-        })
-        .flatten()
-        .collect();
-    if ACCOUNTS.set(known).is_ok() {
-        std::panic::set_hook(Box::new(|panic| {
-            let payload = panic.payload();
-            let text = payload
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_owned())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "a value that is no text".to_owned());
-            let place = panic.location().map_or_else(String::new, |place| {
-                format!(" at {}:{}", place.file(), place.line())
-            });
-            eprintln!("panicked{place}: {}", veiled(&text));
-        }));
+    for account in accounts {
+        live_support::veil(account.id);
+        if let Some(login) = account.login {
+            live_support::veil(login);
+        }
     }
 }
 
@@ -169,7 +138,7 @@ fn configuration() -> ConfigurationOpenApi {
 
 #[tokio::test]
 async fn live_framed_round_trip_over_tls() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let configuration = configuration();
     let tls = Tls::new().expect("tls configuration");
     let stream = tls
@@ -194,7 +163,7 @@ async fn live_framed_round_trip_over_tls() {
         .await
         .expect("reply in time")
         .expect("reply");
-    println!(
+    say!(
         "live round trip: payload type {} id {:?} body {} bytes",
         reply.payload_type,
         reply.client_msg_id,
@@ -221,7 +190,7 @@ async fn open(configuration: &ConfigurationOpenApi) -> Connection {
 
 #[tokio::test]
 async fn live_concurrent_requests_and_heartbeats_over_an_idle_period() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let configuration = configuration();
     let connection = open(&configuration).await;
     connection
@@ -253,7 +222,7 @@ async fn live_concurrent_requests_and_heartbeats_over_an_idle_period() {
         .into_iter()
         .map(|response| response.expect("account list").ctid_trader_account.len())
         .collect();
-    println!("live concurrent requests: versions {versions:?} account counts {counts:?}");
+    say!("live concurrent requests: versions {versions:?} account counts {counts:?}");
     assert!(versions.iter().all(|text| !text.is_empty()));
     assert!(counts.iter().all(|count| *count == counts[0] && *count > 0));
     let idle = Duration::from_secs(45);
@@ -268,9 +237,12 @@ async fn live_concurrent_requests_and_heartbeats_over_an_idle_period() {
         .await
         .expect("reply in time")
         .expect("request after idling");
-    println!(
+    say!(
         "live idle {idle:?}: heartbeats sent {} received {} reconnects {} then version {}",
-        stats.heartbeats_sent, stats.heartbeats_received, stats.reconnects, after.version
+        stats.heartbeats_sent,
+        stats.heartbeats_received,
+        stats.reconnects,
+        after.version
     );
     assert!(stats.heartbeats_sent >= 3);
     connection.shutdown().await;
@@ -287,7 +259,7 @@ async fn demo_account(client: &OpenApiClient) -> Account {
     let accounts = client.accounts().await.expect("account list");
     veil(&accounts);
     let demo: Vec<&Account> = accounts.iter().filter(|a| !a.is_live).collect();
-    println!(
+    say!(
         "live accounts: {} in total, {} demo",
         accounts.len(),
         demo.len()
@@ -299,7 +271,7 @@ async fn demo_account(client: &OpenApiClient) -> Account {
 
 #[tokio::test]
 async fn live_application_and_demo_account_are_authorised() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let client = OpenApiClient::connect(configuration())
         .await
         .expect("connect to the demo host");
@@ -313,21 +285,21 @@ async fn live_application_and_demo_account_are_authorised() {
         .await
         .expect("account authorisation");
     let named = format!("account {} of login {:?}", account.id, account.login);
-    let hidden = veiled(&named);
+    let hidden = live_support::veiled(&named);
     assert!(!hidden.contains(&account.id.to_string()));
     assert!(
         account
             .login
             .is_none_or(|login| !hidden.contains(&login.to_string()))
     );
-    assert!(hidden.contains(VEIL));
-    println!("live authorisation: application and {hidden} authorised");
+    assert!(hidden.contains(live_support::VEIL));
+    say!("live authorisation: application and {hidden} authorised");
     client.shutdown().await;
 }
 
 #[tokio::test]
 async fn live_bad_secret_yields_the_typed_error() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let good = configuration();
     let bad = ConfigurationOpenApi::demo()
         .host(good.host())
@@ -341,7 +313,7 @@ async fn live_bad_secret_yields_the_typed_error() {
         .await
         .expect("connect to the demo host");
     let refused = code(client.authorise_application().await);
-    println!("live bad secret: {refused:?}");
+    say!("live bad secret: {refused:?}");
     assert_eq!(refused, Some(ErrorCode::ChClientAuthFailure));
     client.shutdown().await;
 }
@@ -368,7 +340,7 @@ fn writable_token_file() -> (PathBuf, String) {
 
 #[tokio::test]
 async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (path, text) = writable_token_file();
     let before = configuration();
     let client = OpenApiClient::connect(before.clone())
@@ -401,12 +373,12 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
         .expect("application authorisation");
     let account = demo_account(&fresh).await;
     let authorised = fresh.authorise_account(account.id).await;
-    println!(
+    say!(
         "live refresh: token type {} expires in {} s, rotated {rotated}, persisted {persisted}, account with the new token: {}",
         pair.token_type,
         pair.expires_in.as_secs(),
         authorised.as_ref().map_or_else(
-            |error| veiled(&error.to_string()),
+            |error| live_support::veiled(&error.to_string()),
             |()| "authorised".to_owned()
         )
     );
@@ -425,7 +397,7 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
 
 #[tokio::test]
 async fn live_refresh_over_http_with_an_unknown_token_is_refused() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let good = configuration();
     let unknown = ConfigurationOpenApi::demo()
         .host(good.host())
@@ -441,7 +413,7 @@ async fn live_refresh_over_http_with_an_unknown_token_is_refused() {
         .await
         .expect("connect to the demo host");
     let outcome = client.refresh_token_over_http().await.map(|_| ());
-    println!("live refresh over HTTP with an unknown token: {outcome:?}");
+    say!("live refresh over HTTP with an unknown token: {outcome:?}");
     assert!(
         matches!(
             outcome,
@@ -477,7 +449,7 @@ async fn next_spot(
 
 #[tokio::test]
 async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let client = OpenApiClient::connect(configuration())
         .await
         .expect("connect to the demo host");
@@ -514,7 +486,7 @@ async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
                 Event::Disconnected(_) => disconnected = true,
                 Event::ReconnectFailed { reason, .. } => failures.push(reason.to_string()),
                 Event::ReplayFailed { key, error } => {
-                    failures.push(veiled(&format!("{key:?}: {error}")));
+                    failures.push(live_support::veiled(&format!("{key:?}: {error}")));
                 }
                 Event::Reconnected { attempt } => break attempt,
                 _ => {}
@@ -526,7 +498,7 @@ async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
     let after = next_spot(&mut events, &symbols).await;
     let version = client.version().await.expect("version after reconnection");
     let reconnects = client.connection().stats().reconnects;
-    println!(
+    say!(
         "live reconnect: disconnected {disconnected}, reconnected on attempt {attempt}, failures {failures:?}, reconnects {reconnects}, spot for symbol {} before {} and for symbol {} after {}, version {version}",
         before.symbol_id,
         before.bid.is_some() || before.ask.is_some(),
@@ -542,7 +514,7 @@ async fn live_forced_disconnect_recovers_authorisation_and_spot_subscription() {
 #[tokio::test]
 async fn live_burst_above_the_limit_completes_without_a_limit_error() {
     const BURST: usize = 120;
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let client = OpenApiClient::connect(configuration())
         .await
         .expect("connect to the demo host");
@@ -579,9 +551,10 @@ async fn live_burst_above_the_limit_completes_without_a_limit_error() {
             )
         })
         .count();
-    println!(
+    say!(
         "live burst: {answered} of {BURST} version requests answered in {elapsed:.1?}, failures {failures:?}, limit errors {limited}, requests sent {}, throttle retries {}",
-        stats.requests_sent, stats.throttle_retries
+        stats.requests_sent,
+        stats.throttle_retries
     );
     assert_eq!(limited, 0, "a limit error reached the caller: {failures:?}");
     assert!(failures.is_empty(), "{failures:?}");
@@ -614,7 +587,7 @@ async fn authorised() -> (OpenApiClient, Account) {
 
 #[tokio::test]
 async fn live_accounts_assets_symbols_and_details_parse_into_typed_values() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let assets = client.assets(account.id).await.expect("assets");
     let list = client
@@ -639,7 +612,7 @@ async fn live_accounts_assets_symbols_and_details_parse_into_typed_values() {
             .find(|asset| Some(asset.id) == id)
             .map(|asset| asset.name.clone())
     };
-    println!(
+    say!(
         "live reference data: {} assets, {} symbols ({} enabled, {} archived), EURUSD id {} base {:?} quote {:?}",
         assets.len(),
         list.symbols.len(),
@@ -650,7 +623,7 @@ async fn live_accounts_assets_symbols_and_details_parse_into_typed_values() {
         asset_name(light.quote_asset),
     );
     for symbol in &details {
-        println!(
+        say!(
             "live symbol details: id {} digits {} pip position {} volume min {:?} max {:?} step {:?} lot {:?} mode {:?} units {:?}",
             symbol.id,
             symbol.digits,
@@ -704,7 +677,7 @@ async fn candidates(client: &OpenApiClient, account: &Account) -> Vec<(SymbolId,
 
 #[tokio::test]
 async fn live_quotes_arrive_while_subscribed_and_stop_after_unsubscribing() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let candidates = candidates(&client, &account).await;
     let ids: Vec<SymbolId> = candidates.iter().map(|(id, _)| *id).collect();
@@ -736,7 +709,7 @@ async fn live_quotes_arrive_while_subscribed_and_stop_after_unsubscribing() {
     let mut after = client.quotes(account.id, &ids);
     let quiet = Duration::from_secs(8);
     let late = timeout(quiet, after.next()).await.ok();
-    println!(
+    say!(
         "live quotes: {received} quotes while subscribed to {ids:?}; sample {name} ({}) bid {} ask {} at {:?}; after unsubscribing {} in {quiet:?}",
         sample.symbol,
         sample
@@ -756,7 +729,7 @@ async fn live_quotes_arrive_while_subscribed_and_stop_after_unsubscribing() {
 
 #[tokio::test]
 async fn live_depth_updates_rebuild_a_book_with_bids_below_asks() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let candidates = candidates(&client, &account).await;
     let ids: Vec<SymbolId> = candidates.iter().map(|(id, _)| *id).collect();
@@ -788,7 +761,7 @@ async fn live_depth_updates_rebuild_a_book_with_bids_below_asks() {
         .find(|(id, _)| *id == symbol)
         .map_or("?", |(_, name)| name.as_str());
     let (bids, asks) = (book.bids(), book.asks());
-    println!(
+    say!(
         "live depth: {updates} updates ({added} new, {deleted} deleted quotes); book of {name} ({symbol}) holds {} bids and {} asks; best bid {} x {} / best ask {} x {}",
         bids.len(),
         asks.len(),
@@ -818,7 +791,7 @@ async fn fresh_depth(depth: &mut DepthStream) {
             continue;
         }
         let entries = depth.book(first.symbol).map_or(0, DepthBook::len);
-        println!(
+        say!(
             "live depth resync: the first update of {} carries {} new and {} deleted quotes; its book holds {entries} entries",
             first.symbol,
             first.new_quotes.len(),
@@ -834,7 +807,7 @@ async fn fresh_depth(depth: &mut DepthStream) {
 
 #[tokio::test]
 async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let now = Timestamp::now();
     let recent = TimeRange::ending_at(now, Duration::from_secs(600));
@@ -882,7 +855,7 @@ async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
     let latest = client.trendbars(&params.count(10)).await.expect("history");
     assert_eq!(latest.as_slice(), &bars[bars.len() - 10..]);
     let (first, last) = (&bars[0], &bars[bars.len() - 1]);
-    println!(
+    say!(
         "live trendbars: {} M1 bars of {name} ({symbol}) from {} to {}; last bar open {} high {} low {} close {} volume {}",
         bars.len(),
         first.timestamp,
@@ -901,9 +874,14 @@ async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
         .await
         .unwrap_or_else(|_| panic!("no live M1 bar of {name} in 90 s; the market may be closed"))
         .expect("live bar");
-    println!(
+    say!(
         "live trendbar: {name} ({symbol}) M1 at {} open {} high {} low {} close {} volume {}",
-        bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume,
+        bar.timestamp,
+        bar.open,
+        bar.high,
+        bar.low,
+        bar.close,
+        bar.volume,
     );
     assert_eq!((bar.symbol, bar.period), (symbol, Period::M1));
     assert!(bar.low <= bar.open && bar.open <= bar.high);
@@ -920,7 +898,7 @@ async fn live_trendbars_are_ordered_and_a_live_bar_arrives() {
 #[tokio::test]
 async fn live_tick_history_of_both_sides_falls_inside_the_range() {
     const PART_MILLIS: i64 = 1_200_000;
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let settled = Timestamp::now()
         .checked_sub(Duration::from_secs(60))
@@ -977,7 +955,7 @@ async fn live_tick_history_of_both_sides_falls_inside_the_range() {
     });
     for (side, ticks) in &sides {
         let (first, last) = (&ticks[0], &ticks[ticks.len() - 1]);
-        println!(
+        say!(
             "live ticks: {} {side:?} ticks of {name} ({symbol}) in {}..{}; first {} at {}, last {} at {}",
             ticks.len(),
             range.from(),
@@ -1027,7 +1005,7 @@ async fn raw_ticks(
 #[tokio::test]
 async fn live_tick_requests_end_before_the_millisecond_named_as_their_end() {
     const MINUTE: i64 = 60_000;
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let now = Timestamp::now().as_millis();
     let mut observed = false;
@@ -1069,7 +1047,7 @@ async fn live_tick_requests_end_before_the_millisecond_named_as_their_end() {
         let ticks = client.tick_data(&params).await.expect("tick history");
         assert_eq!(ticks.len(), held);
         assert!(ticks.iter().all(|tick| tick.timestamp == moment));
-        println!(
+        say!(
             "live tick bounds: {name} ({symbol}) answer of {} ticks, more announced: {more}; fromTimestamp {probe} toTimestamp {probe} + 1 returned the {held} tick(s) of that millisecond, toTimestamp {probe} none of them",
             page.len()
         );
@@ -1151,7 +1129,7 @@ async fn depth_since_the_loss(
 #[tokio::test]
 async fn live_depth_book_holds_the_replayed_depth_after_a_forced_reconnect() {
     const SETTLE: Duration = Duration::from_secs(5);
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let candidates = candidates(&client, &account).await;
     let ids: Vec<SymbolId> = candidates.iter().map(|(id, _)| *id).collect();
@@ -1217,7 +1195,7 @@ async fn live_depth_book_holds_the_replayed_depth_after_a_forced_reconnect() {
     .await
     .expect("the stream delivers what the connection delivered");
     let entries: usize = expected.values().map(BTreeSet::len).sum();
-    println!(
+    say!(
         "live depth reconnect: order {order:?}, {during} depth events during the replay, {} until {SETTLE:?} after it, books of {} symbols hold {entries} entries",
         replayed.len(),
         expected.len()
@@ -1312,7 +1290,7 @@ async fn sweep_once(
         .collect();
     for order in orders.iter().filter(|order| !order.closing) {
         let outcome = client.cancel_order(account, order.id).await;
-        println!(
+        say!(
             "live sweep: cancel order {} answered {:?}",
             order.id,
             outcome.map(|execution| execution.kind)
@@ -1324,16 +1302,17 @@ async fn sweep_once(
             .await?
             .pop();
         let Some(symbol) = symbol else {
-            println!(
+            say!(
                 "live sweep: no details of symbol {} to close position {}",
-                position.symbol, position.id
+                position.symbol,
+                position.id
             );
             continue;
         };
         let outcome = client
             .close_position(account, position, position.volume, &symbol)
             .await;
-        println!(
+        say!(
             "live sweep: close position {} answered {:?}",
             position.id,
             outcome.map(|execution| execution.kind)
@@ -1400,7 +1379,7 @@ where
     B: FnOnce(Desk) -> F,
     F: Future<Output = ()> + Send + 'static,
 {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let list = client
         .symbols(SymbolsParams::new(account.id))
@@ -1490,7 +1469,7 @@ async fn live_market_order_opens_a_position_that_reconcile_reads_back() {
         assert_eq!(deal.status, DealStatus::Filled);
         assert!(deal.execution_price.is_some());
         let (positions, orders) = desk.own().await;
-        println!(
+        say!(
             "live market order: order {} deal {} position {:?}, reconcile lists {} own positions ({:?}) and {} own orders",
             placed.id,
             deal.id,
@@ -1586,7 +1565,7 @@ async fn live_limit_and_stop_orders_wait_far_from_the_market() {
             placed.push(accepted.order.expect("accepted order").id);
         }
         let (positions, orders) = desk.own().await;
-        println!(
+        say!(
             "live pending orders: bid {bid} ask {ask}, reconcile lists {} own positions and own orders {:?}",
             positions.len(),
             orders
@@ -1657,7 +1636,7 @@ async fn live_stop_limit_order_waits_with_its_stop_price_and_slippage() {
         assert_eq!(accepted.kind, ExecutionType::Accepted);
         let placed = accepted.order.expect("accepted order");
         let (positions, orders) = desk.own().await;
-        println!(
+        say!(
             "live stop-limit order: bid {bid} ask {ask}, reconcile lists {} own positions and own orders {:?}",
             positions.len(),
             orders
@@ -1741,7 +1720,7 @@ async fn amend_pending(desk: &Desk, bid: Price, ask: Price) {
         .expect("amended order");
     assert_eq!(replaced.kind, ExecutionType::Replaced);
     let read = desk.order(placed.id).await;
-    println!(
+    say!(
         "live amended order: {} volume {} price {:?} till {:?} stop loss {:?} take profit {:?}",
         read.id,
         read.volume,
@@ -1765,7 +1744,7 @@ async fn amend_pending(desk: &Desk, bid: Price, ask: Price) {
         .expect("amended order");
     assert_eq!(replaced.kind, ExecutionType::Replaced);
     let read = desk.order(placed.id).await;
-    println!(
+    say!(
         "live amended order without stop loss and expiry: till {:?} stop loss {:?} take profit {:?}",
         read.time_in_force,
         read.stop_loss.map(|price| price.to_string()),
@@ -1803,7 +1782,7 @@ async fn amend_protection(desk: &Desk, bid: Price, ask: Price) {
         .await
         .expect("amended position");
     let read = desk.position(opened.id).await;
-    println!(
+    say!(
         "live amended position: {} answered {:?}, stop loss {:?} take profit {:?}",
         read.id,
         protected.kind,
@@ -1823,7 +1802,7 @@ async fn amend_protection(desk: &Desk, bid: Price, ask: Price) {
         .await
         .expect("amended position");
     let read = desk.position(opened.id).await;
-    println!(
+    say!(
         "live amended position without take profit: answered {:?}, stop loss {:?} take profit {:?}",
         replaced.kind,
         read.stop_loss.map(|price| price.to_string()),
@@ -1886,7 +1865,7 @@ async fn live_cancelled_pending_order_is_no_longer_listed() {
         assert_eq!(last.id, placed.id);
         assert_eq!(last.status, OrderStatus::Cancelled);
         let (positions, orders) = desk.own().await;
-        println!(
+        say!(
             "live cancel: order {} answered {:?} with status {:?}, reconcile lists {} own orders and {} own positions",
             placed.id,
             cancelled.kind,
@@ -1901,7 +1880,7 @@ async fn live_cancelled_pending_order_is_no_longer_listed() {
             Err(ConnectorError::Server(error)) => Some(error.code),
             _ => None,
         };
-        println!("live cancel of an order no longer in force: {code:?}");
+        say!("live cancel of an order no longer in force: {code:?}");
         assert_eq!(code, Some(ErrorCode::OrderNotFound));
     })
     .await;
@@ -1947,7 +1926,7 @@ async fn live_reconcile_lists_exactly_the_orders_and_positions_of_the_run() {
             .await
             .expect("protected position");
         let (positions, orders) = desk.own().await;
-        println!(
+        say!(
             "live reconcile: own positions {:?}, own orders {:?}",
             positions
                 .iter()
@@ -2062,7 +2041,7 @@ async fn live_position_is_closed_in_part_and_then_in_whole() {
         assert_eq!((deal.position, deal.filled_volume), (opened.id, part));
         assert_eq!(Some(detail.entry_price), opened.price);
         let read = desk.position(opened.id).await;
-        println!(
+        say!(
             "live partial close: position {} of {} closed by {}, deal {} at {:?}, reconcile reads volume {}",
             opened.id,
             opened.volume,
@@ -2083,7 +2062,7 @@ async fn live_position_is_closed_in_part_and_then_in_whole() {
         let closed = closed_by(&mut events, closing.id).await;
         let last = closed.position.expect("closed position");
         let (positions, orders) = desk.own().await;
-        println!(
+        say!(
             "live close: position {} ends {:?}, reconcile lists {} own positions and {} own orders",
             last.id,
             last.status,
@@ -2101,7 +2080,7 @@ async fn live_position_is_closed_in_part_and_then_in_whole() {
             Err(ConnectorError::Server(error)) => Some(error.code),
             _ => None,
         };
-        println!("live close of a position already closed: {code:?}");
+        say!("live close of a position already closed: {code:?}");
         assert_eq!(code, Some(ErrorCode::PositionNotFound));
     })
     .await;
@@ -2144,7 +2123,7 @@ async fn live_execution_stream_reports_the_life_of_orders_in_order() {
             .expect("accepted order");
         let accepted = next_of(&mut stream, taken.id).await;
         let filled = next_of(&mut stream, taken.id).await;
-        println!(
+        say!(
             "live execution stream: market order {} reported {:?} then {:?} with deal {:?}",
             taken.id,
             accepted.kind,
@@ -2181,9 +2160,11 @@ async fn live_execution_stream_reports_the_life_of_orders_in_order() {
             .expect("cancelled order");
         let accepted = next_of(&mut stream, waiting.id).await;
         let cancelled = next_of(&mut stream, waiting.id).await;
-        println!(
+        say!(
             "live execution stream: limit order {} reported {:?} then {:?}",
-            waiting.id, accepted.kind, cancelled.kind,
+            waiting.id,
+            accepted.kind,
+            cancelled.kind,
         );
         assert_eq!(accepted.kind, ExecutionType::Accepted);
         assert_eq!(cancelled.kind, ExecutionType::Cancelled);
@@ -2200,7 +2181,7 @@ async fn live_execution_stream_reports_the_life_of_orders_in_order() {
         let TradeEvent::OrderError(error) = event else {
             panic!("expected an order error, got {event:?}");
         };
-        println!(
+        say!(
             "live execution stream: second cancellation reported order error {:?}",
             error.code
         );
@@ -2212,11 +2193,11 @@ async fn live_execution_stream_reports_the_life_of_orders_in_order() {
 
 #[tokio::test]
 async fn live_trader_reports_the_balance_and_currency_of_the_demo_account() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let trader = client.trader(account.id).await.expect("trader");
     let assets = client.assets(account.id).await.expect("assets");
-    println!(
+    say!(
         "live trader: balance {} {} with {} money digits, leverage {:?}, {:?}, {:?}",
         trader.balance,
         trader.currency,
@@ -2301,7 +2282,7 @@ async fn live_history_holds_the_deals_and_orders_of_the_run() {
             .iter()
             .filter(|order| order.label.as_deref() == Some(desk.label.as_str()))
             .collect();
-        println!(
+        say!(
             "live history: {} deals and {} orders in range, own deals {:?} of orders {:?}, own orders {:?}",
             deals.len(),
             orders.len(),
@@ -2366,10 +2347,10 @@ async fn latest_cash_flow(
 
 #[tokio::test]
 async fn live_margin_calls_and_cash_flow_are_read() {
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let calls = client.margin_calls(account.id).await.expect("margin calls");
-    println!(
+    say!(
         "live margin calls: {:?}",
         calls
             .iter()
@@ -2393,7 +2374,7 @@ async fn live_margin_calls_and_cash_flow_are_read() {
         );
     }
     let (window, flows) = latest_cash_flow(&client, account.id).await;
-    println!(
+    say!(
         "live cash flow: {} changes in the four weeks up to {}: {:?}",
         flows.len(),
         window.to(),
@@ -2443,7 +2424,7 @@ async fn live_sweep_cancels_what_a_failed_test_left_over_a_fresh_connection() {
     .await
     .expect_err("the failure of the test is not masked");
     assert_eq!(panic_text(failed), FAILURE);
-    let _guard = LIVE.lock().await;
+    let _guard = live_support::enter().await;
     let (client, account) = authorised().await;
     let reconciled = client.reconcile(account.id).await.expect("reconcile");
     let left = reconciled
@@ -2458,7 +2439,7 @@ async fn live_sweep_cancels_what_a_failed_test_left_over_a_fresh_connection() {
         )
         .filter(|label| label.starts_with("ct53-"))
         .count();
-    println!("live sweep after a failed test: {left} orders or positions of the run are listed");
+    say!("live sweep after a failed test: {left} orders or positions of the run are listed");
     assert_eq!(left, 0);
     client.shutdown().await;
 }
@@ -2570,7 +2551,7 @@ async fn live_margin_changed_event_is_not_emitted_by_the_demo_server_while_the_e
         let mut changes = Vec::new();
         tally(&mut raw, &mut seen, &mut changes);
         let typed = timeout(Duration::from_millis(200), margin.next()).await;
-        println!(
+        say!(
             "live margin change: positions {} {} {} opened, one closed, one halved; raw payload types and counts {seen:?}; {} margin-changed events; typed stream {}",
             first.id,
             hedge.id,
