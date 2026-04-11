@@ -43,7 +43,7 @@ needed:
 [source,toml]
 ----
 [dependencies]
-ctrader-connector = { version = "0.2", features = ["open-api", "fix"] }
+ctrader-connector = { version = "0.3", features = ["open-api", "fix"] }
 ----
 
 === Open API
@@ -250,3 +250,8 @@ cargo llvm-cov --all-features --fail-under-lines 85
   what they create and remove it afterwards.
 - The live test of the token refresh rotates the pair and writes the new one
   to the file `BROKER_ENV_FILE` names; the old pair stops working at once.
+
+== Changes
+
+link:CHANGELOG.adoc[CHANGELOG.adoc] lists what each version added, changed
+and fixed.

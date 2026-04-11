@@ -1,0 +1,85 @@
+= Changelog
+
+All notable changes to this crate are recorded here. The format follows
+https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
+follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
+
+== 0.3.0 - 2026-04-10
+
+=== Added
+
+- FIX 4.4: tag-value codec and typed messages.
+- FIX 4.4: session with logon, heartbeats, test requests and typed rejects.
+- FIX 4.4 quote session: spot price and depth streams, security list.
+- FIX 4.4 trade session: new order single with typed execution reports;
+  order cancel and replace with typed cancel rejects; order status, mass
+  status and position reports.
+- FIX 4.4: reconnection, resend requests and gap fill; no order is sent
+  again.
+- One runnable example per group of requests for both protocols, under
+  `examples/open_api` and `examples/fix`.
+- Crate and module documentation: configuration, connection lifecycle,
+  error handling, streams, rate limits, logging, testing and protocol facts;
+  a README that covers features, both protocols, the examples and the
+  environment variables.
+- This changelog.
+
+=== Fixed
+
+- Open API: events by which the server ends the authorisation of an account
+  or of the application surface as a typed event and a typed error, and
+  nothing of an ended session is replayed.
+- Open API: the slippage of a stop-limit order is bounded before the order
+  is sent.
+- Live tests: margin call and cash flow checks fail on empty input;
+  leftovers are swept over a fresh connection with polling; account
+  identifiers stay out of the test output.
+
+== 0.2.0 - 2026-03-29
+
+=== Added
+
+- Open API trading: market orders that are never sent twice; limit and stop
+  orders with expiry and protection; stop-limit orders as a stop price with
+  slippage.
+- Open API trading: amendment of pending orders and of the protection of
+  positions; cancellation of pending orders; closing of positions in whole
+  or in part.
+- Open API: reconcile of positions and orders as typed values.
+- Open API: stream of execution and order error events.
+- Open API account data: trader balance, currency, leverage and account
+  type; deal and order history by time range; margin events, margin calls
+  and cash flow history.
+
+== 0.1.0 - 2026-03-12
+
+=== Added
+
+- Crate skeleton with a pinned toolchain and lint rules; features `open-api`,
+  `fix` and `logging`.
+- Configuration builders with demo and live constructors; error types that
+  preserve the error codes of the server; typed identifiers and exact
+  decimal prices and volumes.
+- Open API: vendored proto files and generated messages; TLS transport with
+  length-prefixed framing; connection task with correlation of requests and
+  heartbeat.
+- Open API: application and account authorisation; token refresh over the
+  connection and over HTTPS.
+- Open API: reconnection with backoff, renewed authorisation and replay;
+  pacing of requests and retry on limit errors with backoff.
+- Open API market data: assets, symbols and symbol details; spot quote
+  stream; depth stream with a rebuilt order book; trendbar history and live
+  trendbar stream; tick history.
+
+=== Fixed
+
+- Open API: stream state is reset on the loss marker; events lost by a slow
+  reader are reported as a typed error.
+- Open API: socket writes are bounded and a server that stays silent is
+  given up; the default period of silence follows the cadence of the server.
+- Open API: the replay set is read at each step of the restoration; request
+  and replay identifiers come from one counter.
+- Open API: every tick of a paged range is returned once, or the request
+  fails with a typed error.
+- Open API: deadline arithmetic saturates, channel capacities are clamped
+  and the conversion of the system time is checked.
