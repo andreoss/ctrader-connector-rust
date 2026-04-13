@@ -11,6 +11,7 @@ use ctrader_connector::fix::securities::Security;
 use ctrader_connector::fix::session::SessionKind;
 use ctrader_connector::fix::trading::{NewOrder, OrderReport};
 
+use super::demo::demo_only;
 use super::{Failure, QUOTES, STEP, setting, symbol_name, veil, within};
 
 /// Variable naming the quantity the trading examples order, in units of the base asset.
@@ -23,15 +24,35 @@ pub const DEFAULT_QUANTITY: &str = "0.01";
 const CLEAR_ROUNDS: usize = 10;
 const SESSION_ROUNDS: usize = 5;
 
-/// Logs on to one session of the account the environment names.
+/// Reads the configuration from the environment and refuses any account but a demo one.
 ///
 /// # Errors
 ///
-/// Returns a [`Failure`] when a variable is absent or rejected, or the logon fails.
-pub async fn session(kind: SessionKind) -> Result<FixClient, Failure> {
+/// Returns a [`Failure`] when a variable is absent or rejected, or when the sender identifier
+/// or the host names another environment than demo; see [`demo_only`].
+pub fn configuration() -> Result<ConfigurationFix, Failure> {
     let configuration = ConfigurationFix::from_env()?;
     veil(configuration.sender_comp_id());
     veil(configuration.username());
+    demo_only(configuration.sender_comp_id(), configuration.host()).map_err(|reason| {
+        Failure::new(format!(
+            "the examples run against a demo account only: {reason}"
+        ))
+    })?;
+    Ok(configuration)
+}
+
+/// Logs on to one session of the demo account the environment names.
+///
+/// Every FIX example reaches the server through this function, so none of them logs on to
+/// an account that is not a demo one.
+///
+/// # Errors
+///
+/// Returns a [`Failure`] when the configuration is refused by [`configuration`] or the logon
+/// fails.
+pub async fn session(kind: SessionKind) -> Result<FixClient, Failure> {
+    let configuration = configuration()?;
     let logon = Box::pin(FixClient::connect(configuration, kind));
     Ok(within(STEP, "the logon", logon).await??)
 }

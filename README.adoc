@@ -223,7 +223,10 @@ Every example reads its configuration from the environment, prints a short
 result without secrets and exits with a non-zero status and the kind of the
 error on failure. The trading examples run against a demo account, order the
 smallest volume, place waiting orders far from the market and remove what
-they created.
+they created. Every example refuses another environment before it connects:
+the Open API ones unless `BROKER_ENVIRONMENT` is `demo` or absent, the FIX
+ones unless `BROKER_FIX_SENDER_COMP_ID` starts with `demo.` and no label of
+`BROKER_FIX_HOST` starts with `live`.
 
 == Build
 

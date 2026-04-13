@@ -16,6 +16,8 @@ use ctrader_connector::common::time::Timestamp;
 use rust_decimal::Decimal;
 
 #[cfg(feature = "fix")]
+pub mod demo;
+#[cfg(feature = "fix")]
 pub mod fix;
 #[cfg(feature = "open-api")]
 pub mod open_api;
