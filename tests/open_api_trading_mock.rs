@@ -1,5 +1,6 @@
 //! Behaviour of the trading calls against the mock server.
 
+mod faulty;
 mod support;
 
 use std::time::Duration;
@@ -24,7 +25,8 @@ use ctrader_connector::open_api::trading::{
     Comment, Execution, ExecutionType, Label, NewOrder, Order, OrderAmendment, OrderStatus,
     OrderType, Position, PositionAmendment, TimeInForce, TradeSide,
 };
-use ctrader_connector::open_api::transport::Plain;
+use ctrader_connector::open_api::transport::{Connect, Plain};
+use faulty::Faulty;
 use prost::Message as _;
 use rust_decimal::Decimal;
 use support::{
@@ -112,6 +114,15 @@ async fn session_with(
     silent: Vec<u32>,
     adjust: impl FnOnce(ConnectionOptions) -> ConnectionOptions,
 ) -> Session {
+    session_through(Plain, responder, silent, adjust).await
+}
+
+async fn session_through(
+    connector: impl Connect,
+    responder: impl Fn(u32, &[u8]) -> Answer + Send + Sync + 'static,
+    silent: Vec<u32>,
+    adjust: impl FnOnce(ConnectionOptions) -> ConnectionOptions,
+) -> Session {
     let server = MockServer::start(MockOptions {
         responder: Some(Responder::new(move |payload_type, payload| {
             details(payload_type, payload).or_else(|| responder(payload_type, payload))
@@ -132,7 +143,7 @@ async fn session_with(
         .build()
         .expect("configuration");
     let options = adjust(ConnectionOptions::from(&configuration));
-    let client = OpenApiClient::connect_with(configuration, Plain, options)
+    let client = OpenApiClient::connect_with(configuration, connector, options)
         .await
         .expect("client");
     client.authorise_application().await.expect("application");
@@ -415,6 +426,40 @@ async fn order_in_flight_when_the_connection_drops_is_not_sent_again() {
     assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
     assert_eq!(server.connections(), 2);
     assert_eq!(server.count(NEW_ORDER_REQ), 1);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn order_whose_write_fails_has_an_unknown_outcome_and_is_not_sent_again() {
+    let faulty = Faulty::default();
+    let Session {
+        server,
+        client,
+        symbol,
+    } = session_through(faulty.clone(), |_, _| None, Vec::new(), |options| options).await;
+    faulty.fail_writes(true);
+    let outcome = client
+        .place_order(&market(&symbol, TradeSide::Sell, "1"), &symbol)
+        .await;
+    assert_eq!(
+        outcome.map(|execution| execution.kind),
+        Err(ConnectorError::OutcomeUnknown(Interruption::Transport(
+            Faulty::error()
+        )))
+    );
+    faulty.fail_writes(false);
+    eventually("reconnected", || {
+        client.connection().stats().reconnects == 1
+    })
+    .await;
+    assert_eq!(client.version().await.as_deref(), Ok("mock-1"));
+    assert_eq!(server.count(NEW_ORDER_REQ), 0);
+    faulty.fail_writes(true);
+    assert_eq!(
+        client.version().await,
+        Err(ConnectorError::Transport(Faulty::error()))
+    );
+    faulty.fail_writes(false);
     client.shutdown().await;
 }
 

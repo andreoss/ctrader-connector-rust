@@ -1,18 +1,23 @@
 //! Tests of the orders of the trade session against a scripted server.
 
+mod faulty;
 mod fix_support;
+
+use std::time::Duration;
 
 use ctrader_connector::common::decimals::{Price, Volume};
 use ctrader_connector::common::errors::{ConnectorError, FixError, Interruption, TransportError};
 use ctrader_connector::common::ids::{OrderId, PositionId, SymbolId};
 use ctrader_connector::common::time::Timestamp;
+use ctrader_connector::fix::client::FixClient;
 use ctrader_connector::fix::messages::{
-    BusinessReject, ExecType, Message, NewOrderSingle, OrderKind, OrderStatus, Reject, Side,
-    TimeInForce,
+    BusinessReject, ExecType, Logout, Message, NewOrderSingle, OrderKind, OrderStatus, Reject,
+    Side, TestRequest, TimeInForce,
 };
-use ctrader_connector::fix::session::SessionKind;
+use ctrader_connector::fix::session::{Event, SessionKind};
 use ctrader_connector::fix::trading::NewOrder;
-use fix_support::{Peer, session, wire};
+use faulty::Faulty;
+use fix_support::{Peer, Server, session, wire};
 
 fn symbol() -> SymbolId {
     SymbolId::new(22_395).expect("symbol")
@@ -280,5 +285,73 @@ async fn order_without_an_answer_has_an_unknown_outcome_and_is_sent_once() {
         Err(ConnectorError::OutcomeUnknown(Interruption::Transport(
             TransportError::Closed
         )))
+    );
+}
+
+async fn session_through(faulty: &Faulty) -> (Server, FixClient, Peer) {
+    let server = Server::bind().await;
+    let configuration = server
+        .builder()
+        .reconnect_delay(Duration::from_millis(300))
+        .build()
+        .expect("configuration");
+    let (client, peer) = tokio::join!(
+        FixClient::connect_with(configuration, SessionKind::Trade, faulty.clone()),
+        async {
+            let mut peer = server.accept().await;
+            peer.logon().await;
+            peer
+        }
+    );
+    (server, client.expect("logon"), peer)
+}
+
+#[tokio::test]
+async fn order_whose_write_fails_has_an_unknown_outcome_and_is_not_sent_again() {
+    let faulty = Faulty::default();
+    let (server, client, mut old) = session_through(&faulty).await;
+    let mut events = client.events();
+    faulty.fail_writes(true);
+    let outcome = client
+        .place(NewOrder::market(symbol(), Side::Buy, volume("0.01")))
+        .await;
+    assert_eq!(
+        outcome,
+        Err(ConnectorError::OutcomeUnknown(Interruption::Transport(
+            Faulty::error()
+        )))
+    );
+    assert_eq!(
+        events.recv().await,
+        Ok(Event::Disconnected(Faulty::error()))
+    );
+    faulty.fail_writes(false);
+    let mut fresh = server.accept().await;
+    fresh.logon().await;
+    assert_eq!(events.recv().await, Ok(Event::Reconnected { attempt: 1 }));
+    let (left, ()) = tokio::join!(client.logout(), async {
+        let (_, message) = fresh.request().await;
+        assert_eq!(message, Logout { text: None }.into());
+        fresh.send(Logout { text: None }).await;
+    });
+    assert_eq!(left, Ok(()));
+    while let Some(frame) = old.frame().await {
+        assert_eq!(frame.header.msg_type, "0", "{frame:?}");
+    }
+}
+
+#[tokio::test]
+async fn request_that_may_repeat_reports_the_failed_write_as_a_transport_error() {
+    let faulty = Faulty::default();
+    let (_server, client, _peer) = session_through(&faulty).await;
+    faulty.fail_writes(true);
+    let probe = TestRequest {
+        test_req_id: "probe".to_owned(),
+    };
+    assert_eq!(
+        client
+            .request(probe.into(), "probe", |_| Some(Ok(())))
+            .await,
+        Err(ConnectorError::Transport(Faulty::error()))
     );
 }
