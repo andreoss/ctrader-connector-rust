@@ -18,7 +18,9 @@ use ctrader_connector::common::config::{
     ConfigurationOpenApi, ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN, Environment,
 };
 use ctrader_connector::common::decimals::{Price, Volume};
-use ctrader_connector::common::errors::{ConnectorError, ErrorCode, TokenError};
+use ctrader_connector::common::errors::{
+    ConnectorError, ErrorCode, SessionEndCause, SessionEnded, TokenError,
+};
 use ctrader_connector::common::ids::{AccountId, OrderId, PositionId, SymbolId};
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::account::AccessRights;
@@ -338,6 +340,37 @@ fn writable_token_file() -> (PathBuf, String) {
     (path, text)
 }
 
+async fn holder(configuration: ConfigurationOpenApi) -> (OpenApiClient, AccountId) {
+    let client = OpenApiClient::connect(configuration)
+        .await
+        .expect("connect to the demo host");
+    client
+        .authorise_application()
+        .await
+        .expect("application authorisation");
+    let held = demo_account(&client).await.id;
+    client
+        .authorise_account(held)
+        .await
+        .expect("account authorisation with the old token");
+    (client, held)
+}
+
+async fn session_end(events: &mut broadcast::Receiver<Event>) -> Option<SessionEnded> {
+    timeout(STEP, async {
+        loop {
+            match events.recv().await {
+                Ok(Event::SessionEnded(ended)) => break Some(ended),
+                Ok(_) => {}
+                Err(_) => break None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 #[tokio::test]
 async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
     let _guard = live_support::enter().await;
@@ -350,6 +383,8 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
         .authorise_application()
         .await
         .expect("application authorisation");
+    let (old, held) = holder(before.clone()).await;
+    let mut events = old.events();
     let pair = match client.refresh_token().await {
         Ok(pair) => pair,
         Err(error) => panic!("live refresh failed, the stored pair is unchanged: {error}"),
@@ -364,6 +399,9 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
     let rotated =
         before.access_token() != &pair.access && before.refresh_token() != Some(&pair.refresh);
     client.shutdown().await;
+    let ended = session_end(&mut events).await;
+    let later = old.trader(held).await.map(|_| ());
+    old.shutdown().await;
     let fresh = OpenApiClient::connect(after)
         .await
         .expect("connect to the demo host");
@@ -374,12 +412,20 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
     let account = demo_account(&fresh).await;
     let authorised = fresh.authorise_account(account.id).await;
     say!(
-        "live refresh: token type {} expires in {} s, rotated {rotated}, persisted {persisted}, account with the new token: {}",
+        "live refresh: token type {} expires in {} s, rotated {rotated}, persisted {persisted}, account with the new token: {}; old session: {}; later request on it: {}",
         pair.token_type,
         pair.expires_in.as_secs(),
         authorised.as_ref().map_or_else(
             |error| live_support::veiled(&error.to_string()),
             |()| "authorised".to_owned()
+        ),
+        ended.as_ref().map_or_else(
+            || "no event".to_owned(),
+            |ended| live_support::veiled(&ended.cause.to_string())
+        ),
+        later.as_ref().map_or_else(
+            |error| live_support::veiled(&error.to_string()),
+            |()| "answered".to_owned()
         )
     );
     assert!(persisted, "the stored pair differs from the pair received");
@@ -388,6 +434,25 @@ async fn live_refresh_rotates_the_pair_and_the_new_token_authorises() {
         "the refresh returned a token of the pair it was asked to replace"
     );
     assert!(pair.expires_in > Duration::from_secs(60));
+    let ended = ended.expect("the session opened with the old token was not reported as ended");
+    assert_eq!(ended.account, Some(held));
+    assert!(
+        matches!(ended.cause, SessionEndCause::TokenInvalidated { .. }),
+        "{}",
+        live_support::veiled(&ended.cause.to_string())
+    );
+    let Err(ConnectorError::SessionEnded(refused)) = later else {
+        panic!("a request on the ended session was not refused as such");
+    };
+    assert_eq!(refused.account, Some(held));
+    assert!(
+        matches!(
+            refused.cause,
+            SessionEndCause::TokenInvalidated { .. } | SessionEndCause::AccountDisconnected
+        ),
+        "{}",
+        live_support::veiled(&refused.cause.to_string())
+    );
     assert!(
         authorised.is_ok(),
         "the new token did not authorise the account"
