@@ -4,6 +4,32 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.1 - 2026-04-13
+
+=== Changed
+
+- FIX 4.4: `encode` refuses a body that holds a tag of the standard header
+  (34, 35, 43, 49, 50, 52, 56, 57, 122), as it does the tags of the framing.
+- `ServerError` prints its account as masked in `Debug` output; the field
+  stays readable.
+
+=== Fixed
+
+- FIX 4.4: a message whose header cannot be read but whose bytes are intact
+  is counted, reported as `Event::Unparsed` and answered with a reject (3),
+  so that it no longer forces a resend and then a reconnection.
+- FIX 4.4: a heartbeat is sent when the interval since the last message sent
+  ends, not at the next tick of a timer after it.
+- FIX examples refuse an account that is not a demo one before logon.
+- Tests: an order whose write fails is asserted to have an unknown outcome
+  over both protocols; the keep-alive timing is asserted on a paused clock.
+- Live tests: all output passes through one redacting function; the refresh
+  test asserts the end of the session opened with the old token; the
+  heartbeat watch accepts every administrative message.
+- Documentation: the two meanings of `Closed` over FIX, the fate of messages
+  ahead of their turn, the tests that need `BROKER_ENV_FILE` and the list of
+  `tracing` events match the behaviour.
+
 == 0.3.0 - 2026-04-10
 
 === Added
@@ -16,6 +42,8 @@ follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
   status and position reports.
 - FIX 4.4: reconnection, resend requests and gap fill; no order is sent
   again.
+- `force_reconnect` on the Open API connection and on the FIX client drops
+  the connection and starts a reconnection as a loss would.
 - One runnable example per group of requests for both protocols, under
   `examples/open_api` and `examples/fix`.
 - Crate and module documentation: configuration, connection lifecycle,
@@ -23,6 +51,11 @@ follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
   a README that covers features, both protocols, the examples and the
   environment variables.
 - This changelog.
+
+=== Changed
+
+- The transport shared by both protocols (`Connect`, `Plain`, `Tls`) moved
+  to `common::transport`; `open_api::transport` re-exports it.
 
 === Fixed
 

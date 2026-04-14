@@ -70,7 +70,8 @@
 //!   inbound timeout counts as lost, as does a write that does not complete in time.
 //! - Reconnect: after a loss the requests in flight fail,
 //!   [`Event::Disconnected`](connection::Event::Disconnected) is reported and the task
-//!   connects again, waiting twice as long before every further attempt, up to a minute.
+//!   connects again, waiting twice as long before every further attempt, up to a minute or
+//!   the configured delay when that is longer.
 //! - Replay: once connected it authorises the application and the accounts again, restores
 //!   the subscriptions and reports [`Event::Reconnected`](connection::Event::Reconnected).
 //!   Requests made while the connection is down fail at once.
@@ -120,8 +121,8 @@
 //! # Logging
 //!
 //! With the `logging` feature the connection task emits `tracing` events at debug level:
-//! connected, connection lost, reconnected, reconnection failed, replayed request failed
-//! and authorisation ended. They carry no secret. Without the feature nothing is emitted
+//! connected, connection lost, reconnected, reconnection failed, replayed request failed,
+//! authorisation ended and limit exceeded. They carry no secret. Without the feature nothing is emitted
 //! and `tracing` is not compiled in. The application installs the subscriber.
 //!
 //! # Testing

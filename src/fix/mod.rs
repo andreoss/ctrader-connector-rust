@@ -65,7 +65,12 @@
 //!   reports [`Event::Ended`](session::Event::Ended) and the session is over.
 //! - Replay: both sides count from one again after every logon. The server has forgotten
 //!   the subscriptions; the price streams subscribe anew by themselves. A gap in the
-//!   messages of the server is closed with a resend request.
+//!   messages of the server is closed with a resend request: the message that arrived
+//!   ahead of its turn is dropped and read when the server repeats it.
+//! - Unreadable messages: one the library cannot read is reported as
+//!   [`Event::Unparsed`](session::Event::Unparsed) and the session goes on. When not even
+//!   its header can be read but its bytes are intact it is counted and answered with a
+//!   reject (3); one whose bytes are damaged is not counted and is asked for again.
 //! - Never sent again: orders, and every other message. When the server asks for messages
 //!   again the task answers with a sequence reset that skips them, reported as
 //!   [`Event::Skipped`](session::Event::Skipped).
@@ -90,11 +95,21 @@
 //! | `OutcomeUnknown` | An order or a replacement was sent and no answer came, or the server asked for it again. | Read [`open_orders`](client::FixClient::open_orders) and [`positions`](client::FixClient::positions) before placing it again. |
 //! | `Transport` | The connection was lost. | Go on after `Event::Reconnected`; a price stream reports the loss once and continues. |
 //! | `Lagged` | The reader of the events fell behind; an answer may have been skipped. | Read the state again. |
-//! | `Closed` | The session has ended. | Connect anew. |
+//! | `Closed` | The session has ended, or it has no connection at the moment: a request made between `Event::Disconnected` and `Event::Reconnected` is not sent. | Ended: connect anew. Between two connections: go on after `Event::Reconnected`. |
 //!
 //! The variant `SessionEnded` belongs to the Open API and does not occur over FIX: a
 //! session the server ends is reported as [`Event::LoggedOut`](session::Event::LoggedOut)
 //! and then `Closed`.
+//!
+//! `Closed` has two meanings, told apart by the events and by
+//! [`FixClient::closed`](client::FixClient::closed). The session has ended after
+//! [`Event::LoggedOut`](session::Event::LoggedOut), after
+//! [`Event::Ended`](session::Event::Ended) and after a logout or the drop of the last
+//! client: `closed` has returned and every later call fails with `Closed`. The session is
+//! between two connections after [`Event::Disconnected`](session::Event::Disconnected) and
+//! until [`Event::Reconnected`](session::Event::Reconnected): `closed` has not returned, a
+//! message handed over meanwhile is refused with `Closed` without being sent, and calls
+//! work again after `Event::Reconnected`.
 //!
 //! # Streams
 //!

@@ -3,7 +3,7 @@
 //! The FIX sessions have no setting that names the environment; the account is named by the
 //! sender identifier, which the server issues as `demo.<broker>.<login>` for a demo account
 //! and as `live.<broker>.<login>` for a live one, and the hosts of the live environment
-//! carry `live` as a label of their name.
+//! have a label of their name that starts with `live`.
 
 /// Checks that the sender identifier and the host of a FIX session name a demo account.
 ///

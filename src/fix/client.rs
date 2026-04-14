@@ -128,7 +128,8 @@ impl FixClient {
     /// Returns [`ConnectorError::Timeout`] when the server does not confirm the logout in
     /// time, [`ConnectorError::Transport`] when the connection fails first, and
     /// [`ConnectorError::Closed`] when the session has ended already. The connection is
-    /// closed in every case.
+    /// closed in every case. A logout between two connections ends the session without
+    /// an exchange and returns `Ok`.
     pub async fn logout(&self) -> Result<(), ConnectorError> {
         let (reply, answer) = oneshot::channel();
         self.commands
@@ -173,7 +174,8 @@ impl FixClient {
     /// the library never sends twice,
     /// [`ConnectorError::Transport`] when the connection is lost first,
     /// [`ConnectorError::Lagged`] when the reader fell behind and the answer may have been
-    /// skipped, and [`ConnectorError::Closed`] when the session has ended already.
+    /// skipped, and [`ConnectorError::Closed`] when the session has ended already or has no
+    /// connection at the moment, between [`Event::Disconnected`] and [`Event::Reconnected`].
     pub async fn request<T>(
         &self,
         message: Message,

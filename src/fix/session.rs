@@ -5,9 +5,10 @@
 //! message received to the readers of its events. Commands reach it over a channel, so the
 //! socket has a single owner and a single writer.
 //!
-//! Sequence numbers: a message of the server that arrives ahead of its turn is set aside and
-//! the missing ones are asked for again with a resend request; the session goes on once the
-//! server has repeated them or has skipped them with a sequence reset. When the server asks
+//! Sequence numbers: a message of the server that arrives ahead of its turn is dropped and
+//! every message from the missing one on is asked for again with a resend request; the
+//! session goes on once the server has repeated them or has skipped them with a sequence
+//! reset. When the server asks
 //! for messages again, the task answers with a sequence reset that skips them all: no
 //! message, and above all no order, is ever sent twice. [`Event::Skipped`] names the range.
 //!
@@ -16,7 +17,11 @@
 //! [`Event::Reconnected`]. Both sides count from one again after every logon, so no gap
 //! outlives a connection. Nothing sent over the lost connection is sent again, and the
 //! server has forgotten its subscriptions. When no attempt succeeds the task reports
-//! [`Event::Ended`] and the session is over.
+//! [`Event::Ended`] and the session is over. A message handed to the task between the two
+//! connections is refused with [`ConnectorError::Closed`] without being sent.
+//!
+//! Keep-alive: the task sleeps until the next moment something is due, so a heartbeat
+//! leaves when the interval since the last message sent ends, not later.
 
 use std::time::Duration;
 

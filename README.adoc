@@ -158,9 +158,11 @@ account details and belong in no file under version control.
 |Target identifier; `CSERVER` when absent.
 
 |`BROKER_ENV_FILE`
-|live tests
+|live tests of the Open API
 |Absolute path of the file that holds the token pair as `export` lines; the
-live tests read the pair from it and write a refreshed pair back. The token
+live tests that use the Open API (`open_api_live`, and `fix_live_trading`
+for its read-back) read the pair from it, and the refresh test writes the
+new pair back. `fix_live` does not use it. The token
 refresh example needs it when asked to rotate.
 
 |`BROKER_EXAMPLE_SYMBOL`
@@ -249,7 +251,8 @@ cargo llvm-cov --all-features --fail-under-lines 85
 - Unit tests and the tests against scripted mock servers need no
   credentials and no network beyond the loopback interface.
 - Live tests run against the demo environment only and need the variables
-  above, `BROKER_ENV_FILE` included. They trade the smallest volume, label
+  above. `open_api_live` and `fix_live_trading` also need `BROKER_ENV_FILE`;
+  `fix_live` needs the variables of the FIX sessions only. They trade the smallest volume, label
   what they create and remove it afterwards.
 - The live test of the token refresh rotates the pair and writes the new one
   to the file `BROKER_ENV_FILE` names; the old pair stops working at once.
