@@ -28,9 +28,9 @@ use crate::common::config::ConfigurationFix;
 use crate::common::errors::{ConnectorError, FixError, TransportError};
 use crate::common::time::Timestamp;
 use crate::common::transport::Connect;
-use crate::fix::codec::{Frame, Header, decode, encode};
+use crate::fix::codec::{Frame, Header, Unreadable, encode, take};
 use crate::fix::messages::{
-    Heartbeat, Logon, Logout, Message, ResendRequest, SequenceReset, TestRequest,
+    Heartbeat, Logon, Logout, Message, Reject, ResendRequest, SequenceReset, TestRequest,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -41,6 +41,7 @@ const LONGEST_TICK: Duration = Duration::from_secs(1);
 const PROBE: &str = "alive";
 const RECONNECT_ATTEMPTS: u32 = 5;
 const EVERY_LATER_MESSAGE: u64 = 0;
+const REQUIRED_TAG_MISSING: u32 = 1;
 
 /// Which of the two sessions of an account a connection serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,7 +80,10 @@ pub struct Inbound {
 pub enum Event {
     /// A message arrived.
     Message(Inbound),
-    /// A message arrived that the library cannot read; it is skipped.
+    /// A message arrived that the library cannot read; it is skipped. When not even its
+    /// header can be read but its bytes are intact, the session counts it and answers it with
+    /// a reject (3); a message whose bytes are damaged is not counted, so that the server is
+    /// asked to send it again.
     Unparsed(FixError),
     /// The server ended the session with a logout.
     LoggedOut {
@@ -184,13 +188,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Live<S> {
         }
     }
 
-    async fn receive(&mut self) -> Result<Result<Frame, FixError>, TransportError> {
+    async fn receive(&mut self) -> Result<Result<Frame, Unreadable>, TransportError> {
         loop {
-            let before = self.buffer.len();
-            match decode(&mut self.buffer) {
-                Ok(Some(frame)) => return Ok(Ok(frame)),
+            match take(&mut self.buffer) {
+                Ok(Some(taken)) => return Ok(taken),
                 Ok(None) => {}
-                Err(error) if self.buffer.len() < before => return Ok(Err(error)),
                 Err(error) => return Err(TransportError::Decode(error.to_string())),
             }
             let mut chunk = [0_u8; READ_CHUNK];
@@ -204,6 +206,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Live<S> {
 
     async fn close(&mut self) {
         let _ = self.stream.shutdown().await;
+    }
+}
+
+fn rejection(seq: u64, error: &FixError) -> Reject {
+    let (ref_msg_type, ref_tag_id, reason) = match error {
+        FixError::MissingField { msg_type, tag } => (
+            Some(msg_type.clone()),
+            Some(*tag),
+            Some(REQUIRED_TAG_MISSING),
+        ),
+        FixError::InvalidField { msg_type, tag } => (Some(msg_type.clone()), Some(*tag), None),
+        _ => (None, None, None),
+    };
+    Reject {
+        ref_seq_num: seq,
+        text: Some(error.to_string()),
+        ref_tag_id,
+        ref_msg_type,
+        reason,
     }
 }
 
@@ -290,7 +311,8 @@ impl<C: Connect> Actor<C> {
         let limit = self.configuration.timeout();
         let frame = timeout(limit, live.receive())
             .await
-            .map_err(|_| ConnectorError::Timeout(limit))???;
+            .map_err(|_| ConnectorError::Timeout(limit))??
+            .map_err(|unreadable| unreadable.error)?;
         match Message::from_frame(&frame)? {
             Message::Logon(_) => {
                 live.next_in = frame.header.seq.saturating_add(1);
@@ -311,7 +333,7 @@ impl<C: Connect> Actor<C> {
         let answered = timeout(limit, async {
             loop {
                 match live.receive().await? {
-                    Err(error) => self.emit(Event::Unparsed(error)),
+                    Err(unreadable) => self.emit(Event::Unparsed(unreadable.error)),
                     Ok(frame) => match Message::from_frame(&frame) {
                         Ok(Message::Logout(_)) => return Ok::<(), TransportError>(()),
                         Ok(message) => self.emit(Event::Message(Inbound {
@@ -455,6 +477,27 @@ impl<C: Connect> Actor<C> {
         logged_out.map(End::LoggedOut)
     }
 
+    async fn unreadable(&self, live: &mut Live<C::Stream>, unreadable: Unreadable) -> Option<End> {
+        let Unreadable { seq, error } = unreadable;
+        let Some(seq) = seq else {
+            self.emit(Event::Unparsed(error));
+            return None;
+        };
+        live.last_received = Instant::now();
+        live.probed = false;
+        if seq > live.next_in {
+            return self.ask_again(live, seq).await;
+        }
+        let reject = (seq == live.next_in).then(|| rejection(seq, &error));
+        self.emit(Event::Unparsed(error));
+        let reject = reject?;
+        live.advance(seq.saturating_add(1));
+        match self.transmit(live, &reject.into()).await {
+            Err(ConnectorError::Transport(error)) => Some(End::Lost(error)),
+            _ => None,
+        }
+    }
+
     async fn beat(&self, live: &mut Live<C::Stream>) -> Option<End> {
         let heartbeat = self.configuration.heartbeat();
         let now = Instant::now();
@@ -528,10 +571,7 @@ impl<C: Connect> Actor<C> {
                 command = commands.recv() => self.command(live, command).await,
                 received = live.receive() => match received {
                     Err(error) => Some(End::Lost(error)),
-                    Ok(Err(error)) => {
-                        self.emit(Event::Unparsed(error));
-                        None
-                    }
+                    Ok(Err(unreadable)) => self.unreadable(live, unreadable).await,
                     Ok(Ok(frame)) => self.accept(live, frame).await,
                 },
                 _ = ticker.tick() => self.beat(live).await,

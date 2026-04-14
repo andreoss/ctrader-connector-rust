@@ -377,6 +377,36 @@ fn header_of(all: Vec<Field>) -> Result<Frame, FixError> {
 /// does not match, and [`FixError::MissingField`] or [`FixError::InvalidField`] when the
 /// header is incomplete or holds a value of the wrong form.
 pub fn decode(buffer: &mut Vec<u8>) -> Result<Option<Frame>, FixError> {
+    match take(buffer)? {
+        None => Ok(None),
+        Some(Ok(frame)) => Ok(Some(frame)),
+        Some(Err(unreadable)) => Err(unreadable.error),
+    }
+}
+
+/// A whole message that was taken off the stream and cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Unreadable {
+    /// Sequence number of the message, when its bytes are intact and carry exactly one.
+    pub(crate) seq: Option<u64>,
+    /// Why the message cannot be read.
+    pub(crate) error: FixError,
+}
+
+fn scanned_seq(body: &[u8]) -> Option<u64> {
+    let mut numbers = body
+        .split(|byte| *byte == SOH)
+        .filter_map(|piece| piece.strip_prefix(b"34="));
+    let digits = numbers.next()?;
+    if numbers.next().is_some() {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// Takes one whole message off the front of `buffer`, as [`decode`] does, and keeps apart
+/// the message that was removed but cannot be read from the stream that lost its framing.
+pub(crate) fn take(buffer: &mut Vec<u8>) -> Result<Option<Result<Frame, Unreadable>>, FixError> {
     let common = buffer.len().min(PREFIX.len());
     if buffer.get(..common) != PREFIX.get(..common) {
         return Err(FixError::Garbled("the bytes do not open a message"));
@@ -407,14 +437,23 @@ pub fn decode(buffer: &mut Vec<u8>) -> Result<Option<Frame>, FixError> {
     }
     let message: Vec<u8> = buffer.drain(..total).collect();
     let (counted, tail) = message.split_at_checked(trailer).unwrap_or((&message, &[]));
-    let found = found_checksum(tail).ok_or(FixError::Garbled(
-        "the checksum field does not close the message",
-    ))?;
+    let damaged = |error| Ok(Some(Err(Unreadable { seq: None, error })));
+    let Some(found) = found_checksum(tail) else {
+        return damaged(FixError::Garbled(
+            "the checksum field does not close the message",
+        ));
+    };
     let computed = checksum(counted);
     if computed != found {
-        return Err(FixError::Checksum { computed, found });
+        return damaged(FixError::Checksum { computed, found });
     }
-    header_of(fields(counted.get(start..).unwrap_or(&[]))?).map(Some)
+    let body = counted.get(start..).unwrap_or(&[]);
+    Ok(Some(fields(body).and_then(header_of).map_err(|error| {
+        Unreadable {
+            seq: scanned_seq(body),
+            error,
+        }
+    })))
 }
 
 fn civil(days: i64) -> (i64, i64, i64) {
@@ -508,7 +547,7 @@ pub fn parse_time(text: &str) -> Option<Timestamp> {
 mod tests {
     use super::{
         BEGIN_STRING, Field, Frame, Header, MAX_BODY_LENGTH, SOH, checksum, decode, encode,
-        format_time, parse_time,
+        format_time, parse_time, take,
     };
     use crate::common::errors::FixError;
     use crate::common::time::Timestamp;
@@ -632,6 +671,24 @@ mod tests {
             decode(&mut bytes).expect("next").map(|f| f.header.seq),
             Some(2)
         );
+    }
+
+    #[test]
+    fn unreadable_message_keeps_its_number_only_when_its_bytes_are_intact() {
+        let seq = |bytes: &mut Vec<u8>| match take(bytes) {
+            Ok(Some(Err(unreadable))) => Ok(unreadable.seq),
+            other => Err(other),
+        };
+        assert_eq!(seq(&mut sealed("35=0|49=A|56=B|34=7|")), Ok(Some(7)));
+        assert_eq!(seq(&mut sealed("35=0|49=A|56=B|34=7|58=|")), Ok(Some(7)));
+        assert_eq!(seq(&mut sealed("35=0|49=A|56=B|34=7|34=8|")), Ok(None));
+        assert_eq!(seq(&mut sealed("35=0|49=A|56=B|34=x|")), Ok(None));
+        assert_eq!(seq(&mut sealed("35=0|49=A|56=B|")), Ok(None));
+        let mut damaged = sealed("35=0|49=A|56=B|34=7|");
+        let at = damaged.len() - 2;
+        let digit = damaged.get_mut(at).expect("last digit of the checksum");
+        *digit = if *digit == b'9' { b'0' } else { *digit + 1 };
+        assert_eq!(seq(&mut damaged), Ok(None));
     }
 
     #[test]

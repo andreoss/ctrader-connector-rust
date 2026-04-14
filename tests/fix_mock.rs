@@ -9,9 +9,9 @@ use ctrader_connector::common::errors::{ConnectorError, FixError, Interruption, 
 use ctrader_connector::common::transport::Plain;
 use ctrader_connector::fix::client::FixClient;
 use ctrader_connector::fix::messages::{
-    BusinessReject, Heartbeat, Logout, Message, Reject, TestRequest,
+    BusinessReject, Heartbeat, Logout, Message, Reject, ResendRequest, TestRequest,
 };
-use ctrader_connector::fix::session::{Event, SessionKind};
+use ctrader_connector::fix::session::{Event, Inbound, SessionKind};
 use fix_support::{PASSWORD, SENDER, STEP, Server, USERNAME, session};
 use tokio::sync::broadcast::Receiver;
 use tokio::time::{Instant, timeout};
@@ -431,6 +431,100 @@ async fn request_ends_typed_when_the_server_logs_out_or_drops_the_connection() {
     assert_eq!(
         dropped,
         Err(ConnectorError::Transport(TransportError::Closed))
+    );
+}
+
+fn sealed(body: &str) -> Vec<u8> {
+    let body = body.replace('|', "\u{1}");
+    let mut bytes = format!("8=FIX.4.4\u{1}9={}\u{1}{body}", body.len()).into_bytes();
+    let sum = bytes.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+    bytes.extend_from_slice(format!("10={sum:03}\u{1}").as_bytes());
+    bytes
+}
+
+fn without_sending_time(seq: u64) -> Vec<u8> {
+    sealed(&format!("35=8|49=CSERVER|56={SENDER}|34={seq}|"))
+}
+
+#[tokio::test]
+async fn message_with_an_unreadable_header_is_rejected_and_the_numbering_goes_on() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let missing = FixError::MissingField {
+        msg_type: "8".to_owned(),
+        tag: 52,
+    };
+    peer.raw(&without_sending_time(seq)).await;
+    assert_eq!(next(&mut events).await, Event::Unparsed(missing.clone()));
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(Reject {
+            ref_seq_num: seq,
+            text: Some(missing.to_string()),
+            ref_tag_id: Some(52),
+            ref_msg_type: Some("8".to_owned()),
+            reason: Some(1),
+        })
+    );
+    peer.set_next_seq(seq + 1);
+    peer.send(probe("after")).await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Message(Inbound {
+            seq: seq + 1,
+            poss_dup: false,
+            message: probe("after"),
+        })
+    );
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(Heartbeat {
+            test_req_id: Some("after".to_owned()),
+        })
+    );
+    peer.raw(&without_sending_time(seq)).await;
+    assert_eq!(next(&mut events).await, Event::Unparsed(missing.clone()));
+    peer.raw(&without_sending_time(seq + 3)).await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Gap {
+            expected: seq + 2,
+            received: seq + 3,
+        }
+    );
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(ResendRequest {
+            begin_seq_no: seq + 2,
+            end_seq_no: 0,
+        })
+    );
+    peer.raw(&sealed(&format!(
+        "35=8|49=CSERVER|56={SENDER}|34={}|34={}|",
+        seq + 2,
+        seq + 2
+    )))
+    .await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Unparsed(FixError::InvalidField { tag: 34, .. })
+    ));
+    peer.set_next_seq(seq + 2);
+    peer.send(probe("again")).await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Message(Inbound {
+            seq: seq + 2,
+            poss_dup: false,
+            message: probe("again"),
+        })
+    );
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(Heartbeat {
+            test_req_id: Some("again".to_owned()),
+        })
     );
 }
 
