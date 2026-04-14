@@ -55,6 +55,18 @@ const TAG_POSS_DUP: u32 = 43;
 const TAG_ORIG_SENDING_TIME: u32 = 122;
 const TAG_PASSWORD: u32 = 554;
 
+const ENVELOPE: [u32; 9] = [
+    TAG_MSG_TYPE,
+    TAG_SENDER_COMP_ID,
+    TAG_TARGET_COMP_ID,
+    TAG_TARGET_SUB_ID,
+    TAG_SENDER_SUB_ID,
+    TAG_SEQ,
+    TAG_SENDING_TIME,
+    TAG_POSS_DUP,
+    TAG_ORIG_SENDING_TIME,
+];
+
 /// One `tag=value` field.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Field {
@@ -179,8 +191,9 @@ fn put(out: &mut String, msg_type: &str, tag: u32, value: &str) -> Result<(), Fi
 /// # Errors
 ///
 /// Returns [`FixError::InvalidField`] when a value is empty or holds the delimiter, or a body
-/// field carries a tag of the framing, and [`FixError::TooLong`] when the body exceeds
-/// [`MAX_BODY_LENGTH`].
+/// field carries a tag of the envelope: of the framing (8, 9, 10) or of the standard header
+/// (34, 35, 43, 49, 50, 52, 56, 57, 122), which [`Header`] alone sets, and
+/// [`FixError::TooLong`] when the body exceeds [`MAX_BODY_LENGTH`].
 pub fn encode(frame: &Frame) -> Result<Vec<u8>, FixError> {
     let header = &frame.header;
     let kind = header.msg_type.as_str();
@@ -205,6 +218,12 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, FixError> {
         put(&mut body, kind, TAG_ORIG_SENDING_TIME, &first)?;
     }
     for field in &frame.body {
+        if ENVELOPE.contains(&field.tag) {
+            return Err(FixError::InvalidField {
+                msg_type: kind.to_owned(),
+                tag: field.tag,
+            });
+        }
         put(&mut body, kind, field.tag, &field.value)?;
     }
     if body.len() > MAX_BODY_LENGTH {
@@ -798,6 +817,15 @@ mod tests {
             Field::new(9, "5"),
             Field::new(10, "000"),
             Field::new(0, "x"),
+            Field::new(34, "9"),
+            Field::new(35, "D"),
+            Field::new(43, "Y"),
+            Field::new(49, "other"),
+            Field::new(50, "QUOTE"),
+            Field::new(52, "20170117-08:03:04"),
+            Field::new(56, "other"),
+            Field::new(57, "QUOTE"),
+            Field::new(122, "20170117-08:03:04"),
         ] {
             assert_eq!(
                 refused(field.clone()),
