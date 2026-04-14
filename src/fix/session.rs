@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 use crate::common::config::ConfigurationFix;
 use crate::common::errors::{ConnectorError, FixError, TransportError};
@@ -36,8 +36,7 @@ use crate::fix::messages::{
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 4096;
 const READ_CHUNK: usize = 8 * 1024;
-const SHORTEST_TICK: Duration = Duration::from_millis(20);
-const LONGEST_TICK: Duration = Duration::from_secs(1);
+const FAR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const PROBE: &str = "alive";
 const RECONNECT_ATTEMPTS: u32 = 5;
 const EVERY_LATER_MESSAGE: u64 = 0;
@@ -207,6 +206,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Live<S> {
     async fn close(&mut self) {
         let _ = self.stream.shutdown().await;
     }
+}
+
+fn after(from: Instant, wait: Duration) -> Instant {
+    from.checked_add(wait)
+        .or_else(|| from.checked_add(FAR))
+        .unwrap_or(from)
 }
 
 fn rejection(seq: u64, error: &FixError) -> Reject {
@@ -526,8 +531,20 @@ impl<C: Connect> Actor<C> {
             return None;
         };
         match self.transmit(live, &message).await {
+            Ok(_) => None,
             Err(ConnectorError::Transport(error)) => Some(End::Lost(error)),
-            _ => None,
+            Err(error) => Some(End::Lost(TransportError::Decode(error.to_string()))),
+        }
+    }
+
+    fn due(&self, live: &Live<C::Stream>) -> Instant {
+        let heartbeat = self.configuration.heartbeat();
+        let halves = if live.probed { 5 } else { 3 };
+        let silence = after(live.last_received, heartbeat.saturating_mul(halves) / 2);
+        let due = after(live.last_sent, heartbeat).min(silence);
+        match live.awaited {
+            Some((_, since)) => due.min(after(since, self.configuration.timeout())),
+            None => due,
         }
     }
 
@@ -563,10 +580,8 @@ impl<C: Connect> Actor<C> {
         live: &mut Live<C::Stream>,
         commands: &mut mpsc::Receiver<Command>,
     ) -> End {
-        let period = (self.configuration.heartbeat() / 4).clamp(SHORTEST_TICK, LONGEST_TICK);
-        let mut ticker = interval(period);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
+            let due = self.due(live);
             let end = tokio::select! {
                 command = commands.recv() => self.command(live, command).await,
                 received = live.receive() => match received {
@@ -574,7 +589,7 @@ impl<C: Connect> Actor<C> {
                     Ok(Err(unreadable)) => self.unreadable(live, unreadable).await,
                     Ok(Ok(frame)) => self.accept(live, frame).await,
                 },
-                _ = ticker.tick() => self.beat(live).await,
+                () = sleep_until(due) => self.beat(live).await,
             };
             if let Some(end) = end {
                 return end;
