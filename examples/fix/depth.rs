@@ -17,6 +17,7 @@ use ctrader_connector::fix::quotes::BookEntry;
 use ctrader_connector::fix::session::SessionKind;
 
 use support::fix::{leave, session, symbol};
+use support::guard::Access;
 use support::{Failure, QUOTES, STEP, within};
 
 const CHANGES: usize = 5;
@@ -36,7 +37,7 @@ fn print_side(name: &str, entries: &[&BookEntry]) {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let quote = session(SessionKind::Quote).await?;
+    let quote = session(SessionKind::Quote, Access::ReadOnly).await?;
     let security = symbol(&quote).await?;
     let mut depth = within(STEP, "the first book", quote.subscribe_depth(security.id)).await??;
     println!(

@@ -12,6 +12,7 @@ use std::time::Duration;
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 
 use support::Failure;
+use support::guard::Access;
 use support::open_api::session;
 
 const SPAN: Duration = Duration::from_secs(86_400);
@@ -19,7 +20,7 @@ const SHOWN: usize = 3;
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let day = TimeRange::ending_at(Timestamp::now(), SPAN);
     let deals = client.deal_history(account, day).await?;
     let orders = client.order_history(account, day).await?;

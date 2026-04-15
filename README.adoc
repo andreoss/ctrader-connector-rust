@@ -180,6 +180,12 @@ refresh example needs it when asked to rotate.
 |`BROKER_EXAMPLE_MARKET`
 |no
 |Set to `1` to let the FIX order example also trade at market.
+
+|`BROKER_EXAMPLE_ALLOW_LIVE`
+|no
+|Lets the examples leave the demo environment: `read-only` for the examples
+that place no order, `yes` for every example. Absent or any other value:
+demo only.
 |===
 
 == Examples
@@ -210,7 +216,7 @@ examples/
 │   ├── orders.rs          limit order: place, replace, cancel; market on request
 │   ├── reports.rs         order status, mass status and positions
 │   └── reconnect.rs       recovery after a lost connection
-└── support/               pieces the examples share
+└── support/               pieces the examples share; guard.rs is the demo guard
 ----
 
 An example is named after its protocol and its file:
@@ -225,10 +231,26 @@ Every example reads its configuration from the environment, prints a short
 result without secrets and exits with a non-zero status and the kind of the
 error on failure. The trading examples run against a demo account, order the
 smallest volume, place waiting orders far from the market and remove what
-they created. Every example refuses another environment before it connects:
-the Open API ones unless `BROKER_ENVIRONMENT` is `demo` or absent, the FIX
-ones unless `BROKER_FIX_SENDER_COMP_ID` starts with `demo.` and no label of
-`BROKER_FIX_HOST` starts with `live`.
+they created.
+
+Every example, the read-only ones included, takes its configuration and its
+client from one guard, `examples/support/guard.rs`, which checks the
+configuration before any connection is opened. The guard is an allowlist:
+
+- an Open API example runs when `BROKER_ENVIRONMENT` is `demo` or absent and
+  the host is `demo.ctraderapi.com`;
+- a FIX example runs when `BROKER_FIX_SENDER_COMP_ID` starts with `demo.`,
+  one label of `BROKER_FIX_HOST` has the part `demo` and no label has a part
+  that starts with `live`; the parts of a label are separated by `-`,
+  `demo` is matched in lower case only and `live` in any case.
+
+Anything else is refused unless `BROKER_EXAMPLE_ALLOW_LIVE` permits it:
+`read-only` lets the examples that place no order leave demo, `yes` lets
+every example leave it, the trading ones included, and any other value
+permits nothing. Outside demo an Open API example works with the first
+account of the environment it connects to. A test scans the sources of the
+examples and fails when one of them builds a configuration or connects
+without the guard.
 
 == Build
 

@@ -16,6 +16,7 @@ use ctrader_connector::common::decimals::Price;
 use ctrader_connector::fix::session::SessionKind;
 
 use support::fix::{leave, session, symbol};
+use support::guard::Access;
 use support::{Failure, QUOTES, STEP, within};
 
 const UPDATES: usize = 3;
@@ -26,7 +27,7 @@ fn shown(price: Option<Price>) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let quote = session(SessionKind::Quote).await?;
+    let quote = session(SessionKind::Quote, Access::ReadOnly).await?;
     let security = symbol(&quote).await?;
     let mut spots = within(STEP, "the first prices", quote.subscribe_spot(security.id)).await??;
     let first = spots.last();

@@ -20,6 +20,7 @@ use ctrader_connector::open_api::executions::TradeEvent;
 use ctrader_connector::open_api::symbols::Symbol;
 use ctrader_connector::open_api::trading::{ExecutionType, Label, NewOrder, TradeSide};
 
+use support::guard::Access;
 use support::open_api::{market, session, sweep, symbol_details};
 use support::{Failure, STEP, run_label, scaled, within};
 
@@ -74,7 +75,7 @@ async fn follow(
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::Trading).await?;
     let (symbol, name) = symbol_details(&client, account).await?;
     let label = run_label("executions");
     println!("following a limit order of {name} under the label {label}");

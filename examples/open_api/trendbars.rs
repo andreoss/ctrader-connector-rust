@@ -14,6 +14,7 @@ use std::time::Duration;
 use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::trendbars::{Period, Trendbar, TrendbarsParams};
 
+use support::guard::Access;
 use support::open_api::{session, symbol};
 use support::{Failure, QUOTES, within};
 
@@ -28,7 +29,7 @@ fn show(name: &str, bar: &Trendbar) {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let (symbol, name) = symbol(&client, account).await?;
     let day = TimeRange::ending_at(Timestamp::now(), Duration::from_secs(86_400));
     let params = TrendbarsParams::new(account, symbol, Period::H1, day).count(BARS);

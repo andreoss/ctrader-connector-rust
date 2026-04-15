@@ -24,6 +24,7 @@ use ctrader_connector::fix::session::SessionKind;
 use ctrader_connector::fix::trading::NewOrder;
 
 use support::fix::{Ledger, clear, leave, quantity, session, symbol_and_bid};
+use support::guard::Access;
 use support::{Failure, STEP, run_label, scaled, within};
 
 fn shown(price: Option<Price>) -> String {
@@ -93,8 +94,8 @@ async fn report(
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
     let quantity = quantity()?;
-    let (security, bid) = symbol_and_bid().await?;
-    let trade = session(SessionKind::Trade).await?;
+    let (security, bid) = symbol_and_bid(Access::Trading).await?;
+    let trade = session(SessionKind::Trade, Access::Trading).await?;
     let mut ledger = Ledger::default();
     let outcome = report(&trade, &mut ledger, &security, quantity, bid).await;
     let left = leave(&trade).await;

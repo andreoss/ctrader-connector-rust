@@ -18,6 +18,7 @@ use ctrader_connector::fix::client::FixClient;
 use ctrader_connector::fix::session::{Event, SessionKind};
 
 use support::fix::{leave, session, symbol};
+use support::guard::Access;
 use support::{Failure, QUOTES, STEP, within};
 
 fn shown(price: Option<Price>) -> String {
@@ -46,7 +47,7 @@ async fn recovery(quote: &FixClient) -> Result<(), Failure> {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let quote = session(SessionKind::Quote).await?;
+    let quote = session(SessionKind::Quote, Access::ReadOnly).await?;
     let security = symbol(&quote).await?;
     let mut spots = within(STEP, "the first prices", quote.subscribe_spot(security.id)).await??;
     let before = spots.last();

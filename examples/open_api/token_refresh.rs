@@ -7,6 +7,10 @@
 //! `export BROKER_ACCESS_TOKEN=` and `export BROKER_REFRESH_TOKEN=` lines of the file named by
 //! `BROKER_ENV_FILE` before anything else, and authorises the account with the new token.
 //!
+//! The configuration comes through the guard of the examples, which refuses any environment
+//! but demo before the connection is opened unless `BROKER_EXAMPLE_ALLOW_LIVE` is `read-only`
+//! or `yes`.
+//!
 //! ```sh
 //! cargo run --example open_api_token_refresh --features open-api
 //! cargo run --example open_api_token_refresh --features open-api -- --rotate
@@ -17,12 +21,10 @@ mod support;
 
 use std::path::PathBuf;
 
-use ctrader_connector::common::config::{
-    ConfigurationOpenApi, ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN,
-};
-use ctrader_connector::open_api::client::OpenApiClient;
+use ctrader_connector::common::config::{ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN};
 
-use support::open_api::{configuration, demo_account};
+use support::guard::Access;
+use support::open_api::{account, configuration, open, renewed};
 use support::{Failure, flag};
 
 const ENV_FILE: &str = "BROKER_ENV_FILE";
@@ -80,13 +82,14 @@ fn writable_token_file() -> Result<(PathBuf, String), Failure> {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let configuration = configuration()?;
-    let configured = configuration.refresh_token().is_some();
-    let client = OpenApiClient::connect(configuration.clone()).await?;
+    let checked = configuration(Access::ReadOnly)?;
+    let environment = checked.get().environment();
+    let configured = checked.get().refresh_token().is_some();
+    let client = open(&checked).await?;
     client.authorise_application().await?;
-    let account = demo_account(&client).await?;
+    let account = account(&client, environment).await?;
     client.authorise_account(account).await?;
-    println!("the current access token authorises the demo account");
+    println!("the current access token authorises the {environment} account");
     println!(
         "a refresh token is {}",
         if configured {
@@ -112,20 +115,12 @@ async fn main() -> Result<(), Failure> {
         pair.expires_in.as_secs()
     );
     client.shutdown().await;
-    let rotated = ConfigurationOpenApi::demo()
-        .host(configuration.host())
-        .port(configuration.port())
-        .client_id(configuration.client_id().as_str())
-        .client_secret(configuration.client_secret().expose())
-        .access_token(pair.access.expose())
-        .refresh_token(pair.refresh.expose())
-        .token_url(configuration.token_url())
-        .build()?;
-    let fresh = OpenApiClient::connect(rotated).await?;
+    let rotated = renewed(&checked, pair.access.expose(), pair.refresh.expose())?;
+    let fresh = open(&rotated).await?;
     fresh.authorise_application().await?;
     let authorised = fresh.authorise_account(account).await;
     fresh.shutdown().await;
     authorised?;
-    println!("the new access token authorises the demo account over a new connection");
+    println!("the new access token authorises the {environment} account over a new connection");
     Ok(())
 }

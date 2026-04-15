@@ -16,13 +16,14 @@ use ctrader_connector::open_api::quotes::QuoteSide;
 use ctrader_connector::open_api::ticks::TickDataParams;
 
 use support::Failure;
+use support::guard::Access;
 use support::open_api::{session, symbol};
 
 const SPAN: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let (symbol, name) = symbol(&client, account).await?;
     let range = TimeRange::ending_at(Timestamp::now(), SPAN);
     for side in [QuoteSide::Bid, QuoteSide::Ask] {

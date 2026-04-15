@@ -13,6 +13,7 @@ mod support;
 use ctrader_connector::open_api::symbols::SymbolsParams;
 
 use support::Failure;
+use support::guard::Access;
 use support::open_api::{session, symbol_details};
 
 fn shown<T: ToString>(value: Option<T>) -> String {
@@ -21,7 +22,7 @@ fn shown<T: ToString>(value: Option<T>) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let assets = client.assets(account).await?;
     println!("{} assets", assets.len());
     let list = client

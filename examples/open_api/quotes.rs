@@ -11,6 +11,7 @@ mod support;
 
 use ctrader_connector::common::decimals::Price;
 
+use support::guard::Access;
 use support::open_api::{session, symbol};
 use support::{Failure, QUOTES, within};
 
@@ -22,7 +23,7 @@ fn shown(price: Option<Price>) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let (symbol, name) = symbol(&client, account).await?;
     let mut quotes = client.subscribe_quotes(account, &[symbol]).await?;
     for _ in 0..QUOTES_SHOWN {

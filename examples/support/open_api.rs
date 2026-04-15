@@ -10,33 +10,57 @@ use ctrader_connector::open_api::executions::{ExecutionStream, TradeEvent};
 use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
 use ctrader_connector::open_api::trading::{Execution, ExecutionType};
 
+use super::guard::{self, Access, Checked};
 use super::{Failure, QUOTES, STEP, symbol_name, veil, within};
 
 const SWEEP_ROUNDS: usize = 10;
 const SESSION_ROUNDS: usize = 5;
 
-/// Reads the configuration from the environment and refuses any environment but demo.
+/// Reads the configuration from the environment through the guard.
 ///
 /// # Errors
 ///
-/// Returns a [`Failure`] when a variable is absent or rejected, or the environment is live.
-pub fn configuration() -> Result<ConfigurationOpenApi, Failure> {
-    let configuration = ConfigurationOpenApi::from_env()?;
-    if configuration.environment() == Environment::Demo {
-        Ok(configuration)
-    } else {
-        Err(Failure::new(
-            "the examples run against the demo environment only",
-        ))
-    }
+/// Returns a [`Failure`] when a variable is absent or rejected, or the guard refuses the
+/// configuration for `access`; see [`guard`].
+pub fn configuration(access: Access) -> Result<Checked<ConfigurationOpenApi>, Failure> {
+    Ok(guard::open_api(access)?)
 }
 
-/// Returns the first demo account the access token grants access to.
+/// Opens a connection with a configuration the guard let through.
 ///
 /// # Errors
 ///
-/// Returns a [`Failure`] when the list cannot be read or holds no demo account.
-pub async fn demo_account(client: &OpenApiClient) -> Result<AccountId, Failure> {
+/// Returns a [`Failure`] when the connection cannot be established.
+pub async fn open(checked: &Checked<ConfigurationOpenApi>) -> Result<OpenApiClient, Failure> {
+    Ok(guard::open_api_client(checked).await?)
+}
+
+/// Returns `checked` with a new token pair; the environment and the host stay the same.
+///
+/// # Errors
+///
+/// Returns a [`Failure`] when a token of the pair is empty.
+pub fn renewed(
+    checked: &Checked<ConfigurationOpenApi>,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<Checked<ConfigurationOpenApi>, Failure> {
+    Ok(guard::open_api_renewed(
+        checked,
+        access_token,
+        refresh_token,
+    )?)
+}
+
+/// Returns the first account of `environment` the access token grants access to.
+///
+/// # Errors
+///
+/// Returns a [`Failure`] when the list cannot be read or holds no such account.
+pub async fn account(
+    client: &OpenApiClient,
+    environment: Environment,
+) -> Result<AccountId, Failure> {
     let accounts = client.accounts().await?;
     for account in &accounts {
         veil(account.id);
@@ -44,22 +68,33 @@ pub async fn demo_account(client: &OpenApiClient) -> Result<AccountId, Failure> 
             veil(login);
         }
     }
+    let live = environment == Environment::Live;
     accounts
         .iter()
-        .find(|account| !account.is_live)
+        .find(|account| account.is_live == live)
         .map(|account| account.id)
-        .ok_or_else(|| Failure::new("the access token grants access to no demo account"))
+        .ok_or_else(|| {
+            Failure::new(format!(
+                "the access token grants access to no {environment} account"
+            ))
+        })
 }
 
-/// Connects, authorises the application and authorises the first demo account.
+/// Connects, authorises the application and authorises the first account of the
+/// environment, which is demo unless the guard was told otherwise.
+///
+/// Every Open API example reaches the server through [`configuration`] and [`open`], so none
+/// of them connects with a configuration the guard did not check.
 ///
 /// # Errors
 ///
-/// Returns a [`Failure`] when the configuration, the connection or an authorisation fails.
-pub async fn session() -> Result<(OpenApiClient, AccountId), Failure> {
-    let client = OpenApiClient::connect(configuration()?).await?;
+/// Returns a [`Failure`] when the guard refuses the configuration for `access`, or the
+/// connection or an authorisation fails.
+pub async fn session(access: Access) -> Result<(OpenApiClient, AccountId), Failure> {
+    let checked = configuration(access)?;
+    let client = open(&checked).await?;
     client.authorise_application().await?;
-    let account = demo_account(&client).await?;
+    let account = account(&client, checked.get().environment()).await?;
     client.authorise_account(account).await?;
     Ok((client, account))
 }
@@ -175,7 +210,7 @@ pub async fn sweep(label: &str) -> Result<(), Failure> {
         if round > 0 {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        match session().await {
+        match session(Access::Trading).await {
             Ok((client, account)) => {
                 let outcome = sweep_over(&client, account, label).await;
                 client.shutdown().await;

@@ -10,6 +10,7 @@ mod support;
 use ctrader_connector::common::decimals::Price;
 
 use support::Failure;
+use support::guard::Access;
 use support::open_api::session;
 
 fn shown(price: Option<Price>) -> String {
@@ -18,7 +19,7 @@ fn shown(price: Option<Price>) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let reconciled = client.reconcile(account).await?;
     client.shutdown().await;
     println!(

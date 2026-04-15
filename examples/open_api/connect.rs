@@ -1,7 +1,10 @@
 //! Connects to the Open API and authorises the application and a demo account.
 //!
 //! The steps are spelled out here; the other examples take them from the shared `session`
-//! helper. Needs `BROKER_CLIENT_ID`, `BROKER_CLIENT_SECRET` and `BROKER_ACCESS_TOKEN`.
+//! helper. The configuration comes through the guard of the examples, which refuses any
+//! environment but demo before the connection is opened unless
+//! `BROKER_EXAMPLE_ALLOW_LIVE` is `read-only` or `yes`. Needs `BROKER_CLIENT_ID`,
+//! `BROKER_CLIENT_SECRET` and `BROKER_ACCESS_TOKEN`.
 //!
 //! ```sh
 //! cargo run --example open_api_connect --features open-api
@@ -10,16 +13,17 @@
 #[path = "../support/mod.rs"]
 mod support;
 
-use ctrader_connector::common::config::ConfigurationOpenApi;
-use ctrader_connector::open_api::client::OpenApiClient;
+use ctrader_connector::common::config::Environment;
 
+use support::guard::Access;
+use support::open_api::{configuration, open};
 use support::{Failure, veil};
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let configuration = ConfigurationOpenApi::from_env()?;
-    let environment = configuration.environment();
-    let client = OpenApiClient::connect(configuration).await?;
+    let checked = configuration(Access::ReadOnly)?;
+    let environment = checked.get().environment();
+    let client = open(&checked).await?;
     println!("connected to the {environment} environment");
     let version = client.version().await?;
     println!("the server speaks version {version} of the protocol");
@@ -29,20 +33,24 @@ async fn main() -> Result<(), Failure> {
     for account in &accounts {
         veil(account.id);
     }
-    let demo: Vec<_> = accounts.iter().filter(|account| !account.is_live).collect();
+    let live = environment == Environment::Live;
+    let own: Vec<_> = accounts
+        .iter()
+        .filter(|account| account.is_live == live)
+        .collect();
     println!(
-        "the access token grants access to {} accounts, {} of them demo",
+        "the access token grants access to {} accounts, {} of them {environment}",
         accounts.len(),
-        demo.len()
+        own.len()
     );
-    let Some(account) = demo.first() else {
+    let Some(account) = own.first() else {
         client.shutdown().await;
-        return Err(Failure::new(
-            "the access token grants access to no demo account",
-        ));
+        return Err(Failure::new(format!(
+            "the access token grants access to no {environment} account"
+        )));
     };
     client.authorise_account(account.id).await?;
-    println!("demo account authorised");
+    println!("{environment} account authorised");
     client.shutdown().await;
     println!("connection shut down");
     Ok(())

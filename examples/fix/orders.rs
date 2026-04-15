@@ -27,6 +27,7 @@ use ctrader_connector::fix::session::SessionKind;
 use ctrader_connector::fix::trading::NewOrder;
 
 use support::fix::{Ledger, clear, leave, quantity, session, symbol_and_bid};
+use support::guard::Access;
 use support::{Failure, STEP, flag, run_label, scaled, within};
 
 fn shown(price: Option<Price>) -> String {
@@ -131,10 +132,10 @@ async fn market_order(
 async fn main() -> Result<(), Failure> {
     let with_market = flag("--market", "BROKER_EXAMPLE_MARKET");
     let quantity = quantity()?;
-    let (security, bid) = symbol_and_bid().await?;
+    let (security, bid) = symbol_and_bid(Access::Trading).await?;
     let label = run_label("fix-orders");
     println!("trading {} at a bid of {bid}", security.name);
-    let trade = session(SessionKind::Trade).await?;
+    let trade = session(SessionKind::Trade, Access::Trading).await?;
     let mut ledger = Ledger::default();
     let mut outcome = waiting_order(&trade, &mut ledger, &security, quantity, bid, &label).await;
     if outcome.is_ok() && with_market {

@@ -12,13 +12,14 @@ mod support;
 use ctrader_connector::fix::session::SessionKind;
 
 use support::fix::{leave, session};
+use support::guard::Access;
 use support::{Failure, STEP, symbol_name, within};
 
 const SHOWN: usize = 5;
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let quote = session(SessionKind::Quote).await?;
+    let quote = session(SessionKind::Quote, Access::ReadOnly).await?;
     let securities = within(STEP, "the security list", quote.securities()).await?;
     leave(&quote).await?;
     let securities = securities?;

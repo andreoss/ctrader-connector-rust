@@ -11,7 +11,7 @@ use ctrader_connector::fix::securities::Security;
 use ctrader_connector::fix::session::SessionKind;
 use ctrader_connector::fix::trading::{NewOrder, OrderReport};
 
-use super::demo::demo_only;
+use super::guard::{self, Access, Checked};
 use super::{Failure, QUOTES, STEP, setting, symbol_name, veil, within};
 
 /// Variable naming the quantity the trading examples order, in units of the base asset.
@@ -24,36 +24,32 @@ pub const DEFAULT_QUANTITY: &str = "0.01";
 const CLEAR_ROUNDS: usize = 10;
 const SESSION_ROUNDS: usize = 5;
 
-/// Reads the configuration from the environment and refuses any account but a demo one.
+/// Reads the configuration from the environment through the guard.
 ///
 /// # Errors
 ///
-/// Returns a [`Failure`] when a variable is absent or rejected, or when the sender identifier
-/// or the host names another environment than demo; see [`demo_only`].
-pub fn configuration() -> Result<ConfigurationFix, Failure> {
-    let configuration = ConfigurationFix::from_env()?;
-    veil(configuration.sender_comp_id());
-    veil(configuration.username());
-    demo_only(configuration.sender_comp_id(), configuration.host()).map_err(|reason| {
-        Failure::new(format!(
-            "the examples run against a demo account only: {reason}"
-        ))
-    })?;
-    Ok(configuration)
+/// Returns a [`Failure`] when a variable is absent or rejected, or the guard refuses the
+/// sender identifier or the host for `access`; see [`guard`].
+pub fn configuration(access: Access) -> Result<Checked<ConfigurationFix>, Failure> {
+    let checked = guard::fix(access)?;
+    veil(checked.get().sender_comp_id());
+    veil(checked.get().username());
+    Ok(checked)
 }
 
-/// Logs on to one session of the demo account the environment names.
+/// Logs on to one session of the account the environment names, which is a demo one
+/// unless the guard was told otherwise.
 ///
-/// Every FIX example reaches the server through this function, so none of them logs on to
-/// an account that is not a demo one.
+/// Every FIX example reaches the server through this function, so none of them logs on
+/// with a configuration the guard did not check.
 ///
 /// # Errors
 ///
 /// Returns a [`Failure`] when the configuration is refused by [`configuration`] or the logon
 /// fails.
-pub async fn session(kind: SessionKind) -> Result<FixClient, Failure> {
-    let configuration = configuration()?;
-    let logon = Box::pin(FixClient::connect(configuration, kind));
+pub async fn session(kind: SessionKind, access: Access) -> Result<FixClient, Failure> {
+    let checked = configuration(access)?;
+    let logon = Box::pin(guard::fix_client(&checked, kind));
     Ok(within(STEP, "the logon", logon).await??)
 }
 
@@ -86,8 +82,8 @@ pub async fn symbol(quote: &FixClient) -> Result<Security, Failure> {
 /// # Errors
 ///
 /// Returns a [`Failure`] when the session, the symbol or the price cannot be had.
-pub async fn symbol_and_bid() -> Result<(Security, Price), Failure> {
-    let quote = session(SessionKind::Quote).await?;
+pub async fn symbol_and_bid(access: Access) -> Result<(Security, Price), Failure> {
+    let quote = session(SessionKind::Quote, access).await?;
     let security = symbol(&quote).await?;
     let mut spots = within(STEP, "the first prices", quote.subscribe_spot(security.id)).await??;
     let bid = within(QUOTES, "a bid", async {
@@ -176,7 +172,7 @@ async fn session_for_clearing() -> Result<FixClient, Failure> {
         if round > 0 {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        match session(SessionKind::Trade).await {
+        match session(SessionKind::Trade, Access::Trading).await {
             Ok(trade) => return Ok(trade),
             Err(failure) => last = failure,
         }

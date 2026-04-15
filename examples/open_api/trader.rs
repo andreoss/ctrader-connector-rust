@@ -8,11 +8,12 @@
 mod support;
 
 use support::Failure;
+use support::guard::Access;
 use support::open_api::session;
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let trader = client.trader(account).await?;
     client.shutdown().await;
     println!("balance: {} {}", trader.balance, trader.currency);

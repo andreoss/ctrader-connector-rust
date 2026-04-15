@@ -12,6 +12,7 @@ mod support;
 
 use ctrader_connector::open_api::depth::DepthQuote;
 
+use support::guard::Access;
 use support::open_api::{session, symbol};
 use support::{Failure, QUOTES, within};
 
@@ -29,7 +30,7 @@ fn levels(quotes: &[DepthQuote]) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::ReadOnly).await?;
     let (symbol, name) = symbol(&client, account).await?;
     let mut depth = client.subscribe_depth(account, &[symbol]).await?;
     let filled = within(QUOTES, "a book with both sides", async {

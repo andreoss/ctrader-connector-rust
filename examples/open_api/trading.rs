@@ -25,6 +25,7 @@ use ctrader_connector::open_api::trading::{
     ExecutionType, Label, NewOrder, Order, OrderAmendment, Position, PositionAmendment, TradeSide,
 };
 
+use support::guard::Access;
 use support::open_api::{execution_of, market, session, sweep, symbol_details};
 use support::{Failure, run_label, scaled, seconds_from_now};
 
@@ -194,7 +195,7 @@ impl Desk {
 
 #[tokio::main]
 async fn main() -> Result<(), Failure> {
-    let (client, account) = session().await?;
+    let (client, account) = session(Access::Trading).await?;
     let (symbol, name) = symbol_details(&client, account).await?;
     let label = run_label("trading");
     println!("trading {name} under the label {label}");

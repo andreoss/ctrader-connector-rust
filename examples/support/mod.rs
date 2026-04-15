@@ -16,9 +16,8 @@ use ctrader_connector::common::time::Timestamp;
 use rust_decimal::Decimal;
 
 #[cfg(feature = "fix")]
-pub mod demo;
-#[cfg(feature = "fix")]
 pub mod fix;
+pub mod guard;
 #[cfg(feature = "open-api")]
 pub mod open_api;
 
@@ -72,6 +71,12 @@ impl Failure {
 impl fmt::Debug for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&veiled(&self.0))
+    }
+}
+
+impl From<guard::Refusal> for Failure {
+    fn from(refusal: guard::Refusal) -> Self {
+        Self(refusal.to_string())
     }
 }
 
