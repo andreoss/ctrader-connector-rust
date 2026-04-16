@@ -14,9 +14,10 @@
 //! [`TransportError::WriteTimeout`], and a server that sends nothing at all, not even a
 //! heartbeat, for the period set with [`ConnectionOptions::inbound_timeout`] fails the
 //! connection with [`TransportError::Idle`]. Both count as a loss of the connection.
-//! Every duration an option carries is added to the clock without overflow: a wait that would
-//! end more than thirty years ahead ends thirty years ahead, so [`Duration::MAX`] stands for
-//! never and turns the wait it is given to off.
+//! Every duration an option carries is added to the clock without overflow. A heartbeat
+//! interval, a silence allowed or a time allowed for a response of more than thirty years is
+//! never due, so [`Duration::MAX`] stands for never and turns the wait it is given to off. A
+//! pause before a request is sent again ends thirty years ahead at the latest.
 //!
 //! Backpressure: the command channel is bounded, so callers wait while the task is busy, and the
 //! event stream is a bounded broadcast, so a subscriber that falls behind skips the oldest
@@ -52,6 +53,7 @@
 //! the caller is told that its outcome is unknown, with [`ConnectorError::OutcomeUnknown`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::pending;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -520,8 +522,8 @@ impl Connection {
             connector,
             host: host.to_owned(),
             port,
-            heartbeat_at: after(Instant::now(), options.heartbeat_interval),
-            silent_at: after(Instant::now(), options.silence()),
+            heartbeat_at: within(Instant::now(), options.heartbeat_interval),
+            silent_at: within(Instant::now(), options.silence()),
             options,
             commands: receiver,
             events: events.clone(),
@@ -743,15 +745,15 @@ struct Actor<C: Connect> {
     counters: Arc<Counters>,
     queue: VecDeque<Outbound>,
     pending: HashMap<String, Outbound>,
-    deadlines: VecDeque<(Instant, String)>,
+    deadlines: VecDeque<(Option<Instant>, String)>,
     replays: Replays,
     ended: Ended,
     throttles: [Throttle; 2],
     paused_until: Option<Instant>,
     send_at: Option<Instant>,
     next_id: u64,
-    heartbeat_at: Instant,
-    silent_at: Instant,
+    heartbeat_at: Option<Instant>,
+    silent_at: Option<Instant>,
 }
 
 impl<C: Connect> Actor<C> {
@@ -805,8 +807,8 @@ impl<C: Connect> Actor<C> {
                             .sent
                             .extend(std::iter::repeat_n(Instant::now(), seeded));
                     }
-                    self.heartbeat_at = after(Instant::now(), self.options.heartbeat_interval);
-                    self.silent_at = after(Instant::now(), self.options.silence());
+                    self.heartbeat_at = within(Instant::now(), self.options.heartbeat_interval);
+                    self.silent_at = within(Instant::now(), self.options.silence());
                     let _ = self.events.send(Event::Reconnected { attempt });
                     return Ok(framed);
                 }
@@ -900,7 +902,7 @@ impl<C: Connect> Actor<C> {
                     Some(Command::Reconnect) => return Exit::Lost(TransportError::Closed),
                     Some(Command::Shutdown) | None => return Exit::Shutdown,
                 },
-                () = sleep_until(wake) => {
+                () = reached(wake) => {
                     if let Err(reason) = self.tick(framed).await {
                         return Exit::Lost(reason);
                     }
@@ -934,19 +936,16 @@ impl<C: Connect> Actor<C> {
     }
 
     fn heard(&mut self, message: ProtoMessage) {
-        self.silent_at = after(Instant::now(), self.options.silence());
+        self.silent_at = within(Instant::now(), self.options.silence());
         self.dispatch(message);
     }
 
-    fn next_wake(&self) -> Instant {
-        let mut wake = self.heartbeat_at.min(self.silent_at);
-        if let Some((deadline, _)) = self.deadlines.front() {
-            wake = wake.min(*deadline);
-        }
-        if let Some(send_at) = self.send_at {
-            wake = wake.min(send_at);
-        }
-        wake
+    fn next_wake(&self) -> Option<Instant> {
+        let deadline = self.deadlines.front().and_then(|(deadline, _)| *deadline);
+        [self.heartbeat_at, self.silent_at, deadline, self.send_at]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     fn next_ready(&mut self, now: Instant) -> Option<usize> {
@@ -1007,9 +1006,9 @@ impl<C: Connect> Actor<C> {
                     {
                         throttle.sent.push_back(now);
                     }
-                    self.heartbeat_at = after(now, self.options.heartbeat_interval);
+                    self.heartbeat_at = within(now, self.options.heartbeat_interval);
                     self.deadlines
-                        .push_back((after(now, self.options.timeout), id.clone()));
+                        .push_back((within(now, self.options.timeout), id.clone()));
                     self.pending.insert(id, outbound);
                 }
                 Err(error @ TransportError::FrameTooLong { .. }) => {
@@ -1027,7 +1026,7 @@ impl<C: Connect> Actor<C> {
     async fn tick(&mut self, framed: &mut Framed<C::Stream>) -> Result<(), TransportError> {
         let now = Instant::now();
         while let Some((deadline, id)) = self.deadlines.pop_front() {
-            if deadline > now {
+            if deadline.is_none_or(|deadline| deadline > now) {
                 self.deadlines.push_front((deadline, id));
                 break;
             }
@@ -1036,18 +1035,21 @@ impl<C: Connect> Actor<C> {
                 let _ = outbound.reply.send(Err(error));
             }
         }
-        if now >= self.silent_at {
+        if self.silent_at.is_some_and(|silent_at| now >= silent_at) {
             let silence = self.options.silence();
             let late = timeout(Duration::ZERO, framed.receive())
                 .await
                 .unwrap_or(Err(TransportError::Idle(silence)));
             self.heard(late?);
         }
-        if now >= self.heartbeat_at {
+        if self
+            .heartbeat_at
+            .is_some_and(|heartbeat_at| now >= heartbeat_at)
+        {
             let beat = ProtoHeartbeatEvent::default().to_message(None);
             write(framed, &beat, self.options.timeout).await?;
             bump(&self.counters.heartbeats_sent);
-            self.heartbeat_at = after(Instant::now(), self.options.heartbeat_interval);
+            self.heartbeat_at = within(Instant::now(), self.options.heartbeat_interval);
         }
         Ok(())
     }
@@ -1162,6 +1164,20 @@ impl Throttle {
 
 fn after(start: Instant, period: Duration) -> Instant {
     start.checked_add(period.min(LONGEST_WAIT)).unwrap_or(start)
+}
+
+fn within(start: Instant, period: Duration) -> Option<Instant> {
+    if period > LONGEST_WAIT {
+        return None;
+    }
+    start.checked_add(period)
+}
+
+async fn reached(wake: Option<Instant>) {
+    match wake {
+        Some(wake) => sleep_until(wake).await,
+        None => pending().await,
+    }
 }
 
 fn over_limit(result: &Result<ProtoMessage, ConnectorError>) -> bool {
@@ -1280,7 +1296,7 @@ mod tests {
     use super::{
         ConnectionOptions, DEFAULT_INBOUND_TIMEOUT, Event, LIMIT_WINDOW, LONGEST_WAIT,
         MAX_COMMAND_CAPACITY, MAX_EVENT_CAPACITY, ReplayKey, ReplayStage,
-        SERVER_HEARTBEAT_INTERVAL, Throttle, after, outcome, over_limit,
+        SERVER_HEARTBEAT_INTERVAL, Throttle, after, outcome, over_limit, within,
     };
     use crate::common::config::ConfigurationOpenApi;
     use crate::common::errors::{ConnectorError, ErrorCode, TransportError};
@@ -1462,6 +1478,10 @@ mod tests {
         assert_eq!(after(start, Duration::MAX), start + LONGEST_WAIT);
         let far = after(start, Duration::MAX);
         assert_eq!(after(far, Duration::MAX), far + LONGEST_WAIT);
+        assert_eq!(within(start, brief), Some(start + brief));
+        assert_eq!(within(start, LONGEST_WAIT), Some(start + LONGEST_WAIT));
+        assert_eq!(within(start, LONGEST_WAIT + Duration::from_nanos(1)), None);
+        assert_eq!(within(start, Duration::MAX), None);
         let options = ConnectionOptions::new()
             .timeout(Duration::MAX)
             .heartbeat_interval(Duration::MAX);

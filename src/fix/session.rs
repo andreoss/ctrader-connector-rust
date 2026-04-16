@@ -21,8 +21,11 @@
 //! connections is refused with [`ConnectorError::Closed`] without being sent.
 //!
 //! Keep-alive: the task sleeps until the next moment something is due, so a heartbeat
-//! leaves when the interval since the last message sent ends, not later.
+//! leaves when the interval since the last message sent ends, not later. A wait the clock
+//! cannot hold, such as an answer awaited for [`Duration::MAX`], is never due; the heartbeat
+//! interval is bounded by the configuration, so the watch on the server always is.
 
+use std::future::pending;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,7 +44,6 @@ use crate::fix::messages::{
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 4096;
 const READ_CHUNK: usize = 8 * 1024;
-const FAR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const PROBE: &str = "alive";
 const RECONNECT_ATTEMPTS: u32 = 5;
 const EVERY_LATER_MESSAGE: u64 = 0;
@@ -213,10 +215,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Live<S> {
     }
 }
 
-fn after(from: Instant, wait: Duration) -> Instant {
+fn after(from: Instant, wait: Duration) -> Option<Instant> {
     from.checked_add(wait)
-        .or_else(|| from.checked_add(FAR))
-        .unwrap_or(from)
+}
+
+async fn reached(due: Option<Instant>) {
+    match due {
+        Some(due) => sleep_until(due).await,
+        None => pending().await,
+    }
 }
 
 fn rejection(seq: u64, error: &FixError) -> Reject {
@@ -542,15 +549,17 @@ impl<C: Connect> Actor<C> {
         }
     }
 
-    fn due(&self, live: &Live<C::Stream>) -> Instant {
+    fn due(&self, live: &Live<C::Stream>) -> Option<Instant> {
         let heartbeat = self.configuration.heartbeat();
         let halves = if live.probed { 5 } else { 3 };
         let silence = after(live.last_received, heartbeat.saturating_mul(halves) / 2);
-        let due = after(live.last_sent, heartbeat).min(silence);
-        match live.awaited {
-            Some((_, since)) => due.min(after(since, self.configuration.timeout())),
-            None => due,
-        }
+        let patience = live
+            .awaited
+            .and_then(|(_, since)| after(since, self.configuration.timeout()));
+        [after(live.last_sent, heartbeat), silence, patience]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     async fn command(&self, live: &mut Live<C::Stream>, command: Option<Command>) -> Option<End> {
@@ -594,7 +603,7 @@ impl<C: Connect> Actor<C> {
                     Ok(Err(unreadable)) => self.unreadable(live, unreadable).await,
                     Ok(Ok(frame)) => self.accept(live, frame).await,
                 },
-                () = sleep_until(due) => self.beat(live).await,
+                () = reached(due) => self.beat(live).await,
             };
             if let Some(end) = end {
                 return end;
@@ -693,4 +702,26 @@ pub(crate) async fn start<C: Connect>(
         events,
         closed: closed_receiver,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::{Instant, timeout};
+
+    use super::{after, reached};
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_the_clock_cannot_hold_is_never_due() {
+        let now = Instant::now();
+        let brief = Duration::from_secs(90);
+        assert_eq!(after(now, brief), Some(now + brief));
+        assert_eq!(after(now, Duration::MAX), None);
+        assert_eq!(timeout(brief, reached(after(now, brief))).await, Ok(()));
+        assert_eq!(now.elapsed(), brief);
+        let year = Duration::from_secs(365 * 86_400);
+        assert!(timeout(year, reached(None)).await.is_err());
+        assert_eq!(now.elapsed(), brief + year);
+    }
 }

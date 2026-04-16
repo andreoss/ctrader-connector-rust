@@ -31,6 +31,14 @@ pub enum ConfigError {
     /// A duration option is zero.
     #[error("{0} must be longer than zero")]
     ZeroDuration(&'static str),
+    /// A duration option is longer than the longest value it accepts.
+    #[error("{option} must not be longer than {} s", limit.as_secs())]
+    TooLong {
+        /// Name of the option.
+        option: &'static str,
+        /// Longest value the option accepts.
+        limit: Duration,
+    },
 }
 
 macro_rules! error_codes {

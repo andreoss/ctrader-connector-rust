@@ -538,6 +538,12 @@ pub const DEFAULT_FIX_TRADE_PLAIN_PORT: u16 = 5202;
 pub const DEFAULT_FIX_TARGET_COMP_ID: &str = "CSERVER";
 /// Default interval between heartbeats.
 pub const DEFAULT_FIX_HEARTBEAT: Duration = Duration::from_secs(30);
+/// Longest interval between heartbeats a configuration accepts.
+///
+/// The logon carries the interval as a whole number of seconds (108) and the session watches
+/// the server on multiples of it, so an interval without an end would leave a dead connection
+/// unnoticed.
+pub const MAX_FIX_HEARTBEAT: Duration = Duration::from_secs(3_600);
 
 const FIX_HOST: &str = "host";
 const FIX_SENDER_COMP_ID: &str = "sender_comp_id";
@@ -780,7 +786,13 @@ impl ConfigurationFixBuilder {
         self
     }
 
-    /// Sets the interval between heartbeats; the wire carries it in whole seconds.
+    /// Sets the interval between heartbeats.
+    ///
+    /// The logon carries it as a whole number of seconds (108), so a fraction of a second is
+    /// dropped. [`ConfigurationFixBuilder::build`] refuses an interval below one second: zero
+    /// seconds would ask the server for a session without heartbeats, and this library always
+    /// keeps a session alive and watches the server by them. It also refuses an interval above
+    /// [`MAX_FIX_HEARTBEAT`].
     pub const fn heartbeat(mut self, heartbeat: Duration) -> Self {
         self.heartbeat = heartbeat;
         self
@@ -804,7 +816,8 @@ impl ConfigurationFixBuilder {
     ///
     /// Returns a [`ConfigError`] when the host, the sender, the target, the login or the
     /// password is absent or empty, the host is not a bare host name, a port is zero, the
-    /// heartbeat is shorter than one second, or another duration is zero.
+    /// heartbeat is shorter than one second or longer than [`MAX_FIX_HEARTBEAT`], or another
+    /// duration is zero.
     pub fn build(self) -> Result<ConfigurationFix, ConfigError> {
         let (quote, trade) = if self.encrypted {
             (DEFAULT_FIX_QUOTE_PORT, DEFAULT_FIX_TRADE_PORT)
@@ -813,6 +826,12 @@ impl ConfigurationFixBuilder {
         };
         if self.heartbeat.as_secs() == 0 {
             return Err(ConfigError::ZeroDuration(HEARTBEAT));
+        }
+        if self.heartbeat > MAX_FIX_HEARTBEAT {
+            return Err(ConfigError::TooLong {
+                option: HEARTBEAT,
+                limit: MAX_FIX_HEARTBEAT,
+            });
         }
         Ok(ConfigurationFix {
             host: host_name(filled(self.host.unwrap_or_default(), FIX_HOST)?)?,
@@ -847,7 +866,7 @@ mod tests {
         DEFAULT_FIX_QUOTE_PLAIN_PORT, DEFAULT_FIX_QUOTE_PORT, DEFAULT_FIX_TARGET_COMP_ID,
         DEFAULT_FIX_TRADE_PLAIN_PORT, DEFAULT_FIX_TRADE_PORT, ENV_FIX_HOST, ENV_FIX_PASSWORD,
         ENV_FIX_QUOTE_PORT, ENV_FIX_SENDER_COMP_ID, ENV_FIX_TARGET_COMP_ID, ENV_FIX_TRADE_PORT,
-        ENV_FIX_USERNAME,
+        ENV_FIX_USERNAME, MAX_FIX_HEARTBEAT,
     };
     use crate::common::errors::ConfigError;
 
@@ -1175,6 +1194,14 @@ mod tests {
             ConfigError::ZeroDuration("timeout").to_string(),
             "timeout must be longer than zero"
         );
+        assert_eq!(
+            ConfigError::TooLong {
+                option: "heartbeat",
+                limit: MAX_FIX_HEARTBEAT,
+            }
+            .to_string(),
+            "heartbeat must not be longer than 3600 s"
+        );
     }
 
     fn fix() -> ConfigurationFixBuilder {
@@ -1236,6 +1263,8 @@ mod tests {
         assert_eq!(configuration.heartbeat(), Duration::from_secs(5));
         assert_eq!(configuration.timeout(), Duration::from_secs(3));
         assert_eq!(configuration.reconnect_delay(), Duration::from_secs(4));
+        let slowest = fix().heartbeat(MAX_FIX_HEARTBEAT).build()?;
+        assert_eq!(slowest.heartbeat(), MAX_FIX_HEARTBEAT);
         Ok(())
     }
 
@@ -1268,6 +1297,22 @@ mod tests {
             (
                 fix().heartbeat(Duration::from_millis(999)).build(),
                 ConfigError::ZeroDuration("heartbeat"),
+            ),
+            (
+                fix()
+                    .heartbeat(MAX_FIX_HEARTBEAT + Duration::from_secs(1))
+                    .build(),
+                ConfigError::TooLong {
+                    option: "heartbeat",
+                    limit: MAX_FIX_HEARTBEAT,
+                },
+            ),
+            (
+                fix().heartbeat(Duration::MAX).build(),
+                ConfigError::TooLong {
+                    option: "heartbeat",
+                    limit: MAX_FIX_HEARTBEAT,
+                },
             ),
             (
                 fix().timeout(Duration::ZERO).build(),
