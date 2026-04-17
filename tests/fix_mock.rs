@@ -572,3 +572,151 @@ async fn unreadable_messages_are_skipped_and_a_broken_stream_ends_the_session() 
         Event::Disconnected(TransportError::Decode(_))
     ));
 }
+
+async fn answered_after(peer: &mut fix_support::Peer, events: &mut Receiver<Event>, seq: u64) {
+    peer.set_next_seq(seq);
+    peer.send(probe("after")).await;
+    assert_eq!(
+        next(events).await,
+        Event::Message(Inbound {
+            seq,
+            poss_dup: false,
+            message: probe("after"),
+        })
+    );
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(Heartbeat {
+            test_req_id: Some("after".to_owned()),
+        })
+    );
+}
+
+#[tokio::test]
+async fn message_of_an_unsupported_type_is_answered_with_a_business_reject() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let unsupported = FixError::UnsupportedMessage("ZZ".to_owned());
+    peer.send_with(
+        seq,
+        |header| header.msg_type = "ZZ".to_owned(),
+        Heartbeat { test_req_id: None },
+    )
+    .await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Unparsed(unsupported.clone())
+    );
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(BusinessReject {
+            ref_seq_num: Some(seq),
+            ref_msg_type: Some("ZZ".to_owned()),
+            ref_id: None,
+            reason: Some(3),
+            text: Some(unsupported.to_string()),
+        })
+    );
+    answered_after(&mut peer, &mut events, seq + 1).await;
+    drop(client);
+}
+
+#[tokio::test]
+async fn message_with_a_malformed_body_is_answered_with_a_reject() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let missing = FixError::MissingField {
+        msg_type: "1".to_owned(),
+        tag: 112,
+    };
+    peer.send_with(
+        seq,
+        |header| header.msg_type = "1".to_owned(),
+        Heartbeat { test_req_id: None },
+    )
+    .await;
+    assert_eq!(next(&mut events).await, Event::Unparsed(missing.clone()));
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(Reject {
+            ref_seq_num: seq,
+            text: Some(missing.to_string()),
+            ref_tag_id: Some(112),
+            ref_msg_type: Some("1".to_owned()),
+            reason: Some(1),
+        })
+    );
+    let invalid = FixError::InvalidField {
+        msg_type: "2".to_owned(),
+        tag: 7,
+    };
+    let mut frame = Message::from(ResendRequest {
+        begin_seq_no: 1,
+        end_seq_no: 0,
+    })
+    .to_frame(peer.header(seq + 1));
+    for field in &mut frame.body {
+        if field.tag == 7 {
+            field.value = "first".to_owned();
+        }
+    }
+    peer.send_frame(&frame).await;
+    assert_eq!(next(&mut events).await, Event::Unparsed(invalid.clone()));
+    assert_eq!(
+        peer.read().await.1,
+        Message::from(Reject {
+            ref_seq_num: seq + 1,
+            text: Some(invalid.to_string()),
+            ref_tag_id: Some(7),
+            ref_msg_type: Some("2".to_owned()),
+            reason: None,
+        })
+    );
+    answered_after(&mut peer, &mut events, seq + 2).await;
+    drop(client);
+}
+
+#[tokio::test]
+async fn reject_that_cannot_be_read_is_never_answered_with_a_reject() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    peer.send_with(
+        seq,
+        |header| header.msg_type = "3".to_owned(),
+        Heartbeat { test_req_id: None },
+    )
+    .await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Unparsed(FixError::MissingField {
+            msg_type: "3".to_owned(),
+            tag: 45,
+        })
+    );
+    let mut frame = Message::from(BusinessReject {
+        ref_seq_num: None,
+        ref_msg_type: None,
+        ref_id: None,
+        reason: Some(3),
+        text: None,
+    })
+    .to_frame(peer.header(seq + 1));
+    for field in &mut frame.body {
+        if field.tag == 380 {
+            field.value = "three".to_owned();
+        }
+    }
+    peer.send_frame(&frame).await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Unparsed(FixError::InvalidField {
+            msg_type: "j".to_owned(),
+            tag: 380,
+        })
+    );
+    answered_after(&mut peer, &mut events, seq + 2).await;
+    drop(client);
+}

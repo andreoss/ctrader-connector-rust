@@ -38,7 +38,8 @@ use crate::common::time::Timestamp;
 use crate::common::transport::Connect;
 use crate::fix::codec::{Frame, Header, Unreadable, encode, take};
 use crate::fix::messages::{
-    Heartbeat, Logon, Logout, Message, Reject, ResendRequest, SequenceReset, TestRequest,
+    BusinessReject, Heartbeat, Logon, Logout, Message, Reject, ResendRequest, SequenceReset,
+    TestRequest,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -48,6 +49,8 @@ const PROBE: &str = "alive";
 const RECONNECT_ATTEMPTS: u32 = 5;
 const EVERY_LATER_MESSAGE: u64 = 0;
 const REQUIRED_TAG_MISSING: u32 = 1;
+const UNSUPPORTED_MESSAGE_TYPE: u32 = 3;
+const REJECTS: [&str; 2] = ["3", "j"];
 
 /// Which of the two sessions of an account a connection serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,10 +89,13 @@ pub struct Inbound {
 pub enum Event {
     /// A message arrived.
     Message(Inbound),
-    /// A message arrived that the library cannot read; it is skipped. When not even its
-    /// header can be read but its bytes are intact, the session counts it and answers it with
-    /// a reject (3); a message whose bytes are damaged is not counted, so that the server is
-    /// asked to send it again.
+    /// A message arrived that the library cannot read; it is skipped. A message whose bytes
+    /// are intact and whose turn it is is counted and answered as the protocol prescribes: a
+    /// type this library does not know with a business message reject (j) that carries the
+    /// reason 3, a header or a body that cannot be read with a reject (3) that names the
+    /// message, its type where it is known, the tag and, for a missing tag, the reason 1. A
+    /// reject or a business message reject that cannot be read is never answered. A message
+    /// whose bytes are damaged is not counted, so that the server is asked to send it again.
     Unparsed(FixError),
     /// The server ended the session with a logout.
     LoggedOut {
@@ -243,6 +249,32 @@ fn rejection(seq: u64, error: &FixError) -> Reject {
         ref_msg_type,
         reason,
     }
+}
+
+fn refusal(seq: u64, msg_type: &str, error: &FixError) -> Option<Message> {
+    if REJECTS.contains(&msg_type) {
+        return None;
+    }
+    let ref_msg_type = Some(msg_type.to_owned());
+    if matches!(error, FixError::UnsupportedMessage(_)) {
+        return Some(
+            BusinessReject {
+                ref_seq_num: Some(seq),
+                ref_msg_type,
+                ref_id: None,
+                reason: Some(UNSUPPORTED_MESSAGE_TYPE),
+                text: Some(error.to_string()),
+            }
+            .into(),
+        );
+    }
+    Some(
+        Reject {
+            ref_msg_type,
+            ..rejection(seq, error)
+        }
+        .into(),
+    )
 }
 
 struct Actor<C: Connect> {
@@ -456,8 +488,12 @@ impl<C: Connect> Actor<C> {
         let message = match parsed {
             Ok(message) => message,
             Err(error) => {
+                let refusal = refusal(seq, &frame.header.msg_type, &error);
                 self.emit(Event::Unparsed(error));
-                return None;
+                return match self.transmit(live, &refusal?).await {
+                    Err(ConnectorError::Transport(error)) => Some(End::Lost(error)),
+                    _ => None,
+                };
             }
         };
         let answer = match &message {

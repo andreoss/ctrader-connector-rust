@@ -154,7 +154,8 @@ impl Peer {
         self.seq = seq;
     }
 
-    fn header(&self, seq: u64) -> Header {
+    /// Returns the header a message of the server carries under the given sequence number.
+    pub fn header(&self, seq: u64) -> Header {
         let header = Header::new("", "CSERVER", SENDER, seq, Timestamp::now());
         if self.qualifier.is_empty() {
             header
