@@ -1,4 +1,6 @@
 //! Places, amends, cancels and closes orders on a demo account and leaves nothing behind.
+//! The guard of the examples lets it reach another account only when
+//! `BROKER_EXAMPLE_ALLOW_LIVE` is `yes`.
 //!
 //! The example buys the smallest volume at market with a stop loss and a take profit, places
 //! a limit, a stop and a stop-limit order far from the market, amends the limit order and the

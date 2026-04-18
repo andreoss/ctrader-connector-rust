@@ -2,7 +2,8 @@
 //!
 //! The example places a limit order far from the market, cancels it and prints the events
 //! the server reports for it. A second cancellation is refused, which the stream reports as
-//! an order error. Whatever still carries the label of this run at the end is cancelled.
+//! an order error. Whatever still carries the label of this run at the end is cancelled
+//! or closed over a new connection.
 //!
 //! `BROKER_EXAMPLE_SYMBOL` names the symbol; the default is `BTCUSD`.
 //!

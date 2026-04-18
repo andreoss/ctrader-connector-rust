@@ -93,13 +93,15 @@
 //! | `OutcomeUnknown` | A request that trades was written and no answer came: the server may have acted on it. | Look the order up with [`reconcile`](client::OpenApiClient::reconcile) or by its label before placing it again. |
 //! | `SessionEnded` | The server ended the authorisation of the account or the application. | Authorise again, see [`client`]; then subscribe again. |
 //! | `Lagged` | A reader fell behind and events were dropped. | Go on reading; refresh the state from the server. |
-//! | `Incomplete` | The server announced more history than it sent. | Ask again for the range the error names. |
+//! | `Incomplete` | The server announced more history than it sent. | Treat the range the error names as missing: it cannot be asked for in smaller parts. |
 //! | `Token` | A token refresh failed. | Obtain a new pair. |
 //! | `Closed` | The client was shut down. | Connect anew. |
 //!
 //! # Streams
 //!
-//! Subscriptions return typed streams, each read with `next`:
+//! The typed streams are each read with `next`. A subscription returns the first three of
+//! them; the streams of executions and of margin events send no request and read what the
+//! server reports for an authorised account:
 //! [`QuoteStream`](quotes::QuoteStream), [`DepthStream`](depth::DepthStream),
 //! [`TrendbarStream`](trendbars::TrendbarStream),
 //! [`ExecutionStream`](executions::ExecutionStream) and
@@ -116,23 +118,26 @@
 //! historical data. The task holds requests back so that neither limit is exceeded. When
 //! the server still answers that a limit was exceeded, the task pauses and sends the
 //! request again, up to the configured number of retries, with a pause that doubles up to
-//! thirty seconds. Long ranges of bars and ticks take several requests, each counted.
+//! thirty seconds, or up to the configured backoff when that is longer. Long ranges of bars
+//! and ticks take several requests, each counted.
 //!
 //! # Logging
 //!
 //! With the `logging` feature the connection task emits `tracing` events at debug level:
 //! connected, connection lost, reconnected, reconnection failed, replayed request failed,
-//! authorisation ended and limit exceeded. They carry no secret. Without the feature nothing is emitted
-//! and `tracing` is not compiled in. The application installs the subscriber.
+//! authorisation ended and limit exceeded. They carry no secret. Without the feature nothing
+//! is emitted and `tracing` is not compiled in. The application installs the subscriber.
 //!
 //! # Testing
 //!
 //! - Mock servers: the tests named `open_api_*_mock` and `open_api_mock` run against
 //!   scripted servers on the loopback interface, reached through
 //!   [`Plain`](crate::common::transport::Plain) and
-//!   [`connect_with`](client::OpenApiClient::connect_with). They need no credentials.
-//! - Live tests: `open_api_live` runs against the demo environment only and refuses any
-//!   other. It reads the variables of the table above and `BROKER_ENV_FILE`, the absolute
+//!   [`connect_with`](client::OpenApiClient::connect_with). `open_api_clock_mock` runs over
+//!   a stream held in memory, on a paused clock. They need no credentials.
+//! - Live tests: `open_api_live` refuses any environment but the demo one; the host is the
+//!   one the configuration names. It reads the variables of the table above and
+//!   `BROKER_ENV_FILE`, the absolute
 //!   path of a file that holds the token pair as `export BROKER_ACCESS_TOKEN=` and
 //!   `export BROKER_REFRESH_TOKEN=` lines.
 //! - Token rotation: a refresh makes the old pair useless at once. The live test of the

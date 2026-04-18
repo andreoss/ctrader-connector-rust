@@ -8,7 +8,8 @@
 //! Sequence numbers: a message of the server that arrives ahead of its turn is dropped and
 //! every message from the missing one on is asked for again with a resend request; the
 //! session goes on once the server has repeated them or has skipped them with a sequence
-//! reset. When the server asks
+//! reset. A logout or a resend request ahead of its turn is acted on at once all the same.
+//! When the server asks
 //! for messages again, the task answers with a sequence reset that skips them all: no
 //! message, and above all no order, is ever sent twice. [`Event::Skipped`] names the range.
 //!

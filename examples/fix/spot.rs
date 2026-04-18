@@ -1,7 +1,8 @@
 //! Follows the bid and the offer of a symbol over the quote session.
 //!
 //! The server sends every change of the price as a full snapshot. A market that is closed
-//! sends no price, and the example fails after ninety seconds without one.
+//! sends no price, and the example fails: when no first price comes within the time allowed
+//! for an answer, or when ninety seconds pass without the next one.
 //!
 //! `BROKER_EXAMPLE_SYMBOL` names the symbol; the default is `BTCUSD`.
 //!

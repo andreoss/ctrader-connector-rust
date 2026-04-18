@@ -2,14 +2,16 @@
 //!
 //! A refresh rotates the pair: the old access and refresh tokens stop working at once, in
 //! every program that still holds them. Without the option the example therefore only checks
-//! that a refresh is possible and changes nothing. With `--rotate`, or with
+//! that the current access token authorises the account, reports whether a refresh token is
+//! configured and changes nothing. With `--rotate`, or with
 //! `BROKER_EXAMPLE_ROTATE=1`, it refreshes the pair, writes the new one into the
 //! `export BROKER_ACCESS_TOKEN=` and `export BROKER_REFRESH_TOKEN=` lines of the file named by
 //! `BROKER_ENV_FILE` before anything else, and authorises the account with the new token.
 //!
-//! The configuration comes through the guard of the examples, which refuses any environment
-//! but demo before the connection is opened unless `BROKER_EXAMPLE_ALLOW_LIVE` is `read-only`
-//! or `yes`.
+//! The configuration comes through the guard of the examples, which refuses anything but
+//! the demo environment on its default host before the connection is opened unless
+//! `BROKER_EXAMPLE_ALLOW_LIVE` is `read-only` or `yes`; either value permits the rotation
+//! too.
 //!
 //! ```sh
 //! cargo run --example open_api_token_refresh --features open-api

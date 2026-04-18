@@ -4,8 +4,10 @@ A Rust library for the cTrader Open API (Protobuf over TLS) and the cTrader
 FIX 4.4 API: connection and authorisation, market data, trading and account
 data.
 
-Prices, volumes and money are exact decimals, never floats. An order is
-written to the wire at most once and is never sent again by the library.
+In the typed API prices, volumes and money are exact decimals, never floats;
+the generated Protobuf messages in `open_api::messages` keep the types of the
+wire. An order is written to the wire at most once and is never sent again
+by the library.
 
 == Features
 
@@ -175,11 +177,13 @@ refresh example needs it when asked to rotate.
 
 |`BROKER_EXAMPLE_ROTATE`
 |no
-|Set to `1` to let the token refresh example rotate the pair.
+|Set to `1`, `true` or `yes` to let the token refresh example rotate the
+pair.
 
 |`BROKER_EXAMPLE_MARKET`
 |no
-|Set to `1` to let the FIX order example also trade at market.
+|Set to `1`, `true` or `yes` to let the FIX order example also trade at
+market.
 
 |`BROKER_EXAMPLE_ALLOW_LIVE`
 |no
@@ -228,8 +232,9 @@ cargo run --example fix_spot --features fix
 ----
 
 Every example reads its configuration from the environment, prints a short
-result without secrets and exits with a non-zero status and the kind of the
-error on failure. The trading examples run against a demo account, order the
+result without secrets and exits with a non-zero status and a message that
+names the cause on failure, with the kind of the error when the library
+reported it. The trading examples run against a demo account, order the
 smallest volume, place waiting orders far from the market and remove what
 they created.
 
@@ -272,10 +277,14 @@ cargo llvm-cov --all-features --fail-under-lines 85
 
 - Unit tests and the tests against scripted mock servers need no
   credentials and no network beyond the loopback interface.
-- Live tests run against the demo environment only and need the variables
-  above. `open_api_live` and `fix_live_trading` also need `BROKER_ENV_FILE`;
-  `fix_live` needs the variables of the FIX sessions only. They trade the smallest volume, label
-  what they create and remove it afterwards.
+- Live tests need the variables above and refuse a configuration that is
+  not a demo one: `open_api_live` and `fix_live_trading` check the
+  environment of the Open API, `fix_live` and `fix_live_trading` check that
+  the sender identifier starts with `demo.`. `open_api_live` and
+  `fix_live_trading` also need `BROKER_ENV_FILE`; `fix_live` needs the
+  variables of the FIX sessions only. `open_api_live` and `fix_live_trading`
+  trade the smallest volume, label what they create and remove it
+  afterwards; `fix_live` places no order.
 - The live test of the token refresh rotates the pair and writes the new one
   to the file `BROKER_ENV_FILE` names; the old pair stops working at once.
 

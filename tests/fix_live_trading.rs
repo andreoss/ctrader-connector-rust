@@ -82,6 +82,10 @@ fn fix_configuration() -> ConfigurationFix {
     let read = ConfigurationFix::from_env().expect("variables of the FIX sessions");
     live_support::veil(read.sender_comp_id());
     live_support::veil(read.username());
+    assert!(
+        read.sender_comp_id().starts_with("demo."),
+        "the live tests run against a demo account only"
+    );
     assert!(read.encrypted());
     ConfigurationFix::builder()
         .host(read.host())

@@ -4,6 +4,41 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.2 - 2026-04-17
+
+=== Added
+
+- `ConfigError::TooLong` and `MAX_FIX_HEARTBEAT`.
+- `BROKER_EXAMPLE_ALLOW_LIVE` for the examples: `read-only` or `yes`.
+
+=== Changed
+
+- FIX 4.4: a configuration refuses a heartbeat interval above one hour.
+- Open API: a heartbeat interval, a silence allowed or a time allowed for a
+  response above thirty years is never due; it used to end after thirty
+  years.
+- Examples: every example, the read-only ones included, takes its
+  configuration and its client from one allowlist guard and runs against
+  demo only unless `BROKER_EXAMPLE_ALLOW_LIVE` permits more. A test scans
+  the sources for a way around the guard.
+- Live tests: `fix_live` refuses a sender identifier that does not start
+  with `demo.`; its heartbeat watch accepts heartbeats and test requests
+  only.
+
+=== Fixed
+
+- FIX 4.4: a wait the clock cannot hold, such as a timeout of
+  `Duration::MAX`, is never due; the session task no longer spins once a
+  year has passed.
+- FIX 4.4: a readable message in turn that is refused is answered: an
+  unsupported type with a business message reject (j, reason 3), a body
+  that cannot be read with a reject (3). A reject that cannot be read is
+  never answered.
+- Documentation: order kinds over FIX and `OrderKind::StopLimit`, a logout
+  or a resend request ahead of its turn, the heartbeat bounds, the rejects,
+  the errors a call returns, the live tests and the headers of the examples
+  match the behaviour.
+
 == 0.3.1 - 2026-04-13
 
 === Changed

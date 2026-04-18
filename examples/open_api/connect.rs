@@ -1,8 +1,10 @@
-//! Connects to the Open API and authorises the application and a demo account.
+//! Connects to the Open API and authorises the application and the first account of the
+//! configured environment, a demo one unless the guard permits another.
 //!
-//! The steps are spelled out here; the other examples take them from the shared `session`
-//! helper. The configuration comes through the guard of the examples, which refuses any
-//! environment but demo before the connection is opened unless
+//! The steps are spelled out here; the other examples, `open_api_token_refresh` apart, take
+//! them from the shared `session` helper. The configuration comes through the guard of the
+//! examples, which refuses anything
+//! but the demo environment on its default host before the connection is opened unless
 //! `BROKER_EXAMPLE_ALLOW_LIVE` is `read-only` or `yes`. Needs `BROKER_CLIENT_ID`,
 //! `BROKER_CLIENT_SECRET` and `BROKER_ACCESS_TOKEN`.
 //!

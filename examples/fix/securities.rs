@@ -1,4 +1,5 @@
-//! Lists the symbols of the account over the quote session.
+//! Reads the list of the symbols of the account over the quote session and prints how many
+//! there are, the first five and the one that is named.
 //!
 //! `BROKER_EXAMPLE_SYMBOL` names the symbol whose entry is printed; the default is `BTCUSD`.
 //!

@@ -151,7 +151,8 @@ wire_enum! {
         Limit => "2",
         /// Becomes a market order once the stop price is reached.
         Stop => "3",
-        /// Becomes a limit order once the stop price is reached.
+        /// Becomes a limit order once the stop price is reached. The server offers no such
+        /// order over FIX: the kind is read from a report and no typed request sends it.
         StopLimit => "4",
     }
 }

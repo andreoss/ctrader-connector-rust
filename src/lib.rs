@@ -13,7 +13,8 @@
 //! The [`common`] module holds what both share: [configuration](common::config),
 //! [errors](common::errors), [typed identifiers](common::ids),
 //! [exact prices and volumes](common::decimals) and [timestamps](common::time). Prices,
-//! volumes and money are decimals throughout, never floats.
+//! volumes and money are decimals throughout the typed API, never floats; the generated
+//! Protobuf messages of the Open API keep the types of the wire.
 //!
 //! Both clients are asynchronous and run on a tokio runtime the application provides.
 //!
@@ -30,8 +31,9 @@
 //! # Quick start
 //!
 //! Both clients are built from a configuration, which is either read from the environment
-//! or put together with a builder. The demo environment is the target unless the live one
-//! is asked for. The variables are listed in the documentation of each protocol module.
+//! or put together with a builder. The Open API targets the demo environment unless the
+//! live one is asked for; a FIX configuration names its host. The variables are listed in
+//! the documentation of each protocol module.
 //!
 //! ## Open API
 //!
@@ -78,8 +80,12 @@
 //!
 //! # Errors
 //!
-//! Every fallible call returns [`ConnectorError`](common::errors::ConnectorError), one
-//! family for both protocols. Each protocol module explains which of its variants call for
+//! Every call of a client returns [`ConnectorError`](common::errors::ConnectorError), one
+//! family for both protocols. A configuration or a value that is refused before anything is
+//! sent returns a narrower error, such as
+//! [`ConfigError`](common::errors::ConfigError) or
+//! [`ValueError`](common::errors::ValueError), that converts into it. Each protocol module
+//! explains which of its variants call for
 //! which reaction; the one to know before trading is
 //! [`OutcomeUnknown`](common::errors::ConnectorError::OutcomeUnknown): an order is written
 //! to the wire at most once and is never sent again by this library.

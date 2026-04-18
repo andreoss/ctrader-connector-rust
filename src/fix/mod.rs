@@ -39,13 +39,21 @@
 //! | `BROKER_FIX_QUOTE_PORT` | `quote_port` | no | 5211 |
 //! | `BROKER_FIX_TRADE_PORT` | `trade_port` | no | 5212 |
 //! | `BROKER_FIX_TARGET_COMP_ID` | `target_comp_id` | no | `CSERVER` |
-//! | none | `unencrypted` | no | TLS; without it the ports default to 5201 and 5202 |
-//! | none | `heartbeat` | no | 30 s |
+//! | none | `unencrypted` | no | TLS; once it is called the ports default to 5201 and 5202 |
+//! | none | `heartbeat` | no | 30 s; whole seconds from 1 s to 3600 s |
 //! | none | `timeout` | no | 10 s for one answer |
 //! | none | `reconnect_delay` | no | 5 s before the first attempt |
 //!
 //! An empty variable counts as absent. The password is held in a type that does not print
 //! its value. Sessions read from the environment always run over TLS.
+//!
+//! The heartbeat interval travels in the logon as a whole number of seconds (108), so a
+//! fraction of a second is dropped. An interval below one second is refused with
+//! `ConfigError::ZeroDuration`: zero would ask for a session without heartbeats, and the
+//! library always keeps a session alive and watches the server by them. An interval above
+//! [`MAX_FIX_HEARTBEAT`](crate::common::config::MAX_FIX_HEARTBEAT), one hour, is refused
+//! with `ConfigError::TooLong`. A timeout of [`Duration::MAX`](std::time::Duration::MAX)
+//! stands for a wait without an end.
 //!
 //! # Connection lifecycle
 //!
@@ -60,17 +68,24 @@
 //!   test request; after two and a half the connection counts as lost.
 //! - Reconnect: after a loss the task reports
 //!   [`Event::Disconnected`](session::Event::Disconnected), then connects and logs on
-//!   again, five times at most with a growing pause, and reports
-//!   [`Event::Reconnected`](session::Event::Reconnected). When no attempt succeeds it
-//!   reports [`Event::Ended`](session::Event::Ended) and the session is over.
+//!   again, five times at most with a pause that grows by the reconnect delay each time,
+//!   and reports [`Event::Reconnected`](session::Event::Reconnected). When no attempt
+//!   succeeds, or as soon as the server refuses a logon, it reports
+//!   [`Event::Ended`](session::Event::Ended) and the session is over.
 //! - Replay: both sides count from one again after every logon. The server has forgotten
 //!   the subscriptions; the price streams subscribe anew by themselves. A gap in the
 //!   messages of the server is closed with a resend request: the message that arrived
-//!   ahead of its turn is dropped and read when the server repeats it.
+//!   ahead of its turn is dropped and read when the server repeats it. A logout or a resend
+//!   request that arrives ahead of its turn is the exception: it is acted on at once.
 //! - Unreadable messages: one the library cannot read is reported as
-//!   [`Event::Unparsed`](session::Event::Unparsed) and the session goes on. When not even
-//!   its header can be read but its bytes are intact it is counted and answered with a
-//!   reject (3); one whose bytes are damaged is not counted and is asked for again.
+//!   [`Event::Unparsed`](session::Event::Unparsed) and the session goes on. One whose bytes
+//!   are intact and whose turn it is is counted and answered as FIX 4.4 prescribes: a type
+//!   the library does not know with a business message reject (j) that carries the reason
+//!   3 (380), a header or a body that cannot be read with a reject (3) that names the
+//!   message (45), its type where it is known (372), the tag (371) and, for a missing tag,
+//!   the reason 1 (373). A reject or a business message reject that cannot be read is never
+//!   answered, so that no reject answers a reject. One whose bytes are damaged is not
+//!   counted and is asked for again.
 //! - Never sent again: orders, and every other message. When the server asks for messages
 //!   again the task answers with a sequence reset that skips them, reported as
 //!   [`Event::Skipped`](session::Event::Skipped).
@@ -89,17 +104,18 @@
 //! | `Fix(LogonRefused)` | The server answered the logon with a logout. | Check the credentials and the session kind. |
 //! | `Fix(Rejected)`, `Fix(BusinessRejected)` | The server refused a message or a request. | Decide by the reason and the text. |
 //! | `Fix(MarketDataRejected)` | The server refused a subscription to prices. | Check the symbol. |
-//! | `Fix(OrderRejected)` | The server refused an order; nothing was placed. | Decide by the text. |
+//! | `Fix(OrderRejected)` | The server refused an order, or cancelled or expired it right after accepting it, or answered a cancellation or a replacement with a rejecting report. | Decide by the text. |
 //! | `Fix(CancelRejected)` | The server refused to cancel or replace; the order is as it was. | Read the state of the order. |
 //! | `Timeout` | No answer in time to a request that may be repeated. | Repeat it. |
-//! | `OutcomeUnknown` | An order or a replacement was sent and no answer came, or the server asked for it again. | Read [`open_orders`](client::FixClient::open_orders) and [`positions`](client::FixClient::positions) before placing it again. |
+//! | `OutcomeUnknown` | An order or a replacement was sent and no answer came or its write failed, or the server asked again for a request of any kind, which is never sent twice. | Read [`open_orders`](client::FixClient::open_orders) and [`positions`](client::FixClient::positions) before placing it again. |
 //! | `Transport` | The connection was lost. | Go on after `Event::Reconnected`; a price stream reports the loss once and continues. |
 //! | `Lagged` | The reader of the events fell behind; an answer may have been skipped. | Read the state again. |
 //! | `Closed` | The session has ended, or it has no connection at the moment: a request made between `Event::Disconnected` and `Event::Reconnected` is not sent. | Ended: connect anew. Between two connections: go on after `Event::Reconnected`. |
 //!
 //! The variant `SessionEnded` belongs to the Open API and does not occur over FIX: a
-//! session the server ends is reported as [`Event::LoggedOut`](session::Event::LoggedOut)
-//! and then `Closed`.
+//! session the server ends is reported as [`Event::LoggedOut`](session::Event::LoggedOut).
+//! A call that waits for its answer at that moment fails with `Transport`, an order or a
+//! replacement with `OutcomeUnknown`, and every later call with `Closed`.
 //!
 //! `Closed` has two meanings, told apart by the events and by
 //! [`FixClient::closed`](client::FixClient::closed). The session has ended after
@@ -134,14 +150,16 @@
 //! # Testing
 //!
 //! - Mock servers: the tests named `fix_*_mock` and `fix_mock` run against scripted servers
-//!   on the loopback interface over unencrypted sessions. They need no credentials.
+//!   on the loopback interface over unencrypted sessions; `fix_clock_mock` runs over a
+//!   stream held in memory, on a paused clock. They need no credentials.
 //! - Live tests: `fix_live` needs the variables of the table above. `fix_live_trading`
 //!   also needs the variables of the Open API and `BROKER_ENV_FILE`, since it reads back
 //!   over the other interface what it did over FIX; both must name the same demo account.
 //! - Token rotation: the FIX sessions use no token, but the read-back does. The pair is
 //!   taken from the file `BROKER_ENV_FILE` names, which the Open API tests rewrite.
-//! - Demo only. Live tests trade the smallest quantity, label what they create and remove
-//!   it afterwards.
+//! - Demo only: both refuse a sender identifier that does not start with `demo.`.
+//!   `fix_live_trading` trades the smallest quantity, labels what it creates and removes it
+//!   afterwards; `fix_live` places no order.
 //!
 //! # Protocol facts
 //!
@@ -156,7 +174,12 @@
 //! - A cancellation of an order the server does not know is answered with a business
 //!   message reject, not with an order cancel reject; both are reported as
 //!   `Fix(CancelRejected)`.
-//! - Order kinds are market, limit and stop. There is no stop-limit order over FIX.
+//! - Order kinds: [`NewOrder`](trading::NewOrder) places market, limit and stop orders;
+//!   the server offers no stop-limit order over FIX.
+//!   [`OrderKind::StopLimit`](messages::OrderKind::StopLimit) exists because the dictionary
+//!   enumerates it under tag 40: it is read from an execution report that carries it, and
+//!   no typed request sends it. A message put together by hand goes out through
+//!   [`FixClient::send`](client::FixClient::send) as it is, whatever its kind.
 //! - A market order is answered with its fill, which names the position. A position is
 //!   closed with an opposite market order that names it.
 

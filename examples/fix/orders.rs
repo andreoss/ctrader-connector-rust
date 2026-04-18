@@ -3,8 +3,8 @@
 //! The order waits far below the market, so it is not filled. With `--market`, or with
 //! `BROKER_EXAMPLE_MARKET=1`, the example also buys at market, finds the position among the
 //! open positions and closes it with an opposite order that names it. Whatever the run
-//! created and the account still holds at the end, also after a failure, is cancelled or
-//! closed over a new session.
+//! recorded as created and the account still holds at the end, also after a failure, is
+//! cancelled or closed over a new session.
 //!
 //! `BROKER_EXAMPLE_SYMBOL` names the symbol; the default is `BTCUSD`.
 //! `BROKER_EXAMPLE_QUANTITY` is the quantity in units of the base asset; the default is

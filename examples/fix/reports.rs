@@ -2,8 +2,8 @@
 //! open positions.
 //!
 //! To have an order to ask about, the example places a limit order far below the market
-//! and cancels it afterwards. Whatever the run created and the account still holds at the
-//! end, also after a failure, is cancelled over a new session.
+//! and cancels it afterwards. Whatever the run recorded as created and the account still
+//! holds at the end, also after a failure, is cancelled or closed over a new session.
 //!
 //! `BROKER_EXAMPLE_SYMBOL` names the symbol; the default is `BTCUSD`.
 //! `BROKER_EXAMPLE_QUANTITY` is the quantity in units of the base asset; the default is
