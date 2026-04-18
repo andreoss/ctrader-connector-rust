@@ -233,49 +233,44 @@ async fn reached(due: Option<Instant>) {
     }
 }
 
-fn rejection(seq: u64, error: &FixError) -> Reject {
-    let (ref_msg_type, ref_tag_id, reason) = match error {
+fn rejection(seq: u64, msg_type: Option<&str>, error: &FixError) -> Option<Reject> {
+    let (named, ref_tag_id, reason) = match error {
         FixError::MissingField { msg_type, tag } => (
-            Some(msg_type.clone()),
+            Some(msg_type.as_str()),
             Some(*tag),
             Some(REQUIRED_TAG_MISSING),
         ),
-        FixError::InvalidField { msg_type, tag } => (Some(msg_type.clone()), Some(*tag), None),
+        FixError::InvalidField { msg_type, tag } => (Some(msg_type.as_str()), Some(*tag), None),
         _ => (None, None, None),
     };
-    Reject {
+    let ref_msg_type = msg_type.or(named);
+    if ref_msg_type.is_some_and(|msg_type| REJECTS.contains(&msg_type)) {
+        return None;
+    }
+    Some(Reject {
         ref_seq_num: seq,
         text: Some(error.to_string()),
         ref_tag_id,
-        ref_msg_type,
+        ref_msg_type: ref_msg_type.map(str::to_owned),
         reason,
-    }
+    })
 }
 
 fn refusal(seq: u64, msg_type: &str, error: &FixError) -> Option<Message> {
-    if REJECTS.contains(&msg_type) {
-        return None;
-    }
-    let ref_msg_type = Some(msg_type.to_owned());
+    let reject = rejection(seq, Some(msg_type), error)?;
     if matches!(error, FixError::UnsupportedMessage(_)) {
         return Some(
             BusinessReject {
                 ref_seq_num: Some(seq),
-                ref_msg_type,
+                ref_msg_type: reject.ref_msg_type,
                 ref_id: None,
                 reason: Some(UNSUPPORTED_MESSAGE_TYPE),
-                text: Some(error.to_string()),
+                text: reject.text,
             }
             .into(),
         );
     }
-    Some(
-        Reject {
-            ref_msg_type,
-            ..rejection(seq, error)
-        }
-        .into(),
-    )
+    Some(reject.into())
 }
 
 struct Actor<C: Connect> {
@@ -532,7 +527,11 @@ impl<C: Connect> Actor<C> {
     }
 
     async fn unreadable(&self, live: &mut Live<C::Stream>, unreadable: Unreadable) -> Option<End> {
-        let Unreadable { seq, error } = unreadable;
+        let Unreadable {
+            seq,
+            msg_type,
+            error,
+        } = unreadable;
         let Some(seq) = seq else {
             self.emit(Event::Unparsed(error));
             return None;
@@ -542,11 +541,14 @@ impl<C: Connect> Actor<C> {
         if seq > live.next_in {
             return self.ask_again(live, seq).await;
         }
-        let reject = (seq == live.next_in).then(|| rejection(seq, &error));
+        let in_turn = seq == live.next_in;
+        let reject = rejection(seq, msg_type.as_deref(), &error);
         self.emit(Event::Unparsed(error));
-        let reject = reject?;
+        if !in_turn {
+            return None;
+        }
         live.advance(seq.saturating_add(1));
-        match self.transmit(live, &reject.into()).await {
+        match self.transmit(live, &reject?.into()).await {
             Err(ConnectorError::Transport(error)) => Some(End::Lost(error)),
             _ => None,
         }

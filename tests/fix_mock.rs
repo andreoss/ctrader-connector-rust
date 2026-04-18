@@ -446,6 +446,19 @@ fn without_sending_time(seq: u64) -> Vec<u8> {
     sealed(&format!("35=8|49=CSERVER|56={SENDER}|34={seq}|"))
 }
 
+async fn reject_naming(peer: &mut fix_support::Peer, msg_type: &str) -> (u64, Message) {
+    let frame = peer.frame().await.expect("a reject, not the end");
+    let named: Vec<&str> = frame
+        .body
+        .iter()
+        .filter(|field| field.tag == 372)
+        .map(|field| field.value.as_str())
+        .collect();
+    assert_eq!(named, [msg_type]);
+    let message = Message::from_frame(&frame).expect("message of the client");
+    (frame.header.seq, message)
+}
+
 #[tokio::test]
 async fn message_with_an_unreadable_header_is_rejected_and_the_numbering_goes_on() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -457,8 +470,9 @@ async fn message_with_an_unreadable_header_is_rejected_and_the_numbering_goes_on
     };
     peer.raw(&without_sending_time(seq)).await;
     assert_eq!(next(&mut events).await, Event::Unparsed(missing.clone()));
+    let (sent, reject) = reject_naming(&mut peer, "8").await;
     assert_eq!(
-        peer.read().await.1,
+        reject,
         Message::from(Reject {
             ref_seq_num: seq,
             text: Some(missing.to_string()),
@@ -467,21 +481,9 @@ async fn message_with_an_unreadable_header_is_rejected_and_the_numbering_goes_on
             reason: Some(1),
         })
     );
-    peer.set_next_seq(seq + 1);
-    peer.send(probe("after")).await;
     assert_eq!(
-        next(&mut events).await,
-        Event::Message(Inbound {
-            seq: seq + 1,
-            poss_dup: false,
-            message: probe("after"),
-        })
-    );
-    assert_eq!(
-        peer.read().await.1,
-        Message::from(Heartbeat {
-            test_req_id: Some("after".to_owned()),
-        })
+        answered_after(&mut peer, &mut events, seq + 1).await,
+        sent + 1
     );
     peer.raw(&without_sending_time(seq)).await;
     assert_eq!(next(&mut events).await, Event::Unparsed(missing.clone()));
@@ -573,7 +575,11 @@ async fn unreadable_messages_are_skipped_and_a_broken_stream_ends_the_session() 
     ));
 }
 
-async fn answered_after(peer: &mut fix_support::Peer, events: &mut Receiver<Event>, seq: u64) {
+async fn answered_after(
+    peer: &mut fix_support::Peer,
+    events: &mut Receiver<Event>,
+    seq: u64,
+) -> u64 {
     peer.set_next_seq(seq);
     peer.send(probe("after")).await;
     assert_eq!(
@@ -584,12 +590,14 @@ async fn answered_after(peer: &mut fix_support::Peer, events: &mut Receiver<Even
             message: probe("after"),
         })
     );
+    let (header, message) = peer.read().await;
     assert_eq!(
-        peer.read().await.1,
+        message,
         Message::from(Heartbeat {
             test_req_id: Some("after".to_owned()),
         })
     );
+    header.seq
 }
 
 #[tokio::test]
@@ -618,7 +626,7 @@ async fn message_of_an_unsupported_type_is_answered_with_a_business_reject() {
             text: Some(unsupported.to_string()),
         })
     );
-    answered_after(&mut peer, &mut events, seq + 1).await;
+    let _ = answered_after(&mut peer, &mut events, seq + 1).await;
     drop(client);
 }
 
@@ -638,8 +646,9 @@ async fn message_with_a_malformed_body_is_answered_with_a_reject() {
     )
     .await;
     assert_eq!(next(&mut events).await, Event::Unparsed(missing.clone()));
+    let (sent, reject) = reject_naming(&mut peer, "1").await;
     assert_eq!(
-        peer.read().await.1,
+        reject,
         Message::from(Reject {
             ref_seq_num: seq,
             text: Some(missing.to_string()),
@@ -664,8 +673,10 @@ async fn message_with_a_malformed_body_is_answered_with_a_reject() {
     }
     peer.send_frame(&frame).await;
     assert_eq!(next(&mut events).await, Event::Unparsed(invalid.clone()));
+    let (again, reject) = reject_naming(&mut peer, "2").await;
+    assert_eq!(again, sent + 1);
     assert_eq!(
-        peer.read().await.1,
+        reject,
         Message::from(Reject {
             ref_seq_num: seq + 1,
             text: Some(invalid.to_string()),
@@ -674,7 +685,10 @@ async fn message_with_a_malformed_body_is_answered_with_a_reject() {
             reason: None,
         })
     );
-    answered_after(&mut peer, &mut events, seq + 2).await;
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 2).await,
+        sent + 2
+    );
     drop(client);
 }
 
@@ -717,6 +731,42 @@ async fn reject_that_cannot_be_read_is_never_answered_with_a_reject() {
             tag: 380,
         })
     );
-    answered_after(&mut peer, &mut events, seq + 2).await;
+    let _ = answered_after(&mut peer, &mut events, seq + 2).await;
+    drop(client);
+}
+
+#[tokio::test]
+async fn reject_with_an_unreadable_header_gets_no_reply_and_no_number() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let before = answered_after(&mut peer, &mut events, seq).await;
+    for (at, msg_type, body) in [(seq + 1, "3", "45=1"), (seq + 2, "j", "380=3")] {
+        peer.raw(&sealed(&format!(
+            "35={msg_type}|49=CSERVER|56={SENDER}|34={at}|{body}|"
+        )))
+        .await;
+        assert_eq!(
+            next(&mut events).await,
+            Event::Unparsed(FixError::MissingField {
+                msg_type: msg_type.to_owned(),
+                tag: 52,
+            })
+        );
+    }
+    for (at, msg_type) in [(seq + 3, "3"), (seq + 4, "j")] {
+        peer.raw(&sealed(&format!(
+            "35={msg_type}|49=CSERVER|56={SENDER}|34={at}|58=|"
+        )))
+        .await;
+        assert!(matches!(
+            next(&mut events).await,
+            Event::Unparsed(FixError::Garbled(_))
+        ));
+    }
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 5).await,
+        before + 1
+    );
     drop(client);
 }

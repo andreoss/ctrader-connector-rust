@@ -408,6 +408,8 @@ pub fn decode(buffer: &mut Vec<u8>) -> Result<Option<Frame>, FixError> {
 pub(crate) struct Unreadable {
     /// Sequence number of the message, when its bytes are intact and carry exactly one.
     pub(crate) seq: Option<u64>,
+    /// Type of the message (35), when its bytes are intact and name one.
+    pub(crate) msg_type: Option<String>,
     /// Why the message cannot be read.
     pub(crate) error: FixError,
 }
@@ -421,6 +423,13 @@ fn scanned_seq(body: &[u8]) -> Option<u64> {
         return None;
     }
     std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+fn scanned_type(body: &[u8]) -> Option<String> {
+    let value = body
+        .split(|byte| *byte == SOH)
+        .find_map(|piece| piece.strip_prefix(b"35="))?;
+    Some(std::str::from_utf8(value).ok()?.to_owned())
 }
 
 /// Takes one whole message off the front of `buffer`, as [`decode`] does, and keeps apart
@@ -456,7 +465,13 @@ pub(crate) fn take(buffer: &mut Vec<u8>) -> Result<Option<Result<Frame, Unreadab
     }
     let message: Vec<u8> = buffer.drain(..total).collect();
     let (counted, tail) = message.split_at_checked(trailer).unwrap_or((&message, &[]));
-    let damaged = |error| Ok(Some(Err(Unreadable { seq: None, error })));
+    let damaged = |error| {
+        Ok(Some(Err(Unreadable {
+            seq: None,
+            msg_type: None,
+            error,
+        })))
+    };
     let Some(found) = found_checksum(tail) else {
         return damaged(FixError::Garbled(
             "the checksum field does not close the message",
@@ -470,6 +485,7 @@ pub(crate) fn take(buffer: &mut Vec<u8>) -> Result<Option<Result<Frame, Unreadab
     Ok(Some(fields(body).and_then(header_of).map_err(|error| {
         Unreadable {
             seq: scanned_seq(body),
+            msg_type: scanned_type(body),
             error,
         }
     })))
