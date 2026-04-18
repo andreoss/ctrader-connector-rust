@@ -64,7 +64,14 @@ async fn live_sessions_log_on_stay_up_across_heartbeats_and_log_out() {
         {
             match event.expect("event") {
                 Event::Message(inbound) => {
-                    assert!(inbound.message.is_administrative(), "{:?}", inbound.message);
+                    assert!(
+                        matches!(
+                            inbound.message,
+                            Message::Heartbeat(_) | Message::TestRequest(_)
+                        ),
+                        "{:?}",
+                        inbound.message
+                    );
                     beats.push((inbound.seq, started.elapsed().as_millis()));
                 }
                 other => panic!("the session did not stay up: {other:?}"),
