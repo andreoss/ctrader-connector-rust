@@ -47,11 +47,27 @@ name = "open_api_mock"
 required-features = ["open-api"]
 
 [[test]]
+name = "open_api_clock_mock"
+required-features = ["open-api"]
+
+[[test]]
+name = "open_api_data_mock"
+required-features = ["open-api"]
+
+[[test]]
+name = "open_api_trading_mock"
+required-features = ["open-api"]
+
+[[test]]
 name = "open_api_live"
 required-features = ["open-api"]
 
 [[test]]
 name = "fix_mock"
+required-features = ["fix"]
+
+[[test]]
+name = "fix_clock_mock"
 required-features = ["fix"]
 
 [[test]]

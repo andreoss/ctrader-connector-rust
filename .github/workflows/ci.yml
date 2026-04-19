@@ -39,3 +39,8 @@ jobs:
           cargo test --all-features --doc
       - name: Compile live tests
         run: cargo test --all-features --no-run
+      - name: Compile tests for each feature set
+        run: |
+          cargo test --no-run --no-default-features
+          cargo test --no-run --no-default-features --features fix
+          cargo test --no-run --no-default-features --features open-api
