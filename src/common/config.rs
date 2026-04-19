@@ -544,6 +544,11 @@ pub const DEFAULT_FIX_HEARTBEAT: Duration = Duration::from_secs(30);
 /// the server on multiples of it, so an interval without an end would leave a dead connection
 /// unnoticed.
 pub const MAX_FIX_HEARTBEAT: Duration = Duration::from_secs(3_600);
+/// Longest pause before a lost session is opened again.
+///
+/// A configuration takes a longer pause as this one, so that a session that lost its
+/// connection does not wait without an end before it logs on again.
+pub const MAX_FIX_RECONNECT_DELAY: Duration = Duration::from_secs(3_600);
 
 const FIX_HOST: &str = "host";
 const FIX_SENDER_COMP_ID: &str = "sender_comp_id";
@@ -805,6 +810,9 @@ impl ConfigurationFixBuilder {
     }
 
     /// Sets the pause before a lost session is opened again.
+    ///
+    /// [`ConfigurationFixBuilder::build`] takes a pause above [`MAX_FIX_RECONNECT_DELAY`] as
+    /// that maximum.
     pub const fn reconnect_delay(mut self, reconnect_delay: Duration) -> Self {
         self.reconnect_delay = reconnect_delay;
         self
@@ -817,7 +825,8 @@ impl ConfigurationFixBuilder {
     /// Returns a [`ConfigError`] when the host, the sender, the target, the login or the
     /// password is absent or empty, the host is not a bare host name, a port is zero, the
     /// heartbeat is shorter than one second or longer than [`MAX_FIX_HEARTBEAT`], or another
-    /// duration is zero.
+    /// duration is zero. A reconnect delay above [`MAX_FIX_RECONNECT_DELAY`] is no error: it
+    /// is shortened to that maximum.
     pub fn build(self) -> Result<ConfigurationFix, ConfigError> {
         let (quote, trade) = if self.encrypted {
             (DEFAULT_FIX_QUOTE_PORT, DEFAULT_FIX_TRADE_PORT)
@@ -844,7 +853,8 @@ impl ConfigurationFixBuilder {
             password: self.password.ok_or(ConfigError::Missing(FIX_PASSWORD))?,
             heartbeat: Duration::from_secs(self.heartbeat.as_secs()),
             timeout: positive(self.timeout, TIMEOUT)?,
-            reconnect_delay: positive(self.reconnect_delay, RECONNECT_DELAY)?,
+            reconnect_delay: positive(self.reconnect_delay, RECONNECT_DELAY)?
+                .min(MAX_FIX_RECONNECT_DELAY),
         })
     }
 }
@@ -866,7 +876,7 @@ mod tests {
         DEFAULT_FIX_QUOTE_PLAIN_PORT, DEFAULT_FIX_QUOTE_PORT, DEFAULT_FIX_TARGET_COMP_ID,
         DEFAULT_FIX_TRADE_PLAIN_PORT, DEFAULT_FIX_TRADE_PORT, ENV_FIX_HOST, ENV_FIX_PASSWORD,
         ENV_FIX_QUOTE_PORT, ENV_FIX_SENDER_COMP_ID, ENV_FIX_TARGET_COMP_ID, ENV_FIX_TRADE_PORT,
-        ENV_FIX_USERNAME, MAX_FIX_HEARTBEAT,
+        ENV_FIX_USERNAME, MAX_FIX_HEARTBEAT, MAX_FIX_RECONNECT_DELAY,
     };
     use crate::common::errors::ConfigError;
 
@@ -1265,6 +1275,23 @@ mod tests {
         assert_eq!(configuration.reconnect_delay(), Duration::from_secs(4));
         let slowest = fix().heartbeat(MAX_FIX_HEARTBEAT).build()?;
         assert_eq!(slowest.heartbeat(), MAX_FIX_HEARTBEAT);
+        Ok(())
+    }
+
+    #[test]
+    fn fix_builder_shortens_a_reconnect_delay_above_the_maximum() -> Result<(), ConfigError> {
+        let longest = fix().reconnect_delay(MAX_FIX_RECONNECT_DELAY).build()?;
+        assert_eq!(longest.reconnect_delay(), MAX_FIX_RECONNECT_DELAY);
+        let above = MAX_FIX_RECONNECT_DELAY + Duration::from_nanos(1);
+        for delay in [above, Duration::MAX] {
+            let configuration = fix().reconnect_delay(delay).build()?;
+            assert_eq!(configuration.reconnect_delay(), MAX_FIX_RECONNECT_DELAY);
+        }
+        let below = MAX_FIX_RECONNECT_DELAY - Duration::from_nanos(1);
+        assert_eq!(
+            fix().reconnect_delay(below).build()?.reconnect_delay(),
+            below
+        );
         Ok(())
     }
 

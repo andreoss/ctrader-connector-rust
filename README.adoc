@@ -265,6 +265,16 @@ that builds a configuration, opens a connection or a transport, names a
 host, exchanges a token pair or changes the environment. The same test pins
 the access level every example asks for.
 
+== Known limitations
+
+- The guard of the examples checks neither the ports nor the token endpoint:
+  `BROKER_FIX_QUOTE_PORT`, `BROKER_FIX_TRADE_PORT` and `BROKER_TOKEN_URL`
+  are used as given.
+- The guard matches `demo` in `BROKER_FIX_HOST` in lower case only, so it
+  refuses a demo host written in another case; it fails closed.
+- A FIX reconnect delay above one hour is shortened to one hour without a
+  message; a heartbeat interval above one hour is refused instead.
+
 == Build
 
 [source,sh]

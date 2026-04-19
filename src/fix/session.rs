@@ -95,8 +95,10 @@ pub enum Event {
     /// type this library does not know with a business message reject (j) that carries the
     /// reason 3, a header or a body that cannot be read with a reject (3) that names the
     /// message, its type where it is known, the tag and, for a missing tag, the reason 1. A
-    /// reject or a business message reject that cannot be read is never answered. A message
-    /// whose bytes are damaged is not counted, so that the server is asked to send it again.
+    /// reject or a business message reject that cannot be read is counted and never answered.
+    /// A message whose bytes are damaged is not counted, so that the server is asked to send
+    /// it again. While the session logs out an unreadable message is reported and not
+    /// answered.
     Unparsed(FixError),
     /// The server ended the session with a logout.
     LoggedOut {

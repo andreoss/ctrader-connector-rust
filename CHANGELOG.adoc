@@ -4,6 +4,33 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.3 - 2026-04-18
+
+=== Added
+
+- `MAX_FIX_RECONNECT_DELAY`.
+
+=== Changed
+
+- FIX 4.4: a configuration shortens a reconnect delay above one hour to one
+  hour.
+- Examples: outside demo the token refresh example rotates the pair only
+  under `BROKER_EXAMPLE_ALLOW_LIVE=yes`. The test that scans the sources
+  holds every example to an allowlist of library items, refuses a `use` that
+  renames or globs and pins the access level each example asks for.
+- Build: the test targets that need a protocol declare its feature, so that
+  `cargo test` builds with any set of features.
+
+=== Fixed
+
+- FIX 4.4: a reject (3) or a business message reject (j) whose header cannot
+  be read is counted and no longer answered with a reject. A reject sent for
+  a header that cannot be read names the type of the message (372) when its
+  bytes show one.
+- Documentation: the rejects, the reconnect delay and the limits of the
+  guard of the examples match the behaviour; the README lists the known
+  limitations.
+
 == 0.3.2 - 2026-04-17
 
 === Added

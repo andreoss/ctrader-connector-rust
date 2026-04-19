@@ -42,7 +42,7 @@
 //! | none | `unencrypted` | no | TLS; once it is called the ports default to 5201 and 5202 |
 //! | none | `heartbeat` | no | 30 s; whole seconds from 1 s to 3600 s |
 //! | none | `timeout` | no | 10 s for one answer |
-//! | none | `reconnect_delay` | no | 5 s before the first attempt |
+//! | none | `reconnect_delay` | no | 5 s before the first attempt; 3600 s at most, a longer one is shortened to that |
 //!
 //! An empty variable counts as absent. The password is held in a type that does not print
 //! its value. Sessions read from the environment always run over TLS.
@@ -83,9 +83,10 @@
 //!   the library does not know with a business message reject (j) that carries the reason
 //!   3 (380), a header or a body that cannot be read with a reject (3) that names the
 //!   message (45), its type where it is known (372), the tag (371) and, for a missing tag,
-//!   the reason 1 (373). A reject or a business message reject that cannot be read is never
-//!   answered, so that no reject answers a reject. One whose bytes are damaged is not
-//!   counted and is asked for again.
+//!   the reason 1 (373). A reject or a business message reject that cannot be read is
+//!   counted and never answered, so that no reject answers a reject. One whose bytes are
+//!   damaged is not counted and is asked for again. While the session logs out an
+//!   unreadable message is reported and not answered.
 //! - Never sent again: orders, and every other message. When the server asks for messages
 //!   again the task answers with a sequence reset that skips them, reported as
 //!   [`Event::Skipped`](session::Event::Skipped).
