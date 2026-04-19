@@ -257,13 +257,18 @@ only under `yes`; `read-only` lets it check the pair and no more. Outside
 demo an Open API example works with the first account of the environment it
 connects to.
 
-A test scans the sources of the examples and holds each of them to an
-allowlist: of the library an example imports only the items the test lists,
-by a `use` that neither renames nor globs, and names the library nowhere
-else; of the guard it imports only the access level; and it names nothing
-that builds a configuration, opens a connection or a transport, names a
-host, exchanges a token pair or changes the environment. The same test pins
-the access level every example asks for.
+The manifest lists every example and turns the discovery of examples off. A
+test walks every `.rs` file under `examples/`, at any depth: a file outside
+`examples/support` has to be the file of a listed example whose access level
+the test pins, and any other file fails the test. The test scans the sources
+of the examples and holds each of them to an allowlist: of the library an
+example imports only the items the test lists, by a `use` that neither
+renames nor globs, and names the library nowhere else; of the guard it
+imports only the access level; and it names nothing that builds a
+configuration, opens a connection or a transport, names a host, exchanges a
+token pair or changes the environment. The same test pins the access level
+every example asks for, and an example pinned read-only names nothing of the
+library that places, changes, cancels or closes an order or a position.
 
 == Known limitations
 

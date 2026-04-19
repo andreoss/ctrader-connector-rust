@@ -1,15 +1,20 @@
 //! Tests of the guard that keeps the examples on a demo account, and of its use.
 //!
 //! The guard module of the examples is compiled into this test, so its own tests run here.
-//! The scan below reads every other source of the examples. It works on the words of the
-//! code, without the comments, and holds an example to an allowlist:
+//! The scan below reads every other source of the examples: it walks every `.rs` file under
+//! `examples/`. The manifest turns the discovery of examples off, and a file outside
+//! `examples/support` that is not the file of an `[[example]]` with an access level pinned
+//! in [`LEVELS`] fails the test. The scan works on the words of the code, without the
+//! comments, and holds an example to an allowlist:
 //!
 //! - of this crate an example names only the items of [`ITEMS`], and only in a `use` that
 //!   neither renames nor globs; outside a `use` the name of the crate does not occur;
 //! - of the guard an example names only `support::guard::Access`, in a `use`;
 //! - the words of [`REFUSED`] occur nowhere: what builds a configuration, opens a connection
 //!   or a transport, names a host, exchanges a token pair or changes the environment;
-//! - the only module is `support`, taken from `../support/mod.rs`.
+//! - the only module is `support`, taken from `../support/mod.rs`;
+//! - an example pinned read-only names none of the words of [`REFUSED_IN_READ_ONLY`]: what
+//!   places, changes, cancels or closes an order or a position.
 //!
 //! The support modules next to the guard are held to the shorter list [`REFUSED_IN_SUPPORT`].
 
@@ -68,11 +73,12 @@ const ITEMS: [&str; 35] = [
 ];
 
 /// Words that occur in no example outside a `use`, and in none of its imports either.
-const REFUSED: [&str; 27] = [
+const REFUSED: [&str; 28] = [
     CRATE,
     "guard",
     "connect",
     "connect_with",
+    "connect_timeout",
     "from_env",
     "from_lookup",
     "builder",
@@ -114,6 +120,25 @@ const REFUSED_IN_SUPPORT: [&str; 14] = [
     "LIVE_HOST",
     "set_var",
     "remove_var",
+];
+
+/// Words that occur nowhere in an example pinned [`Access::ReadOnly`]: the methods of the
+/// clients that place, change, cancel or close an order or a position, and the values those
+/// methods take. The library has no call that cancels all orders at once, and what rotates
+/// the token pair is in [`REFUSED`] for every example.
+const REFUSED_IN_READ_ONLY: [&str; 12] = [
+    "place",
+    "replace",
+    "cancel",
+    "place_order",
+    "amend_order",
+    "amend_position",
+    "cancel_order",
+    "close_position",
+    "NewOrder",
+    "Replacement",
+    "OrderAmendment",
+    "PositionAmendment",
 ];
 
 /// Access every example asks the guard for; an example that places an order asks for
@@ -392,6 +417,11 @@ fn violations(source: &str) -> Vec<String> {
     faults
 }
 
+/// Tells what in the source of an example pinned read-only changes an order or a position.
+fn read_only_violations(source: &str) -> Vec<String> {
+    refused_words(&tokens(source), &REFUSED_IN_READ_ONLY)
+}
+
 /// Tells what in the source of a support module goes around the guard.
 fn support_violations(source: &str) -> Vec<String> {
     let all = tokens(source);
@@ -444,22 +474,87 @@ fn examples() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")
 }
 
-/// Returns the source of every example under the name its target has.
-fn programs() -> BTreeMap<String, String> {
-    let root = examples();
-    let mut programs = BTreeMap::new();
-    for directory in ["fix", "open_api"] {
-        let mut found = Vec::new();
-        assert!(sources(&root.join(directory), &mut found).is_ok());
-        for path in found {
-            let stem = path.file_stem().and_then(|stem| stem.to_str());
-            let name = format!("{directory}_{}", stem.unwrap_or_default());
-            let source = fs::read_to_string(&path).unwrap_or_default();
-            assert!(!source.is_empty(), "{}", path.display());
-            assert_eq!(programs.insert(name, source), None, "{}", path.display());
+fn manifest() -> String {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    fs::read_to_string(manifest).unwrap_or_default()
+}
+
+/// Returns the path of every `[[example]]` of the manifest under the name of its target.
+fn targets_of(manifest: &str) -> BTreeMap<String, String> {
+    let value = |table: &str, key: &str| {
+        let line = |line: &str| {
+            let quoted = line.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+            let text = quoted.trim().strip_prefix('"')?.strip_suffix('"')?;
+            Some(text.to_owned())
+        };
+        table.lines().find_map(line).unwrap_or_default()
+    };
+    manifest
+        .split("[[example]]")
+        .skip(1)
+        .map(|rest| rest.split("\n[").next().unwrap_or_default())
+        .map(|table| (value(table, "name"), value(table, "path")))
+        .collect()
+}
+
+/// Returns the source of every example under `root` under the name of its target, or what
+/// is wrong with the tree: every `.rs` file outside `support`, at any depth, has to be the
+/// file of one of `targets`, and every target has to have its file.
+fn programs_under(
+    root: &Path,
+    targets: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, Vec<String>> {
+    let mut found = Vec::new();
+    assert!(sources(root, &mut found).is_ok());
+    let (mut programs, mut faults) = (BTreeMap::new(), Vec::new());
+    for path in found {
+        let parts: Vec<_> = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect();
+        if parts.len() > 1 && parts.first().is_some_and(|part| part == "support") {
+            continue;
+        }
+        let file = format!("examples/{}", parts.join("/"));
+        let target = targets
+            .iter()
+            .find(|(name, path)| **path == file && !programs.contains_key(*name));
+        let source = fs::read_to_string(&path).unwrap_or_default();
+        match target {
+            Some((name, _)) if !source.is_empty() => {
+                programs.insert(name.clone(), source);
+            }
+            Some(_) => faults.push(format!("empty file {file}")),
+            None => faults.push(format!("unlisted file {file}")),
         }
     }
-    programs
+    let missing = targets
+        .iter()
+        .filter(|(name, _)| !programs.contains_key(*name))
+        .map(|(name, path)| format!("no file {path} of {name}"));
+    faults.extend(missing);
+    faults.sort();
+    if faults.is_empty() {
+        Ok(programs)
+    } else {
+        Err(faults)
+    }
+}
+
+/// Returns the source of every example under the name its target has.
+fn programs() -> BTreeMap<String, String> {
+    let programs = programs_under(&examples(), &targets_of(&manifest()));
+    assert_eq!(programs.as_ref().err(), None);
+    programs.unwrap_or_default()
+}
+
+/// Returns the access pinned for the example `name`.
+fn pinned(name: &str) -> Option<Access> {
+    LEVELS
+        .into_iter()
+        .find_map(|(pinned, level)| (pinned == name).then_some(level))
 }
 
 const HEAD: &str = "#[path = \"../support/mod.rs\"]\nmod support;\nuse support::Failure;\n";
@@ -579,6 +674,7 @@ fn the_scan_finds_every_way_around_the_guard() {
         ("OpenApiClient::r#connect(configuration)", "connect"),
         ("FixClient::connect_with(c, kind, Plain)", "connect_with"),
         ("FixClient::connect_with(c, kind, Plain)", "Plain"),
+        ("client.connect_timeout(limit)", "connect_timeout"),
         ("ConfigurationFix::from_env()?", "from_env"),
         ("Configuration::from_lookup(lookup)", "from_lookup"),
         ("Configuration::builder()", "builder"),
@@ -707,6 +803,100 @@ fn no_example_reaches_past_the_allowlist() {
 }
 
 #[test]
+fn the_scan_refuses_a_file_that_is_no_pinned_example() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("examples_guard_tree");
+    let _ = fs::remove_dir_all(&root);
+    let source = "OpenApiClient::connect(ConfigurationOpenApi::from_env()?)";
+    let listed = ["fix/spot.rs", "support/mod.rs", "support/deep/more.rs"];
+    let unlisted = [
+        "quick.rs",
+        "misc/main.rs",
+        "fix/deep/other.rs",
+        "support.rs",
+    ];
+    for file in listed.into_iter().chain(unlisted) {
+        let path = root.join(file);
+        assert!(fs::create_dir_all(path.parent().unwrap_or(&root)).is_ok());
+        assert!(fs::write(path, source).is_ok());
+    }
+    assert!(fs::write(root.join("notes.txt"), source).is_ok());
+    let spot = ("fix_spot".to_owned(), "examples/fix/spot.rs".to_owned());
+    let gone = ("fix_gone".to_owned(), "examples/fix/gone.rs".to_owned());
+    let targets = BTreeMap::from([spot.clone(), gone]);
+    let faults = [
+        "no file examples/fix/gone.rs of fix_gone",
+        "unlisted file examples/fix/deep/other.rs",
+        "unlisted file examples/misc/main.rs",
+        "unlisted file examples/quick.rs",
+        "unlisted file examples/support.rs",
+    ];
+    assert_eq!(
+        programs_under(&root, &targets),
+        Err(faults.map(str::to_owned).to_vec())
+    );
+    for file in unlisted {
+        assert!(fs::remove_file(root.join(file)).is_ok());
+    }
+    let programs = programs_under(&root, &BTreeMap::from([spot]));
+    assert_eq!(
+        programs,
+        Ok(BTreeMap::from([("fix_spot".to_owned(), source.to_owned())]))
+    );
+    assert!(fs::remove_dir_all(&root).is_ok());
+    let manifest = "[package]\nname = \"a\"\n\n[[example]]\nname = \"b\"\npath = \"examples/b.rs\"\n\
+                    required-features = [\"c\"]\n\n[[example]]\nname = \"d\"\n\n[[test]]\n\
+                    path = \"tests/e.rs\"\n";
+    let expected = [("b", "examples/b.rs"), ("d", "")];
+    let expected = expected.map(|(name, path)| (name.to_owned(), path.to_owned()));
+    assert_eq!(targets_of(manifest), BTreeMap::from(expected));
+}
+
+#[test]
+fn no_example_pinned_read_only_changes_an_order_or_a_position() {
+    let programs = programs();
+    let mut read_only = 0;
+    for (name, source) in &programs {
+        if pinned(name) == Some(Access::ReadOnly) {
+            read_only += 1;
+            assert_eq!(read_only_violations(source), Vec::<String>::new(), "{name}");
+        }
+    }
+    assert_eq!(read_only, 15);
+    let quotes = programs.get("open_api_quotes").cloned().unwrap_or_default();
+    assert_eq!(pinned("open_api_quotes"), Some(Access::ReadOnly));
+    assert!(!quotes.is_empty());
+    let gained = format!(
+        "{quotes}\nasync fn buy(client: &OpenApiClient, order: &Order) {{\n    let _ = \
+         client.place_order(order).await;\n}}\n"
+    );
+    assert_eq!(read_only_violations(&gained), ["place_order"]);
+    for (source, fault) in [
+        ("trade.place(order).await?", "place"),
+        ("trade.replace(&id, change).await?", "replace"),
+        ("trade.cancel(&id).await?", "cancel"),
+        ("client.place_order(&order).await?", "place_order"),
+        ("client.amend_order(&change).await?", "amend_order"),
+        ("client.amend_position(&change).await?", "amend_position"),
+        ("client.cancel_order(account, id).await?", "cancel_order"),
+        (
+            "client.close_position(a, &p, v, &s).await?",
+            "close_position",
+        ),
+        ("use ctrader_connector::fix::trading::NewOrder;", "NewOrder"),
+        ("let change = Replacement::of(&report);", "Replacement"),
+        ("OrderAmendment::of(account, &order)", "OrderAmendment"),
+        (
+            "PositionAmendment::of(account, &position)",
+            "PositionAmendment",
+        ),
+    ] {
+        assert_eq!(read_only_violations(source), [fault], "{source}");
+    }
+    let reads = "// place_order\nlet orders = client.reconcile(account).await?.orders;";
+    assert_eq!(read_only_violations(reads), Vec::<String>::new());
+}
+
+#[test]
 fn every_example_asks_for_the_access_pinned_here() {
     let asked: Vec<(String, Option<Access>)> = programs()
         .iter()
@@ -717,12 +907,12 @@ fn every_example_asks_for_the_access_pinned_here() {
         .map(|(name, level)| (name.to_owned(), Some(level)))
         .collect();
     assert_eq!(asked, pinned);
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    let manifest = fs::read_to_string(manifest).unwrap_or_default();
+    let manifest = manifest();
+    assert!(manifest.lines().any(|line| line == "autoexamples = false"));
     assert_eq!(manifest.matches("[[example]]").count(), LEVELS.len());
-    for (name, _) in LEVELS {
-        assert!(manifest.contains(&format!("name = \"{name}\"\n")), "{name}");
-    }
+    let targets = targets_of(&manifest);
+    let names: Vec<&str> = targets.keys().map(String::as_str).collect();
+    assert_eq!(names, LEVELS.map(|(name, _)| name));
     assert_eq!(
         access("session(Access::ReadOnly); sweep(Access::Trading)"),
         Some(Access::Trading)
@@ -769,18 +959,14 @@ fn no_support_module_builds_a_configuration_or_connects_without_the_guard() {
 
 #[test]
 fn every_example_takes_its_client_from_the_support_of_its_protocol() {
-    let root = examples();
-    for (directory, needle) in [
-        ("open_api", "support::open_api::"),
-        ("fix", "support::fix::"),
-    ] {
-        let mut found = Vec::new();
-        assert!(sources(&root.join(directory), &mut found).is_ok());
-        assert!(!found.is_empty());
-        for path in found {
-            let source = fs::read_to_string(&path).unwrap_or_default();
-            assert!(source.contains(needle), "{}", path.display());
-        }
+    for (name, source) in &programs() {
+        let needle = if name.starts_with("open_api_") {
+            "support::open_api::"
+        } else {
+            assert!(name.starts_with("fix_"), "{name}");
+            "support::fix::"
+        };
+        assert!(source.contains(needle), "{name}");
     }
 }
 
