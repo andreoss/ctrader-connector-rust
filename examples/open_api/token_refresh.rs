@@ -10,8 +10,8 @@
 //!
 //! The configuration comes through the guard of the examples, which refuses anything but
 //! the demo environment on its default host before the connection is opened unless
-//! `BROKER_EXAMPLE_ALLOW_LIVE` is `read-only` or `yes`; either value permits the rotation
-//! too.
+//! `BROKER_EXAMPLE_ALLOW_LIVE` is `read-only` or `yes`. Outside demo the rotation takes
+//! `yes`: `read-only` lets the example check the pair and refuses to exchange it.
 //!
 //! ```sh
 //! cargo run --example open_api_token_refresh --features open-api
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use ctrader_connector::common::config::{ENV_ACCESS_TOKEN, ENV_REFRESH_TOKEN};
 
 use support::guard::Access;
-use support::open_api::{account, configuration, open, renewed};
+use support::open_api::{account, configuration, open, refreshable, renewed, rotate};
 use support::{Failure, flag};
 
 const ENV_FILE: &str = "BROKER_ENV_FILE";
@@ -86,7 +86,7 @@ fn writable_token_file() -> Result<(PathBuf, String), Failure> {
 async fn main() -> Result<(), Failure> {
     let checked = configuration(Access::ReadOnly)?;
     let environment = checked.get().environment();
-    let configured = checked.get().refresh_token().is_some();
+    let configured = refreshable(&checked);
     let client = open(&checked).await?;
     client.authorise_application().await?;
     let account = account(&client, environment).await?;
@@ -106,7 +106,7 @@ async fn main() -> Result<(), Failure> {
         return Ok(());
     }
     let (path, text) = writable_token_file()?;
-    let pair = client.refresh_token().await?;
+    let pair = rotate(&checked, &client).await?;
     let text = stored(&text, ENV_ACCESS_TOKEN, pair.access.expose());
     let text = stored(&text, ENV_REFRESH_TOKEN, pair.refresh.expose());
     std::fs::write(&path, text)

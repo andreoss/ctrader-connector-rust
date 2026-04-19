@@ -188,8 +188,8 @@ market.
 |`BROKER_EXAMPLE_ALLOW_LIVE`
 |no
 |Lets the examples leave the demo environment: `read-only` for the examples
-that place no order, `yes` for every example. Absent or any other value:
-demo only.
+that place no order, `yes` for every example and for rotating the token
+pair. Absent or any other value: demo only.
 |===
 
 == Examples
@@ -252,10 +252,18 @@ configuration before any connection is opened. The guard is an allowlist:
 Anything else is refused unless `BROKER_EXAMPLE_ALLOW_LIVE` permits it:
 `read-only` lets the examples that place no order leave demo, `yes` lets
 every example leave it, the trading ones included, and any other value
-permits nothing. Outside demo an Open API example works with the first
-account of the environment it connects to. A test scans the sources of the
-examples and fails when one of them builds a configuration or connects
-without the guard.
+permits nothing. Outside demo the token refresh example rotates the pair
+only under `yes`; `read-only` lets it check the pair and no more. Outside
+demo an Open API example works with the first account of the environment it
+connects to.
+
+A test scans the sources of the examples and holds each of them to an
+allowlist: of the library an example imports only the items the test lists,
+by a `use` that neither renames nor globs, and names the library nowhere
+else; of the guard it imports only the access level; and it names nothing
+that builds a configuration, opens a connection or a transport, names a
+host, exchanges a token pair or changes the environment. The same test pins
+the access level every example asks for.
 
 == Build
 

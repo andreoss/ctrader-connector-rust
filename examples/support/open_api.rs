@@ -8,6 +8,7 @@ use ctrader_connector::common::ids::{AccountId, OrderId, SymbolId};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::executions::{ExecutionStream, TradeEvent};
 use ctrader_connector::open_api::symbols::{Symbol, SymbolsParams};
+use ctrader_connector::open_api::token::TokenPair;
 use ctrader_connector::open_api::trading::{Execution, ExecutionType};
 
 use super::guard::{self, Access, Checked};
@@ -50,6 +51,25 @@ pub fn renewed(
         access_token,
         refresh_token,
     )?)
+}
+
+/// Tells whether the configuration holds a refresh token.
+pub fn refreshable(checked: &Checked<ConfigurationOpenApi>) -> bool {
+    checked.get().refresh_token().is_some()
+}
+
+/// Exchanges the refresh token for a new pair, once the guard permits the rotation.
+///
+/// # Errors
+///
+/// Returns a [`Failure`] when the guard refuses the rotation, which outside demo takes the
+/// full permit, or the server refuses the refresh.
+pub async fn rotate(
+    checked: &Checked<ConfigurationOpenApi>,
+    client: &OpenApiClient,
+) -> Result<TokenPair, Failure> {
+    guard::open_api_rotation(checked)?;
+    Ok(client.refresh_token().await?)
 }
 
 /// Returns the first account of `environment` the access token grants access to.

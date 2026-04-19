@@ -12,7 +12,8 @@
 //! that starts with `live`; the parts of a label are separated by `-`, `demo` is matched in
 //! lower case only and `live` in any case. Anything else is refused unless
 //! [`ENV_ALLOW_LIVE`] permits it: `read-only` lets the examples that place no order leave
-//! demo, `yes` lets every example leave it, and any other value permits nothing.
+//! demo, `yes` lets every example leave it, and any other value permits nothing. Exchanging
+//! the token pair for a new one outside demo takes `yes`.
 
 use std::fmt;
 
@@ -198,6 +199,35 @@ pub fn open_api_renewed(
         .build()
         .map(Checked)
         .map_err(Refusal::Config)
+}
+
+/// Checks that the token pair of `checked` may be exchanged for a new one.
+///
+/// A rotation ends the old pair in every program that holds it, so outside demo it takes
+/// the permit of the trading examples: `read-only` is not enough.
+///
+/// # Errors
+///
+/// Returns a [`Refusal`] when the configuration is not a demo one and `lookup` does not
+/// permit every example to leave demo.
+#[cfg(feature = "open-api")]
+pub fn open_api_rotation_from(
+    lookup: impl Fn(&str) -> Option<String>,
+    checked: &Checked<ConfigurationOpenApi>,
+) -> Result<(), Refusal> {
+    let configuration = checked.get();
+    let demo = demo_open_api(configuration.environment(), configuration.host());
+    allowed(&lookup, Access::Trading, demo)
+}
+
+/// Checks against the environment that the token pair of `checked` may be exchanged.
+///
+/// # Errors
+///
+/// Returns the refusals of [`open_api_rotation_from`].
+#[cfg(feature = "open-api")]
+pub fn open_api_rotation(checked: &Checked<ConfigurationOpenApi>) -> Result<(), Refusal> {
+    open_api_rotation_from(process, checked)
 }
 
 /// Connects to the Open API with a configuration the guard let through.
@@ -393,7 +423,10 @@ mod tests {
         };
         use ctrader_connector::common::errors::ConfigError;
 
-        use super::super::{Access, ENV_ALLOW_LIVE, Refusal, open_api_from, open_api_renewed};
+        use super::super::{
+            Access, ENV_ALLOW_LIVE, Refusal, open_api_from, open_api_renewed,
+            open_api_rotation_from,
+        };
         use super::lookup;
 
         const BASE: [(&str, &str); 3] = [
@@ -478,6 +511,43 @@ mod tests {
                     checked.as_ref().map(|c| c.get().environment()),
                     Ok(Environment::Live)
                 );
+            }
+        }
+
+        #[test]
+        fn rotation_outside_demo_takes_the_full_permit() {
+            let refused = Err(Refusal::NotDemo("the environment is not demo"));
+            for (permit, rotation) in [
+                (&[][..], Ok(())),
+                (
+                    &[(ENV_ENVIRONMENT, "demo"), (ENV_ALLOW_LIVE, "")][..],
+                    Ok(()),
+                ),
+                (
+                    &[(ENV_ENVIRONMENT, "live"), (ENV_ALLOW_LIVE, "read-only")][..],
+                    refused,
+                ),
+                (
+                    &[(ENV_ENVIRONMENT, "live"), (ENV_ALLOW_LIVE, "yes")][..],
+                    Ok(()),
+                ),
+            ] {
+                let checked = open_api_from(with(permit), Access::ReadOnly);
+                let asked = checked
+                    .as_ref()
+                    .map_err(|_| ())
+                    .map(|checked| open_api_rotation_from(with(permit), checked));
+                assert_eq!(asked, Ok(rotation), "{permit:?}");
+            }
+            let live = [(ENV_ENVIRONMENT, "live"), (ENV_ALLOW_LIVE, "yes")];
+            let checked = open_api_from(with(&live), Access::ReadOnly);
+            for value in ["read-only", "", "YES", "1"] {
+                let later = [(ENV_ENVIRONMENT, "live"), (ENV_ALLOW_LIVE, value)];
+                let asked = checked
+                    .as_ref()
+                    .map_err(|_| ())
+                    .map(|checked| open_api_rotation_from(with(&later), checked).is_err());
+                assert_eq!(asked, Ok(true), "{value:?}");
             }
         }
 
