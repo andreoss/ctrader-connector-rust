@@ -7,13 +7,15 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ctrader_connector::common::config::{ConfigurationFix, DEFAULT_TIMEOUT, MAX_FIX_HEARTBEAT};
-use ctrader_connector::common::errors::TransportError;
+use ctrader_connector::common::errors::{FixError, TransportError};
 use ctrader_connector::common::time::Timestamp;
 use ctrader_connector::common::transport::Connect;
 use ctrader_connector::fix::client::FixClient;
-use ctrader_connector::fix::codec::{Header, decode, encode};
-use ctrader_connector::fix::messages::{Heartbeat, Logon, Message, ResendRequest, TestRequest};
-use ctrader_connector::fix::session::SessionKind;
+use ctrader_connector::fix::codec::{Frame, Header, decode, encode};
+use ctrader_connector::fix::messages::{
+    Heartbeat, Logon, Logout, Message, ResendRequest, TestRequest,
+};
+use ctrader_connector::fix::session::{Event, SessionKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 use tokio::time::{Instant, sleep};
 
@@ -165,4 +167,32 @@ async fn session_kept_alive_past_a_wait_that_never_ends_neither_hangs_nor_gives_
     assert_eq!(started.elapsed(), MAX_FIX_HEARTBEAT * rounds);
     assert!(started.elapsed() > Duration::from_secs(365 * 86_400));
     drop(client);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_message_during_a_logout_is_reported_and_not_answered() {
+    let (client, mut peer) = session().await;
+    let mut events = client.events();
+    let started = Instant::now();
+    let (left, ()) = tokio::join!(client.logout(), async {
+        let (_, logout, _) = peer.read().await;
+        assert!(matches!(logout, Message::Logout(_)), "{logout:?}");
+        let header = Header::new("8", "CSERVER", SENDER, peer.seq, Timestamp::now())
+            .qualified("TRADE", "TRADE");
+        peer.seq += 1;
+        let unreadable = encode(&Frame::new(header, Vec::new())).expect("encode");
+        peer.stream.write_all(&unreadable).await.expect("write");
+        peer.send(Logout { text: None }).await;
+    });
+    assert_eq!(left, Ok(()));
+    let reported = events.recv().await;
+    assert!(
+        matches!(reported, Ok(Event::Unparsed(FixError::MissingField { .. }))),
+        "{reported:?}"
+    );
+    client.closed().await;
+    let mut answer = Vec::new();
+    peer.stream.read_to_end(&mut answer).await.expect("end");
+    assert!(peer.buffer.is_empty() && answer.is_empty(), "{answer:?}");
+    assert_eq!(started.elapsed(), Duration::ZERO);
 }

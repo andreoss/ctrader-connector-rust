@@ -278,7 +278,10 @@ library that places, changes, cancels or closes an order or a position.
 - The guard matches `demo` in `BROKER_FIX_HOST` in lower case only, so it
   refuses a demo host written in another case; it fails closed.
 - A FIX reconnect delay above one hour is shortened to one hour without a
-  message; a heartbeat interval above one hour is refused instead.
+  message; a heartbeat interval above one hour is refused instead. The delay
+  is the pause before the first of at most five attempts and the pause
+  before the n-th attempt is n times the delay, so a session pauses for up
+  to five hours before its last attempt.
 
 == Build
 

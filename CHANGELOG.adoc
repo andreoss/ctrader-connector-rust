@@ -4,6 +4,24 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.4 - 2026-04-19
+
+=== Changed
+
+- Build: the manifest turns the discovery of examples off; every example is
+  listed.
+- Examples: the test that scans the sources walks every `.rs` file under
+  `examples/` and fails on a file outside `examples/support` that is no
+  listed example with a pinned access level. An example pinned read-only
+  names nothing of the library that places, changes, cancels or closes an
+  order or a position.
+
+=== Fixed
+
+- Documentation: `MAX_FIX_RECONNECT_DELAY` bounds the reconnect delay, the
+  pause before the first attempt; the pause before the n-th of at most five
+  attempts is n times the delay, five hours at most.
+
 == 0.3.3 - 2026-04-18
 
 === Added

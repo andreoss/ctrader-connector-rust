@@ -544,10 +544,14 @@ pub const DEFAULT_FIX_HEARTBEAT: Duration = Duration::from_secs(30);
 /// the server on multiples of it, so an interval without an end would leave a dead connection
 /// unnoticed.
 pub const MAX_FIX_HEARTBEAT: Duration = Duration::from_secs(3_600);
-/// Longest pause before a lost session is opened again.
+/// Longest reconnect delay a configuration holds: the pause before the first attempt to
+/// open a lost session again.
 ///
-/// A configuration takes a longer pause as this one, so that a session that lost its
-/// connection does not wait without an end before it logs on again.
+/// A configuration takes a longer delay as this one. The constant bounds the delay, not
+/// every pause: a session makes five attempts at most and pauses before the n-th one for n
+/// times the delay, so the longest pause, the one before the fifth attempt, is five hours.
+/// The bound keeps a session that lost its connection from waiting without an end before it
+/// logs on again.
 pub const MAX_FIX_RECONNECT_DELAY: Duration = Duration::from_secs(3_600);
 
 const FIX_HOST: &str = "host";
@@ -698,7 +702,8 @@ impl ConfigurationFix {
         self.timeout
     }
 
-    /// Returns the pause before a lost session is opened again.
+    /// Returns the reconnect delay: the pause before the first attempt to open a lost session
+    /// again. The pause before the n-th attempt is n times as long.
     #[must_use]
     pub const fn reconnect_delay(&self) -> Duration {
         self.reconnect_delay
@@ -809,9 +814,10 @@ impl ConfigurationFixBuilder {
         self
     }
 
-    /// Sets the pause before a lost session is opened again.
+    /// Sets the reconnect delay: the pause before the first attempt to open a lost session
+    /// again. The pause before the n-th attempt is n times as long.
     ///
-    /// [`ConfigurationFixBuilder::build`] takes a pause above [`MAX_FIX_RECONNECT_DELAY`] as
+    /// [`ConfigurationFixBuilder::build`] takes a delay above [`MAX_FIX_RECONNECT_DELAY`] as
     /// that maximum.
     pub const fn reconnect_delay(mut self, reconnect_delay: Duration) -> Self {
         self.reconnect_delay = reconnect_delay;
@@ -1276,6 +1282,11 @@ mod tests {
         let slowest = fix().heartbeat(MAX_FIX_HEARTBEAT).build()?;
         assert_eq!(slowest.heartbeat(), MAX_FIX_HEARTBEAT);
         Ok(())
+    }
+
+    #[test]
+    fn fix_reconnect_delay_is_bounded_at_one_hour() {
+        assert_eq!(MAX_FIX_RECONNECT_DELAY, Duration::from_secs(3_600));
     }
 
     #[test]
