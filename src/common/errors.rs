@@ -606,6 +606,9 @@ pub enum FixError {
     /// The type of the message is not known to this library.
     #[error("message type {0} is not supported")]
     UnsupportedMessage(String),
+    /// The message is of a type this library never sends, because the server refuses it.
+    #[error("message type {0} is never sent")]
+    Unsendable(String),
     /// The server answered the logon with a logout.
     #[error("the server refused the logon: {}", explained(text.as_deref()))]
     LogonRefused {
@@ -997,6 +1000,10 @@ mod tests {
         assert_eq!(
             FixError::LogonRefused { text: None }.to_string(),
             "the server refused the logon: no explanation given"
+        );
+        assert_eq!(
+            FixError::Unsendable("j".to_owned()).to_string(),
+            "message type j is never sent"
         );
         assert_eq!(
             FixError::UnexpectedMessage("0".to_owned()).to_string(),

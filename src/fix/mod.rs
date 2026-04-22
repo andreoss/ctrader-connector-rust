@@ -81,9 +81,13 @@
 //!   [`Event::Unparsed`](session::Event::Unparsed) and the session goes on. One whose bytes
 //!   are intact and whose turn it is is counted and answered with a reject (3) that names
 //!   the message (45), its type where it is known (372), the tag (371) and the reason
-//!   (373): 11 for a type the library does not know, 1 for a missing tag. The session never
-//!   sends a business message reject (j): the server refuses one with a reject and closes
-//!   the connection. A reject or a business message reject that cannot be read is
+//!   (373): 11 for a type the library does not know, 1 for a missing tag; for a value of
+//!   the wrong form the reject names the tag and carries no reason. A business message
+//!   reject (j) is never sent: the server refuses one with a reject and closes the
+//!   connection. The session answers with none, and
+//!   [`FixClient::send`](client::FixClient::send) refuses one of the application with
+//!   [`FixError::Unsendable`](crate::common::errors::FixError::Unsendable) before anything
+//!   is written. A reject or a business message reject that cannot be read is
 //!   counted and never answered, so that no reject answers a reject. One whose bytes are
 //!   damaged is not counted and is asked for again. While the session logs out an
 //!   unreadable message is reported and not answered.
@@ -102,6 +106,7 @@
 //! | Error | Meaning | Reaction |
 //! |---|---|---|
 //! | `Config`, `Value` | Rejected before anything was sent. | Correct the input. |
+//! | `Fix(Unsendable)` | The message is a business message reject, which is never sent; nothing was written. | Do not send that type. |
 //! | `Fix(LogonRefused)` | The server answered the logon with a logout. | Check the credentials and the session kind. |
 //! | `Fix(Rejected)`, `Fix(BusinessRejected)` | The server refused a message or a request. | Decide by the reason and the text. |
 //! | `Fix(MarketDataRejected)` | The server refused a subscription to prices. | Check the symbol. |

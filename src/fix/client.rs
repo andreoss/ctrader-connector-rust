@@ -106,13 +106,23 @@ impl FixClient {
 
     /// Sends a message and returns the sequence number it was given.
     ///
+    /// The message goes out as it is, with one exception: a business message reject (j) is
+    /// never sent. It is refused here, before anything is written and without a sequence
+    /// number, because the server refuses one with a reject and closes the connection.
+    /// Every message of the application passes through this method, those of
+    /// [`FixClient::request`] and [`FixClient::request_once`] included.
+    ///
     /// # Errors
     ///
-    /// Returns [`ConnectorError::Fix`] when the message cannot be encoded,
+    /// Returns [`ConnectorError::Fix`] with [`FixError::Unsendable`] for a business message
+    /// reject and with another [`FixError`] when the message cannot be encoded,
     /// [`ConnectorError::Transport`] when the write fails, and [`ConnectorError::Closed`]
     /// when the session has ended or is between two connections; the message was not sent
     /// then.
     pub async fn send(&self, message: Message) -> Result<u64, ConnectorError> {
+        if matches!(message, Message::BusinessReject(_)) {
+            return Err(FixError::Unsendable(message.msg_type().to_owned()).into());
+        }
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::Send { message, reply })

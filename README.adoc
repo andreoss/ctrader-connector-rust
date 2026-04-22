@@ -84,9 +84,11 @@ quote.logout().await?;
 An account has a quote session and a trade session, each a client of its
 own. A session answers heartbeats, closes gaps in the sequence numbers and
 logs on again after a loss. A message it cannot read is answered with a
-reject (3), an unknown type with the reason 11; it never sends a business
-message reject (j), because the server refuses one and closes the
-connection.
+reject (3), an unknown type with the reason 11, when its bytes are intact,
+its turn has come, it is not itself a reject and the session is not logging
+out; the module documentation of `fix` holds the details. A business message
+reject (j) is never sent: the server refuses one with a reject and closes
+the connection, so `FixClient::send` refuses one before anything is written.
 
 The module documentation covers configuration, connection lifecycle, error
 handling, streams, rate limits, logging, testing and protocol facts for each

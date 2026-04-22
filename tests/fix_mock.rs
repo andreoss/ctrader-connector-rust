@@ -634,6 +634,33 @@ async fn message_of_an_unsupported_type_is_answered_with_a_session_reject() {
     drop(client);
 }
 
+fn refusal() -> Message {
+    BusinessReject {
+        ref_seq_num: Some(1),
+        ref_msg_type: Some("0".to_owned()),
+        ref_id: None,
+        reason: Some(3),
+        text: None,
+    }
+    .into()
+}
+
+#[tokio::test]
+async fn business_reject_of_the_application_is_refused_and_takes_no_number() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let first = client.send(probe("before")).await.expect("sent");
+    assert_eq!(
+        client.send(refusal()).await,
+        Err(ConnectorError::Fix(FixError::Unsendable("j".to_owned())))
+    );
+    assert_eq!(client.send(probe("after")).await, Ok(first + 1));
+    for (seq, id) in [(first, "before"), (first + 1, "after")] {
+        let (header, message) = peer.read().await;
+        assert_eq!((header.seq, message), (seq, probe(id)));
+    }
+    drop(client);
+}
+
 #[tokio::test]
 async fn no_refusal_is_ever_written_as_a_business_reject() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -657,6 +684,16 @@ async fn no_refusal_is_ever_written_as_a_business_reject() {
     for _ in 0..5 {
         assert!(matches!(next(&mut events).await, Event::Unparsed(_)));
     }
+    let unsendable = ConnectorError::Fix(FixError::Unsendable("j".to_owned()));
+    assert_eq!(client.send(refusal()).await, Err(unsendable.clone()));
+    assert_eq!(
+        client.request(refusal(), "", answers("never")).await,
+        Err(unsendable.clone())
+    );
+    assert_eq!(
+        client.request_once(refusal(), "", answers("never")).await,
+        Err(unsendable)
+    );
     peer.set_next_seq(seq + 5);
     peer.send(Logout { text: None }).await;
     let mut written = Vec::new();

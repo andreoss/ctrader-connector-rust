@@ -92,9 +92,10 @@ pub enum Event {
     /// A message arrived that the library cannot read; it is skipped. A message whose bytes
     /// are intact and whose turn it is is counted and answered with a reject (3) that names
     /// the message, its type where it is known, the tag and the reason: 11 for a type this
-    /// library does not know, 1 for a missing tag. No business message reject (j) is ever
-    /// sent: the server refuses one with a reject and closes the connection. A reject or a
-    /// business message reject that cannot be read is counted and never answered.
+    /// library does not know, 1 for a missing tag, none for a value of the wrong form. A
+    /// business message reject (j) is never sent: the server refuses one with a reject and
+    /// closes the connection. A reject or a business message reject that cannot be read is
+    /// counted and never answered.
     /// A message whose bytes are damaged is not counted, so that the server is asked to send
     /// it again. While the session logs out an unreadable message is reported and not
     /// answered.

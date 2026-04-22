@@ -4,6 +4,23 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.6 - 2026-04-21
+
+=== Added
+
+- FIX 4.4: `FixError::Unsendable`, the error for a message of a type the
+  library never sends.
+
+=== Fixed
+
+- FIX 4.4: `FixClient::send`, and with it `request` and `request_once`,
+  refuses a business message reject (j) with `FixError::Unsendable` before
+  anything is written and without a sequence number; the server refuses one
+  with a reject and closes the connection.
+- Documentation: the conditions under which an unreadable message is
+  answered with a reject (3) are stated, and a value of the wrong form is
+  rejected without a reason (373).
+
 == 0.3.5 - 2026-04-21
 
 === Changed
