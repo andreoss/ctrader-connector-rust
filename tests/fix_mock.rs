@@ -601,7 +601,7 @@ async fn answered_after(
 }
 
 #[tokio::test]
-async fn message_of_an_unsupported_type_is_answered_with_a_business_reject() {
+async fn message_of_an_unsupported_type_is_answered_with_a_session_reject() {
     let (client, mut peer) = session(SessionKind::Trade).await;
     let mut events = client.events();
     let seq = peer.next_seq();
@@ -616,18 +616,57 @@ async fn message_of_an_unsupported_type_is_answered_with_a_business_reject() {
         next(&mut events).await,
         Event::Unparsed(unsupported.clone())
     );
+    let (sent, reject) = reject_naming(&mut peer, "ZZ").await;
     assert_eq!(
-        peer.read().await.1,
-        Message::from(BusinessReject {
-            ref_seq_num: Some(seq),
-            ref_msg_type: Some("ZZ".to_owned()),
-            ref_id: None,
-            reason: Some(3),
+        reject,
+        Message::from(Reject {
+            ref_seq_num: seq,
             text: Some(unsupported.to_string()),
+            ref_tag_id: None,
+            ref_msg_type: Some("ZZ".to_owned()),
+            reason: Some(11),
         })
     );
-    let _ = answered_after(&mut peer, &mut events, seq + 1).await;
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 1).await,
+        sent + 1
+    );
     drop(client);
+}
+
+#[tokio::test]
+async fn no_refusal_is_ever_written_as_a_business_reject() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    for (at, msg_type) in [(seq, "ZZ"), (seq + 1, "1")] {
+        peer.send_with(
+            at,
+            |header| header.msg_type = msg_type.to_owned(),
+            Heartbeat { test_req_id: None },
+        )
+        .await;
+    }
+    peer.raw(&without_sending_time(seq + 2)).await;
+    for (at, msg_type) in [(seq + 3, "ZZ"), (seq + 4, "j")] {
+        peer.raw(&sealed(&format!(
+            "35={msg_type}|49=CSERVER|56={SENDER}|34={at}|"
+        )))
+        .await;
+    }
+    for _ in 0..5 {
+        assert!(matches!(next(&mut events).await, Event::Unparsed(_)));
+    }
+    peer.set_next_seq(seq + 5);
+    peer.send(Logout { text: None }).await;
+    let mut written = Vec::new();
+    while let Some(frame) = peer.frame().await {
+        written.push(frame.header.msg_type);
+    }
+    assert_eq!(written, ["3", "3", "3", "3", "5"]);
+    timeout(STEP, client.closed())
+        .await
+        .expect("closed in time");
 }
 
 #[tokio::test]

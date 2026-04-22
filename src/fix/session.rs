@@ -39,8 +39,7 @@ use crate::common::time::Timestamp;
 use crate::common::transport::Connect;
 use crate::fix::codec::{Frame, Header, Unreadable, encode, take};
 use crate::fix::messages::{
-    BusinessReject, Heartbeat, Logon, Logout, Message, Reject, ResendRequest, SequenceReset,
-    TestRequest,
+    Heartbeat, Logon, Logout, Message, Reject, ResendRequest, SequenceReset, TestRequest,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -50,7 +49,7 @@ const PROBE: &str = "alive";
 const RECONNECT_ATTEMPTS: u32 = 5;
 const EVERY_LATER_MESSAGE: u64 = 0;
 const REQUIRED_TAG_MISSING: u32 = 1;
-const UNSUPPORTED_MESSAGE_TYPE: u32 = 3;
+const INVALID_MSG_TYPE: u32 = 11;
 const REJECTS: [&str; 2] = ["3", "j"];
 
 /// Which of the two sessions of an account a connection serves.
@@ -91,11 +90,11 @@ pub enum Event {
     /// A message arrived.
     Message(Inbound),
     /// A message arrived that the library cannot read; it is skipped. A message whose bytes
-    /// are intact and whose turn it is is counted and answered as the protocol prescribes: a
-    /// type this library does not know with a business message reject (j) that carries the
-    /// reason 3, a header or a body that cannot be read with a reject (3) that names the
-    /// message, its type where it is known, the tag and, for a missing tag, the reason 1. A
-    /// reject or a business message reject that cannot be read is counted and never answered.
+    /// are intact and whose turn it is is counted and answered with a reject (3) that names
+    /// the message, its type where it is known, the tag and the reason: 11 for a type this
+    /// library does not know, 1 for a missing tag. No business message reject (j) is ever
+    /// sent: the server refuses one with a reject and closes the connection. A reject or a
+    /// business message reject that cannot be read is counted and never answered.
     /// A message whose bytes are damaged is not counted, so that the server is asked to send
     /// it again. While the session logs out an unreadable message is reported and not
     /// answered.
@@ -243,6 +242,7 @@ fn rejection(seq: u64, msg_type: Option<&str>, error: &FixError) -> Option<Rejec
             Some(REQUIRED_TAG_MISSING),
         ),
         FixError::InvalidField { msg_type, tag } => (Some(msg_type.as_str()), Some(*tag), None),
+        FixError::UnsupportedMessage(_) => (None, None, Some(INVALID_MSG_TYPE)),
         _ => (None, None, None),
     };
     let ref_msg_type = msg_type.or(named);
@@ -256,23 +256,6 @@ fn rejection(seq: u64, msg_type: Option<&str>, error: &FixError) -> Option<Rejec
         ref_msg_type: ref_msg_type.map(str::to_owned),
         reason,
     })
-}
-
-fn refusal(seq: u64, msg_type: &str, error: &FixError) -> Option<Message> {
-    let reject = rejection(seq, Some(msg_type), error)?;
-    if matches!(error, FixError::UnsupportedMessage(_)) {
-        return Some(
-            BusinessReject {
-                ref_seq_num: Some(seq),
-                ref_msg_type: reject.ref_msg_type,
-                ref_id: None,
-                reason: Some(UNSUPPORTED_MESSAGE_TYPE),
-                text: reject.text,
-            }
-            .into(),
-        );
-    }
-    Some(reject.into())
 }
 
 struct Actor<C: Connect> {
@@ -486,9 +469,9 @@ impl<C: Connect> Actor<C> {
         let message = match parsed {
             Ok(message) => message,
             Err(error) => {
-                let refusal = refusal(seq, &frame.header.msg_type, &error);
+                let reject = rejection(seq, Some(&frame.header.msg_type), &error);
                 self.emit(Event::Unparsed(error));
-                return match self.transmit(live, &refusal?).await {
+                return match self.transmit(live, &reject?.into()).await {
                     Err(ConnectorError::Transport(error)) => Some(End::Lost(error)),
                     _ => None,
                 };

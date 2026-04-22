@@ -4,6 +4,21 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.5 - 2026-04-21
+
+=== Changed
+
+- FIX 4.4: a readable message in turn of a type the library does not know
+  is answered with a reject (3) that names the message (45) and its type
+  (372) and carries the reason 11 (373) and a text (58). It is reported as
+  `Event::Unparsed` and counted as before.
+
+=== Fixed
+
+- FIX 4.4: the session no longer sends a business message reject (j); the
+  server refuses one with a reject and closes the connection.
+- Documentation: the rejects a session sends match the behaviour.
+
 == 0.3.4 - 2026-04-19
 
 === Changed

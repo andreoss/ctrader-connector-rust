@@ -79,11 +79,11 @@
 //!   request that arrives ahead of its turn is the exception: it is acted on at once.
 //! - Unreadable messages: one the library cannot read is reported as
 //!   [`Event::Unparsed`](session::Event::Unparsed) and the session goes on. One whose bytes
-//!   are intact and whose turn it is is counted and answered as FIX 4.4 prescribes: a type
-//!   the library does not know with a business message reject (j) that carries the reason
-//!   3 (380), a header or a body that cannot be read with a reject (3) that names the
-//!   message (45), its type where it is known (372), the tag (371) and, for a missing tag,
-//!   the reason 1 (373). A reject or a business message reject that cannot be read is
+//!   are intact and whose turn it is is counted and answered with a reject (3) that names
+//!   the message (45), its type where it is known (372), the tag (371) and the reason
+//!   (373): 11 for a type the library does not know, 1 for a missing tag. The session never
+//!   sends a business message reject (j): the server refuses one with a reject and closes
+//!   the connection. A reject or a business message reject that cannot be read is
 //!   counted and never answered, so that no reject answers a reject. One whose bytes are
 //!   damaged is not counted and is asked for again. While the session logs out an
 //!   unreadable message is reported and not answered.
