@@ -1,6 +1,6 @@
 [package]
 name = "ctrader-connector"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 rust-version = "1.86"
 description = "Client library for the cTrader Open API and the cTrader FIX 4.4 API"

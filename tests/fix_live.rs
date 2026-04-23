@@ -17,6 +17,8 @@ use tokio::time::{Instant, timeout};
 
 const STEP: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(5);
+/// Most prices a stream may hold from before a loss of the connection.
+const HELD_PRICES: usize = 4096;
 
 fn configuration() -> ConfigurationFix {
     let read = ConfigurationFix::from_env().expect("variables of the FIX sessions");
@@ -282,16 +284,28 @@ async fn live_forced_disconnect_recovers_the_numbering_and_the_spot_subscription
         .expect("first prices in time")
         .expect("spot subscription");
     let seen = reconnected(&client).await;
-    assert!(
-        matches!(seen.first(), Some(Event::Disconnected(_))),
-        "{seen:?}"
-    );
+    // A message read before the connection was closed may precede the loss.
+    let cause = seen
+        .iter()
+        .find(|event| !matches!(event, Event::Message(_)));
+    assert!(matches!(cause, Some(Event::Disconnected(_))), "{seen:?}");
     assert_eq!(seen.last(), Some(&Event::Reconnected { attempt: 1 }));
     let mut events = client.events();
-    let lost = spots.next().await;
+    // The stream holds the prices that arrived before the loss; they come first.
+    let mut held = 0_usize;
+    let lost = timeout(STEP, async {
+        loop {
+            match spots.next().await {
+                Ok(_) if held < HELD_PRICES => held += 1,
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("the loss reported in time");
     assert!(
         matches!(lost, Err(ConnectorError::Transport(_))),
-        "{lost:?}"
+        "after {held} held prices: {lost:?}"
     );
     let quote = timeout(Duration::from_secs(60), spots.next())
         .await
@@ -325,8 +339,7 @@ async fn live_forced_disconnect_recovers_the_numbering_and_the_spot_subscription
         .expect("positions after the reconnection");
     leave(&trade).await;
     say!(
-        "live FIX reconnection: quote session lost with {:?} and logged on again at attempt 1; the spot stream reported the loss once and then {:?}/{:?}; messages {:?}..={:?} followed without a gap; trade session reconnected likewise and listed {} positions",
-        seen.first(),
+        "live FIX reconnection: quote session lost with {cause:?} and logged on again at attempt 1; the spot stream reported the loss once after {held} held prices and then {:?}/{:?}; messages {:?}..={:?} followed without a gap; trade session reconnected likewise and listed {} positions",
         quote.bid.map(|price| price.to_string()),
         quote.offer.map(|price| price.to_string()),
         numbers.first(),
