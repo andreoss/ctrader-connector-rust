@@ -1052,11 +1052,27 @@ async fn refused_and_unanswered_replays_are_reported_and_removed_ones_are_not_se
     assert_eq!(unknown.stage(), ReplayStage::Account);
     assert_eq!(unknown.id(), "999");
     let mut events = connection.events();
+    // The price is sent ahead of the refusal, on the same connection: it is delivered while
+    // the replay runs whatever the pace of this task, and no time limit runs before it.
+    server.precede(
+        ACCOUNT_AUTH_REQ,
+        vec![envelope(
+            ProtoOaSpotEvent::PAYLOAD_TYPE,
+            &ProtoOaSpotEvent {
+                ctid_trader_account_id: 101,
+                symbol_id: 1,
+                bid: Some(5),
+                ..ProtoOaSpotEvent::default()
+            },
+            None,
+        )],
+    );
     connection.force_reconnect().await.expect("reconnection");
     assert_eq!(
         next_event(&mut events).await,
         Event::Disconnected(TransportError::Closed)
     );
+    assert_eq!(next_spot_bid(&mut events).await, Some(5));
     match next_event(&mut events).await {
         Event::ReplayFailed {
             key,
@@ -1067,8 +1083,6 @@ async fn refused_and_unanswered_replays_are_reported_and_removed_ones_are_not_se
         }
         other => panic!("unexpected event {other:?}"),
     }
-    server.push_spot(101, 1, 5);
-    assert_eq!(next_spot_bid(&mut events).await, Some(5));
     assert_eq!(
         next_event(&mut events).await,
         Event::ReplayFailed {

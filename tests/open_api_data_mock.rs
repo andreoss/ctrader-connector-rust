@@ -10,7 +10,7 @@ use ctrader_connector::common::time::{TimeRange, Timestamp};
 use ctrader_connector::open_api::account::{AccessRights, AccountType};
 use ctrader_connector::open_api::client::OpenApiClient;
 use ctrader_connector::open_api::connection::{ConnectionOptions, Event};
-use ctrader_connector::open_api::depth::DepthBook;
+use ctrader_connector::open_api::depth::{DepthBook, DepthStream};
 use ctrader_connector::open_api::history::CashFlowKind;
 use ctrader_connector::open_api::margin::{MarginCall, MarginCallLevel, MarginEvent};
 use ctrader_connector::open_api::messages::{
@@ -646,6 +646,66 @@ async fn depth_sent_during_the_replay_survives_the_reconnection() {
     assert_eq!(book.len(), 2);
     assert_eq!(book.best_bid(), "1.08495".parse().ok());
     assert_eq!(book.best_ask(), "1.08510".parse().ok());
+    client.shutdown().await;
+}
+
+fn held_ids(stream: &DepthStream) -> Vec<u64> {
+    stream.book(symbol(1)).map_or_else(Vec::new, |book| {
+        let mut ids: Vec<u64> = book
+            .bids()
+            .iter()
+            .chain(book.asks().iter())
+            .map(|quote| quote.id.get())
+            .collect();
+        ids.sort_unstable();
+        ids
+    })
+}
+
+#[tokio::test]
+async fn depth_left_unread_before_a_loss_is_delivered_ahead_of_the_replayed_depth() {
+    let Session { server, client } = session(depth_subscriptions).await;
+    let mut events = client.events();
+    let mut stream = client
+        .subscribe_depth(account(101), &[symbol(1)])
+        .await
+        .expect("subscription");
+    let snapshot = || vec![level(7, Some(108_490), None), level(8, None, Some(108_510))];
+    server.push(depth(
+        101,
+        1,
+        vec![level(1, None, Some(108_520)), level(2, Some(108_500), None)],
+        Vec::new(),
+    ));
+    soon("first update", stream.next()).await.expect("update");
+    assert_eq!(held_ids(&stream), [1, 2]);
+    // Two changes stay unread; the first holds the identifiers the replay starts with.
+    server.push(depth(101, 1, snapshot(), Vec::new()));
+    server.push(depth(101, 1, Vec::new(), vec![1]));
+    for _ in 0..3 {
+        assert_eq!(next_marker(&mut events).await, "depth");
+    }
+    server.precede(
+        SUBSCRIBE_DEPTH_REQ,
+        vec![depth(101, 1, snapshot(), Vec::new())],
+    );
+    server.drop_connections();
+    let mut order = Vec::new();
+    while order.last() != Some(&"reconnected") {
+        order.push(next_marker(&mut events).await);
+    }
+    assert_eq!(order, ["disconnected", "depth", "reconnected"]);
+    let twin = soon("unread change", stream.next()).await.expect("update");
+    assert_eq!(twin.new_quotes.len(), 2);
+    assert_eq!(held_ids(&stream), [1, 2, 7, 8]);
+    let removal = soon("unread change", stream.next()).await.expect("update");
+    assert_eq!(removal.deleted_quotes.len(), 1);
+    assert_eq!(held_ids(&stream), [2, 7, 8]);
+    let replayed = soon("snapshot of the replay", stream.next())
+        .await
+        .expect("update");
+    assert_eq!(replayed, twin);
+    assert_eq!(held_ids(&stream), [7, 8]);
     client.shutdown().await;
 }
 

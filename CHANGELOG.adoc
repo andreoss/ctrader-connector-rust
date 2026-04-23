@@ -4,6 +4,27 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.9 - 2026-04-22
+
+=== Fixed
+
+- Live tests: the depth reconnection test of `open_api_live` matches the
+  updates of the stream to the depth events of the connection by their
+  position, counted from the subscription, and no longer by what they hold;
+  it no longer fails when a change left unread before the loss holds the
+  identifiers of the first event sent after it. The changes left unread are
+  compared with their events as well.
+- Tests: the replay test of `open_api_mock` has the price sent ahead of the
+  refusal of the account in place of a price that had to arrive before the
+  time limit of the unanswered replay ran out; a slow run no longer reverses
+  the two.
+
+=== Added
+
+- Tests: `open_api_data_mock` holds a test of the order in which a depth
+  stream delivers the changes left unread before a loss, empties its books
+  and delivers the depth sent anew.
+
 == 0.3.8 - 2026-04-22
 
 === Fixed
