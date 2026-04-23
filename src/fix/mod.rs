@@ -77,25 +77,59 @@
 //!   messages of the server is closed with a resend request: the message that arrived
 //!   ahead of its turn is dropped and read when the server repeats it. A logout or a resend
 //!   request that arrives ahead of its turn is the exception: it is acted on at once.
-//! - Unreadable messages: one the library cannot read is reported as
-//!   [`Event::Unparsed`](session::Event::Unparsed) and the session goes on. One whose bytes
-//!   are intact and whose turn it is is counted and answered with a reject (3) that names
-//!   the message (45), its type where it is known (372), the tag (371) and the reason
-//!   (373): 11 for a type the library does not know, 1 for a missing tag; for a value of
-//!   the wrong form the reject names the tag and carries no reason. A business message
-//!   reject (j) is never sent: the server refuses one with a reject and closes the
-//!   connection. The session answers with none, and
+//! - Unusable messages: a message of the server the session cannot use is never handed on
+//!   as [`Event::Message`](session::Event::Message). What is reported, whether the message
+//!   is counted and what answers it depends on the case; the table under
+//!   [Messages that cannot be used](#messages-that-cannot-be-used) holds every one. A
+//!   business message reject (j) is never sent: the server refuses one with a reject and
+//!   closes the connection. The session answers with none, and
 //!   [`FixClient::send`](client::FixClient::send) refuses one of the application with
 //!   [`FixError::Unsendable`](crate::common::errors::FixError::Unsendable) before anything
-//!   is written. A reject or a business message reject that cannot be read is
-//!   counted and never answered, so that no reject answers a reject. One whose bytes are
-//!   damaged is not counted and is asked for again. While the session logs out an
-//!   unreadable message is reported and not answered.
+//!   is written.
 //! - Never sent again: orders, and every other message. When the server asks for messages
 //!   again the task answers with a sequence reset that skips them, reported as
 //!   [`Event::Skipped`](session::Event::Skipped).
 //! - [`FixClient::logout`](client::FixClient::logout) ends the session in order;
 //!   [`FixClient::closed`](client::FixClient::closed) waits for the end.
+//!
+//! ## Messages that cannot be used
+//!
+//! The first row that applies decides. Rows 1 to 15 hold while the session is logged on.
+//! The events are those of [`session::Event`]. "Counted" tells whether the sequence number
+//! expected next moves past the message. "In turn" means that the message carries exactly
+//! the number expected. A reject (3) carries the tags marked in its row and none of the
+//! others of 45, 371, 372, 373 and 58: 45 is the number of the message, 372 its type, 371
+//! the tag at fault, 373 the reason, and 58 the error of the event as a text.
+//!
+//! | Row | Message | Event | Counted | Answer | 45 | 372 | 371 | 373 | 58 |
+//! |---|---|---|---|---|---|---|---|---|---|
+//! | 1 | The stream has lost its framing: the bytes do not open a message, or the body length (9) is not a number or exceeds the limit. | `Disconnected` with `TransportError::Decode`; the connection is closed and the session connects again. | no | none | | | | | |
+//! | 2 | The bytes are damaged: the checksum (10) does not match them or does not close the message. | `Unparsed` | no | none | | | | | |
+//! | 3 | The bytes are intact, the header or the fields cannot be read, and there is no single sequence number: 34 is absent, there more than once or not a number. | `Unparsed` | no | none | | | | | |
+//! | 4 | The bytes are intact, the header or the fields cannot be read, and the single 34 is above the number expected. | `Gap`, once for a gap; no `Unparsed` | no | resend request (2), once for a gap | | | | | |
+//! | 5 | The bytes are intact, the header or the fields cannot be read, and the single 34 is below the number expected, whether or not the message is marked as a repetition (43). | `Unparsed` | no | none | | | | | |
+//! | 6 | The header can be read and 34 is above the number expected, whether or not the body can be read. | `Gap`, once for a gap; no `Unparsed` | no | resend request (2), once for a gap | | | | | |
+//! | 7 | The header can be read, 34 is below the number expected and the message is marked as a repetition (43=Y), whether or not the body can be read. | none | no | none | | | | | |
+//! | 8 | The header can be read, 34 is below the number expected and the message is not marked as a repetition, whether or not the body can be read. | `Disconnected` with `TransportError::Decode`; the connection is closed and the session connects again. No `Unparsed`. | no | none | | | | | |
+//! | 9 | In turn; a reject (3) or a business message reject (j), as far as a type shows, that cannot be read in its header, its fields or its body. | `Unparsed` | yes | none, so that no reject answers a reject | | | | | |
+//! | 10 | In turn; the header can be read and the type is one the library does not know. | `Unparsed` with `FixError::UnsupportedMessage` | yes | reject (3) | yes | yes | no | 11 | yes |
+//! | 11 | In turn; a required tag is missing: 49, 52 or 56 of the header, or a tag of the body. | `Unparsed` with `FixError::MissingField` | yes | reject (3) | yes | yes | the tag | 1 | yes |
+//! | 12 | In turn; a value has the wrong form, in the header (43, 52, 122) or in the body, or a tag of the header is there twice. | `Unparsed` with `FixError::InvalidField` | yes | reject (3) | yes | yes | the tag | no | yes |
+//! | 13 | In turn; the fields are broken (an empty value such as `58=`, a field without `=`, a tag that is not a positive number, a field that is not UTF-8, a body the delimiter does not close, or a type (35) that is not the first field after the body length) and a field 35 shows a type. | `Unparsed` with `FixError::Garbled` | yes | reject (3) | yes | yes | no | no | yes |
+//! | 14 | In turn; the fields are broken as in row 13 and no field 35 shows a type. | `Unparsed` with `FixError::Garbled` | yes | reject (3) | yes | no | no | no | yes |
+//! | 15 | In turn; the fields are broken as in row 13 and the type shown is empty (`35=`). | `Unparsed` with `FixError::Garbled` | yes | none: the reject would hold an empty 372 and cannot be written | | | | | |
+//! | 16 | While the session logs out, from its logout to the logout of the server: a whole message that cannot be read, whatever its number: damaged bytes, or a header, fields or a body that cannot be read. | `Unparsed` | no | none | | | | | |
+//! | 17 | While the session logs out: the stream loses its framing as in row 1. | none; [`FixClient::logout`](client::FixClient::logout) fails with `Transport`. | no | none | | | | | |
+//! | 18 | In answer to a logon: a stream that has lost its framing as in row 1, or a whole message that cannot be read as in row 16. | none at the first logon: [`FixClient::connect`](client::FixClient::connect) fails with the error, `Transport` for row 1 and `Fix` otherwise. `ReconnectFailed` with that error at a later logon, and the next attempt follows. | no | none; the connection is closed | | | | | |
+//!
+//! Rows 6 to 8 hold for a message that could be used as well; three messages are exempt.
+//! A sequence reset without gap fill is read whatever its number. A logout or a resend
+//! request ahead of its turn opens the gap of row 6 and is acted on at once all the same.
+//! While the session logs out no number is checked: a message that can be read is reported
+//! as `Message` whatever its number.
+//!
+//! A message of rows 2 and 3 is not asked for at once. When it held the number expected,
+//! the next message arrives ahead of its turn and the gap is asked for by rows 4 and 6.
 //!
 //! # Error handling
 //!

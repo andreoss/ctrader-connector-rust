@@ -89,16 +89,13 @@ pub struct Inbound {
 pub enum Event {
     /// A message arrived.
     Message(Inbound),
-    /// A message arrived that the library cannot read; it is skipped. A message whose bytes
-    /// are intact and whose turn it is is counted and answered with a reject (3) that names
-    /// the message, its type where it is known, the tag and the reason: 11 for a type this
-    /// library does not know, 1 for a missing tag, none for a value of the wrong form. A
-    /// business message reject (j) is never sent: the server refuses one with a reject and
-    /// closes the connection. A reject or a business message reject that cannot be read is
-    /// counted and never answered.
-    /// A message whose bytes are damaged is not counted, so that the server is asked to send
-    /// it again. While the session logs out an unreadable message is reported and not
-    /// answered.
+    /// A message arrived that the library cannot read; it is skipped. Whether it is counted
+    /// and whether a reject (3) answers it, and with which tags, depends on the case: the
+    /// table [Messages that cannot be used](crate::fix#messages-that-cannot-be-used) holds
+    /// every one. Not every message that cannot be used is reported with this event: one
+    /// ahead of its turn is reported as [`Event::Gap`], and one behind its turn whose header
+    /// can be read is not reported when it is a repetition and ends the connection when it
+    /// is none. A business message reject (j) is never sent in answer.
     Unparsed(FixError),
     /// The server ended the session with a logout.
     LoggedOut {

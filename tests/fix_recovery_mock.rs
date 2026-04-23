@@ -294,6 +294,8 @@ async fn commands_between_two_connections_are_answered_and_a_logout_ends_the_wai
     assert_eq!(peer.frame().await.map(|frame| frame.header.msg_type), None);
 }
 
+// Rows 6, 7 and 8 of the table "Messages that cannot be used" in the documentation of the
+// module `fix`, for messages that can be read.
 #[tokio::test]
 async fn gap_in_the_messages_of_the_server_is_asked_for_again_and_filled_in_order() {
     let (client, mut peer) = session(SessionKind::Trade).await;

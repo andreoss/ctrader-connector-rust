@@ -4,6 +4,18 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.7 - 2026-04-22
+
+=== Fixed
+
+- Documentation: the module documentation of `fix` holds a table of every
+  case of a message that cannot be used: the event reported, whether the
+  message is counted, the answer and the tags of each reject (45, 371, 372,
+  373, 58). It adds the cases left out before: broken fields are rejected
+  without 371 and 373, an unknown type without 371, and a message without a
+  single sequence number is reported and not answered. `Event::Unparsed` and
+  the README refer to the table.
+
 == 0.3.6 - 2026-04-21
 
 === Added

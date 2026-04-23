@@ -1,4 +1,7 @@
 //! Tests of the FIX session against a scripted server on the local machine.
+//!
+//! A comment that names rows refers to the table "Messages that cannot be used" in the
+//! documentation of the module `fix`: the test below it pins those rows.
 
 mod fix_support;
 
@@ -127,6 +130,7 @@ async fn wrong_password_is_refused_with_a_typed_error_that_holds_no_secret() {
     assert!(!shown.contains(PASSWORD), "{shown}");
 }
 
+// Row 18, the stream that lost its framing.
 #[tokio::test]
 async fn logon_fails_typed_when_the_server_is_silent_closes_or_answers_otherwise() {
     let server = Server::bind().await;
@@ -459,6 +463,7 @@ async fn reject_naming(peer: &mut fix_support::Peer, msg_type: &str) -> (u64, Me
     (frame.header.seq, message)
 }
 
+// Rows 11, 5, 4 and 3, in that order.
 #[tokio::test]
 async fn message_with_an_unreadable_header_is_rejected_and_the_numbering_goes_on() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -530,6 +535,7 @@ async fn message_with_an_unreadable_header_is_rejected_and_the_numbering_goes_on
     );
 }
 
+// Rows 10, 2, 8 and 1, in that order.
 #[tokio::test]
 async fn unreadable_messages_are_skipped_and_a_broken_stream_ends_the_session() {
     let (client, mut peer) = session(SessionKind::Quote).await;
@@ -600,6 +606,7 @@ async fn answered_after(
     header.seq
 }
 
+// Row 10.
 #[tokio::test]
 async fn message_of_an_unsupported_type_is_answered_with_a_session_reject() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -661,6 +668,7 @@ async fn business_reject_of_the_application_is_refused_and_takes_no_number() {
     drop(client);
 }
 
+// Rows 9, 10 and 11.
 #[tokio::test]
 async fn no_refusal_is_ever_written_as_a_business_reject() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -698,14 +706,25 @@ async fn no_refusal_is_ever_written_as_a_business_reject() {
     peer.send(Logout { text: None }).await;
     let mut written = Vec::new();
     while let Some(frame) = peer.frame().await {
-        written.push(frame.header.msg_type);
+        written.push((frame.header.seq, frame.header.msg_type));
     }
-    assert_eq!(written, ["3", "3", "3", "3", "5"]);
+    let numbered = |seq: u64, msg_type: &str| (seq, msg_type.to_owned());
+    assert_eq!(
+        written,
+        [
+            numbered(2, "3"),
+            numbered(3, "3"),
+            numbered(4, "3"),
+            numbered(5, "3"),
+            numbered(6, "5"),
+        ]
+    );
     timeout(STEP, client.closed())
         .await
         .expect("closed in time");
 }
 
+// Rows 11 and 12.
 #[tokio::test]
 async fn message_with_a_malformed_body_is_answered_with_a_reject() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -768,6 +787,7 @@ async fn message_with_a_malformed_body_is_answered_with_a_reject() {
     drop(client);
 }
 
+// Row 9.
 #[tokio::test]
 async fn reject_that_cannot_be_read_is_never_answered_with_a_reject() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -807,10 +827,11 @@ async fn reject_that_cannot_be_read_is_never_answered_with_a_reject() {
             tag: 380,
         })
     );
-    let _ = answered_after(&mut peer, &mut events, seq + 2).await;
+    assert_eq!(answered_after(&mut peer, &mut events, seq + 2).await, 2);
     drop(client);
 }
 
+// Row 9.
 #[tokio::test]
 async fn reject_with_an_unreadable_header_gets_no_reply_and_no_number() {
     let (client, mut peer) = session(SessionKind::Trade).await;
@@ -844,5 +865,558 @@ async fn reject_with_an_unreadable_header_gets_no_reply_and_no_number() {
         answered_after(&mut peer, &mut events, seq + 5).await,
         before + 1
     );
+    drop(client);
+}
+
+const SENT: &str = "20260101-00:00:00";
+
+fn headed(msg_type: &str, seq: u64, rest: &str) -> Vec<u8> {
+    sealed(&format!(
+        "35={msg_type}|49=CSERVER|56={SENDER}|34={seq}|52={SENT}|{rest}"
+    ))
+}
+
+fn damaged(bytes: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    let at = bytes.len() - 2;
+    let digit = bytes.get_mut(at).expect("digit");
+    *digit = if *digit == b'9' { b'0' } else { *digit + 1 };
+    bytes
+}
+
+fn unclosed(bytes: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    let at = bytes.len() - 2;
+    *bytes.get_mut(at).expect("digit") = b'x';
+    bytes
+}
+
+async fn reject_fields(peer: &mut fix_support::Peer) -> (u64, Vec<(u32, String)>) {
+    let frame = peer.frame().await.expect("a reject, not the end");
+    assert_eq!(frame.header.msg_type, "3");
+    let mut fields: Vec<(u32, String)> = frame
+        .body
+        .into_iter()
+        .map(|field| (field.tag, field.value))
+        .collect();
+    fields.sort();
+    (frame.header.seq, fields)
+}
+
+struct Unusable {
+    body: String,
+    error: FixError,
+    reject: Option<Vec<(u32, &'static str)>>,
+}
+
+fn unusable(body: &str, error: FixError, reject: Option<&[(u32, &'static str)]>) -> Unusable {
+    Unusable {
+        body: body.replace("{to}", SENDER).replace("{at}", SENT),
+        error,
+        reject: reject.map(<[(u32, &str)]>::to_vec),
+    }
+}
+
+fn missing(msg_type: &str, tag: u32) -> FixError {
+    FixError::MissingField {
+        msg_type: msg_type.to_owned(),
+        tag,
+    }
+}
+
+fn invalid(msg_type: &str, tag: u32) -> FixError {
+    FixError::InvalidField {
+        msg_type: msg_type.to_owned(),
+        tag,
+    }
+}
+
+const EMPTY_VALUE: FixError = FixError::Garbled("a field has an empty value");
+const NO_VALUE: FixError = FixError::Garbled("a field has no value");
+const TYPE_NOT_FIRST: FixError = FixError::Garbled("the message type is not the third field");
+
+fn unusable_in_turn() -> Vec<Unusable> {
+    vec![
+        // Row 9: a reject or a business message reject, unreadable in its body, its header
+        // or its fields.
+        unusable(
+            "35=3|49=CSERVER|56={to}|34={n}|52={at}|",
+            missing("3", 45),
+            None,
+        ),
+        unusable(
+            "35=j|49=CSERVER|56={to}|34={n}|52={at}|380=three|",
+            invalid("j", 380),
+            None,
+        ),
+        unusable(
+            "35=3|49=CSERVER|56={to}|34={n}|45=1|",
+            missing("3", 52),
+            None,
+        ),
+        unusable("35=j|49=CSERVER|56={to}|34={n}|58=|", EMPTY_VALUE, None),
+        // Row 10: a type the library does not know.
+        unusable(
+            "35=ZZ|49=CSERVER|56={to}|34={n}|52={at}|",
+            FixError::UnsupportedMessage("ZZ".to_owned()),
+            Some(&[(372, "ZZ"), (373, "11")]),
+        ),
+        // Row 11: a required tag is missing, in the header or in the body.
+        unusable(
+            "35=8|49=CSERVER|56={to}|34={n}|",
+            missing("8", 52),
+            Some(&[(371, "52"), (372, "8"), (373, "1")]),
+        ),
+        unusable(
+            "35=8|56={to}|34={n}|52={at}|",
+            missing("8", 49),
+            Some(&[(371, "49"), (372, "8"), (373, "1")]),
+        ),
+        unusable(
+            "35=1|49=CSERVER|56={to}|34={n}|52={at}|",
+            missing("1", 112),
+            Some(&[(371, "112"), (372, "1"), (373, "1")]),
+        ),
+        // Row 12: a value of the wrong form, or a tag of the header twice.
+        unusable(
+            "35=8|49=CSERVER|56={to}|34={n}|52=yesterday|",
+            invalid("8", 52),
+            Some(&[(371, "52"), (372, "8")]),
+        ),
+        unusable(
+            "35=8|49=CSERVER|49=CSERVER|56={to}|34={n}|52={at}|",
+            invalid("8", 49),
+            Some(&[(371, "49"), (372, "8")]),
+        ),
+        unusable(
+            "35=2|49=CSERVER|56={to}|34={n}|52={at}|7=first|16=0|",
+            invalid("2", 7),
+            Some(&[(371, "7"), (372, "2")]),
+        ),
+        // Row 13: broken fields, the type shows.
+        unusable(
+            "35=8|49=CSERVER|56={to}|34={n}|52={at}|58=|",
+            EMPTY_VALUE,
+            Some(&[(372, "8")]),
+        ),
+        unusable(
+            "35=8|49=CSERVER|56={to}|34={n}|52={at}|58|",
+            NO_VALUE,
+            Some(&[(372, "8")]),
+        ),
+        unusable(
+            "49=CSERVER|35=8|56={to}|34={n}|52={at}|",
+            TYPE_NOT_FIRST,
+            Some(&[(372, "8")]),
+        ),
+        // Row 14: broken fields, no type shows.
+        unusable(
+            "49=CSERVER|56={to}|34={n}|52={at}|",
+            TYPE_NOT_FIRST,
+            Some(&[]),
+        ),
+        // Row 15: broken fields, the type is empty.
+        unusable("35=|49=CSERVER|56={to}|34={n}|52={at}|", EMPTY_VALUE, None),
+    ]
+}
+
+// Rows 9 to 15; each case names its row.
+#[tokio::test]
+async fn unusable_message_in_turn_is_counted_and_its_reject_carries_the_tags_of_its_row() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let mut inbound = peer.next_seq();
+    let mut outbound = answered_after(&mut peer, &mut events, inbound).await + 1;
+    for case in unusable_in_turn() {
+        inbound += 1;
+        let number = inbound.to_string();
+        let text = case.error.to_string();
+        peer.raw(&sealed(&case.body.replace("{n}", &number))).await;
+        assert_eq!(next(&mut events).await, Event::Unparsed(case.error));
+        if let Some(named) = case.reject {
+            let mut carried = vec![(45, number), (58, text)];
+            carried.extend(
+                named
+                    .into_iter()
+                    .map(|(tag, value)| (tag, value.to_owned())),
+            );
+            carried.sort();
+            assert_eq!(reject_fields(&mut peer).await, (outbound, carried));
+            outbound += 1;
+        }
+        inbound += 1;
+        assert_eq!(
+            answered_after(&mut peer, &mut events, inbound).await,
+            outbound,
+            "{}",
+            case.body
+        );
+        outbound += 1;
+    }
+    drop(client);
+}
+
+// Row 1.
+#[tokio::test]
+async fn stream_that_lost_its_framing_ends_the_connection_and_is_not_answered() {
+    let lost: [&[u8]; 3] = [
+        b"not a message at all",
+        b"8=FIX.4.4\x019=abc\x01",
+        b"8=FIX.4.4\x019=4194305\x01",
+    ];
+    for bytes in lost {
+        let (client, mut peer) = session(SessionKind::Trade).await;
+        let mut events = client.events();
+        peer.raw(bytes).await;
+        assert!(matches!(
+            next(&mut events).await,
+            Event::Disconnected(TransportError::Decode(_))
+        ));
+        assert!(peer.frame().await.is_none());
+    }
+}
+
+// Row 2.
+#[tokio::test]
+async fn damaged_message_is_reported_and_neither_counted_nor_answered() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let before = answered_after(&mut peer, &mut events, seq).await;
+    let whole = peer.bytes(seq + 1, probe("sum"));
+    peer.raw(&damaged(&whole)).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Unparsed(FixError::Checksum { .. })
+    ));
+    peer.raw(&unclosed(&whole)).await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Unparsed(FixError::Garbled(
+            "the checksum field does not close the message"
+        ))
+    );
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 1).await,
+        before + 1
+    );
+    drop(client);
+}
+
+// Row 3.
+#[tokio::test]
+async fn message_without_a_single_sequence_number_is_reported_and_not_answered() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let before = answered_after(&mut peer, &mut events, seq).await;
+    let at = seq + 1;
+    let numbered = [
+        (String::new(), missing("8", 34)),
+        (format!("34={at}|34={at}|"), invalid("8", 34)),
+        ("34=two|".to_owned(), invalid("8", 34)),
+        ("58=|".to_owned(), EMPTY_VALUE),
+    ];
+    for (number, error) in numbered {
+        peer.raw(&sealed(&format!(
+            "35=8|49=CSERVER|56={SENDER}|52={SENT}|{number}"
+        )))
+        .await;
+        assert_eq!(next(&mut events).await, Event::Unparsed(error));
+    }
+    assert_eq!(answered_after(&mut peer, &mut events, at).await, before + 1);
+    drop(client);
+}
+
+// Row 4.
+#[tokio::test]
+async fn unreadable_header_ahead_of_its_turn_opens_a_gap_and_is_not_reported() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let before = answered_after(&mut peer, &mut events, seq).await;
+    peer.raw(&without_sending_time(seq + 3)).await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Gap {
+            expected: seq + 1,
+            received: seq + 3,
+        }
+    );
+    let (header, message) = peer.read().await;
+    let again = ResendRequest {
+        begin_seq_no: seq + 1,
+        end_seq_no: 0,
+    };
+    assert_eq!((header.seq, message), (before + 1, again.into()));
+    peer.raw(&without_sending_time(seq + 4)).await;
+    peer.raw(&sealed(&format!(
+        "35=3|49=CSERVER|56={SENDER}|34={}|58=|",
+        seq + 5
+    )))
+    .await;
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 1).await,
+        before + 2
+    );
+    drop(client);
+}
+
+// Row 5.
+#[tokio::test]
+async fn unreadable_header_behind_its_turn_is_reported_and_neither_counted_nor_answered() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let before = answered_after(&mut peer, &mut events, seq).await;
+    let behind = [
+        (format!("34={seq}|"), missing("8", 52)),
+        (format!("34={seq}|43=Y|"), missing("8", 52)),
+        (format!("34={seq}|52={SENT}|58=|"), EMPTY_VALUE),
+    ];
+    for (rest, error) in behind {
+        peer.raw(&sealed(&format!("35=8|49=CSERVER|56={SENDER}|{rest}")))
+            .await;
+        assert_eq!(next(&mut events).await, Event::Unparsed(error));
+    }
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 1).await,
+        before + 1
+    );
+    drop(client);
+}
+
+// Row 6.
+#[tokio::test]
+async fn unreadable_body_ahead_of_its_turn_opens_a_gap_and_is_not_reported() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let before = answered_after(&mut peer, &mut events, seq).await;
+    peer.raw(&headed("ZZ", seq + 3, "")).await;
+    assert_eq!(
+        next(&mut events).await,
+        Event::Gap {
+            expected: seq + 1,
+            received: seq + 3,
+        }
+    );
+    let (header, message) = peer.read().await;
+    let again = ResendRequest {
+        begin_seq_no: seq + 1,
+        end_seq_no: 0,
+    };
+    assert_eq!((header.seq, message), (before + 1, again.into()));
+    peer.raw(&headed("1", seq + 4, "")).await;
+    peer.raw(&headed("3", seq + 5, "")).await;
+    peer.raw(&headed("j", seq + 6, "380=three|")).await;
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 1).await,
+        before + 2
+    );
+    drop(client);
+}
+
+// Row 7.
+#[tokio::test]
+async fn repetition_behind_its_turn_is_dropped_without_an_event_or_an_answer() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let seq = peer.next_seq();
+    let before = answered_after(&mut peer, &mut events, seq).await;
+    peer.raw(&headed("ZZ", seq, "43=Y|")).await;
+    peer.raw(&headed("1", seq, "43=Y|")).await;
+    peer.raw(&headed("3", seq, "43=Y|")).await;
+    peer.raw(&headed("1", seq, "43=Y|112=again|")).await;
+    assert_eq!(
+        answered_after(&mut peer, &mut events, seq + 1).await,
+        before + 1
+    );
+    drop(client);
+}
+
+// Row 8.
+#[tokio::test]
+async fn message_behind_its_turn_that_is_no_repetition_ends_the_connection_unanswered() {
+    for (msg_type, rest) in [("ZZ", ""), ("1", ""), ("3", ""), ("1", "112=stale|")] {
+        let (client, mut peer) = session(SessionKind::Trade).await;
+        let mut events = client.events();
+        peer.raw(&headed(msg_type, 1, rest)).await;
+        let lost = next(&mut events).await;
+        assert!(
+            matches!(&lost, Event::Disconnected(TransportError::Decode(text)) if text.contains("below the expected 2")),
+            "{lost:?}"
+        );
+        assert!(peer.frame().await.is_none());
+    }
+}
+
+fn unusable_while_leaving(seq: u64) -> Vec<(Vec<u8>, Option<FixError>)> {
+    let unsupported = || Some(FixError::UnsupportedMessage("ZZ".to_owned()));
+    vec![
+        (damaged(&headed("0", seq, "")), None),
+        (
+            sealed(&format!("35=8|49=CSERVER|56={SENDER}|52={SENT}|")),
+            Some(missing("8", 34)),
+        ),
+        (headed("ZZ", seq, ""), unsupported()),
+        (headed("ZZ", seq + 50, ""), unsupported()),
+        (headed("ZZ", 1, ""), unsupported()),
+        (headed("1", seq, ""), Some(missing("1", 112))),
+        (headed("2", seq, "7=first|16=0|"), Some(invalid("2", 7))),
+        (headed("3", seq, ""), Some(missing("3", 45))),
+        (without_sending_time(seq), Some(missing("8", 52))),
+        (without_sending_time(seq + 50), Some(missing("8", 52))),
+        (without_sending_time(1), Some(missing("8", 52))),
+        (headed("8", seq, "58=|"), Some(EMPTY_VALUE)),
+    ]
+}
+
+// Row 16.
+#[tokio::test]
+async fn unusable_message_during_the_logout_is_reported_and_never_answered() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let mut events = client.events();
+    let cases = unusable_while_leaving(peer.next_seq());
+    let expected: Vec<Option<FixError>> = cases.iter().map(|(_, error)| error.clone()).collect();
+    let (left, written) = tokio::join!(client.logout(), async {
+        let (header, message) = peer.request().await;
+        assert_eq!(message, Logout { text: None }.into());
+        for (bytes, _) in &cases {
+            peer.raw(bytes).await;
+        }
+        peer.send(Logout { text: None }).await;
+        let mut written = vec![header.seq];
+        while let Some(frame) = peer.frame().await {
+            written.push(frame.header.seq);
+        }
+        written
+    });
+    assert_eq!(left, Ok(()));
+    assert_eq!(written, [2]);
+    for error in expected {
+        match (next(&mut events).await, error) {
+            (Event::Unparsed(FixError::Checksum { .. }), None) => {}
+            (event, error) => assert_eq!(Some(event), error.map(Event::Unparsed)),
+        }
+    }
+    timeout(STEP, client.closed())
+        .await
+        .expect("closed in time");
+}
+
+// Row 17.
+#[tokio::test]
+async fn stream_that_loses_its_framing_during_the_logout_fails_the_logout() {
+    let (client, mut peer) = session(SessionKind::Trade).await;
+    let (left, written) = tokio::join!(client.logout(), async {
+        let (header, message) = peer.request().await;
+        assert_eq!(message, Logout { text: None }.into());
+        peer.raw(b"not a message at all").await;
+        let mut written = vec![header.seq];
+        while let Some(frame) = peer.frame().await {
+            written.push(frame.header.seq);
+        }
+        written
+    });
+    assert!(
+        matches!(
+            left,
+            Err(ConnectorError::Transport(TransportError::Decode(_)))
+        ),
+        "{left:?}"
+    );
+    assert_eq!(written, [2]);
+}
+
+fn unusable_logon_answers() -> Vec<(Vec<u8>, Option<FixError>)> {
+    vec![
+        (damaged(&headed("A", 1, "98=0|108=1|")), None),
+        (
+            sealed(&format!(
+                "35=A|49=CSERVER|56={SENDER}|52={SENT}|98=0|108=1|"
+            )),
+            Some(missing("A", 34)),
+        ),
+        (
+            sealed(&format!("35=A|49=CSERVER|56={SENDER}|34=1|98=0|108=1|")),
+            Some(missing("A", 52)),
+        ),
+        (headed("A", 1, "98=0|108=|"), Some(EMPTY_VALUE)),
+        (headed("A", 1, "98=0|"), Some(missing("A", 108))),
+        (headed("A", 1, "98=0|108=soon|"), Some(invalid("A", 108))),
+        (
+            headed("ZZ", 1, ""),
+            Some(FixError::UnsupportedMessage("ZZ".to_owned())),
+        ),
+        (headed("3", 1, ""), Some(missing("3", 45))),
+    ]
+}
+
+// Row 18.
+#[tokio::test]
+async fn unusable_answer_to_the_logon_fails_the_logon_and_is_not_answered() {
+    for (bytes, error) in unusable_logon_answers() {
+        let server = Server::bind().await;
+        let (client, written) = tokio::join!(
+            FixClient::connect(server.configuration(), SessionKind::Trade),
+            async {
+                let mut peer = server.accept().await;
+                let (header, message) = peer.read().await;
+                assert!(matches!(message, Message::Logon(_)));
+                peer.raw(&bytes).await;
+                let mut written = vec![header.seq];
+                while let Some(frame) = peer.frame().await {
+                    written.push(frame.header.seq);
+                }
+                written
+            }
+        );
+        match (client.expect_err("no logon"), error) {
+            (ConnectorError::Fix(FixError::Checksum { .. }), None) => {}
+            (failed, error) => assert_eq!(Some(failed), error.map(ConnectorError::Fix)),
+        }
+        assert_eq!(written, [1]);
+    }
+}
+
+// Row 18, logging on again.
+#[tokio::test]
+async fn unusable_answer_to_a_later_logon_fails_that_attempt_and_the_next_one_follows() {
+    let server = Server::bind().await;
+    let (client, peer) = tokio::join!(
+        FixClient::connect(server.configuration(), SessionKind::Trade),
+        async {
+            let mut peer = server.accept().await;
+            peer.logon().await;
+            peer
+        }
+    );
+    let client = client.expect("logon");
+    let mut events = client.events();
+    drop(peer);
+    let mut peer = server.accept().await;
+    let (header, message) = peer.read().await;
+    assert!(matches!(message, Message::Logon(_)));
+    peer.raw(&headed("ZZ", 1, "")).await;
+    let mut written = vec![header.seq];
+    while let Some(frame) = peer.frame().await {
+        written.push(frame.header.seq);
+    }
+    assert_eq!(written, [1]);
+    assert_eq!(
+        next(&mut events).await,
+        Event::Disconnected(TransportError::Closed)
+    );
+    assert_eq!(
+        next(&mut events).await,
+        Event::ReconnectFailed {
+            attempt: 1,
+            error: FixError::UnsupportedMessage("ZZ".to_owned()).into(),
+        }
+    );
+    let mut peer = server.accept().await;
+    peer.logon().await;
+    assert_eq!(next(&mut events).await, Event::Reconnected { attempt: 2 });
     drop(client);
 }
