@@ -44,3 +44,5 @@ jobs:
           cargo test --no-run --no-default-features
           cargo test --no-run --no-default-features --features fix
           cargo test --no-run --no-default-features --features open-api
+      - name: Package
+        run: cargo package

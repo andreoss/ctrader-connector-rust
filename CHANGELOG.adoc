@@ -4,6 +4,19 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== 0.3.10 - 2026-04-23
+
+=== Added
+
+- The licence: the GNU Lesser General Public License, version 3 or later,
+  declared in the manifest, with its text in `COPYING.LESSER` and `COPYING`.
+- Manifest: the repository, the documentation address and the build of the
+  documentation with every feature on.
+
+=== Changed
+
+- The README is a Markdown file, `README.md`, in place of `README.adoc`.
+
 == 0.3.9 - 2026-04-22
 
 === Fixed

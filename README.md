@@ -1,4 +1,4 @@
-= ctrader-connector
+# ctrader-connector
 
 A Rust library for the cTrader Open API (Protobuf over TLS) and the cTrader
 FIX 4.4 API: connection and authorisation, market data, trading and account
@@ -9,49 +9,34 @@ the generated Protobuf messages in `open_api::messages` keep the types of the
 wire. An order is written to the wire at most once and is never sent again
 by the library.
 
-== Features
+## Features
 
 No feature is on by default.
 
-[cols="1,3"]
-|===
-|Feature |Enables
+| Feature | Enables |
+| --- | --- |
+| `open-api` | The Open API client: application and account authorisation, token refresh, symbols, spot quotes, depth, trendbars, ticks, orders and positions, reconcile, execution events, trader details, deal and order history, margin calls and cash flow. |
+| `fix` | The FIX 4.4 client: quote session (security list, spot prices, depth) and trade session (orders, replacement, cancellation, order status, mass status, positions), with reconnection. |
+| `logging` | Diagnostic events of the Open API connection through `tracing`. |
 
-|`open-api`
-|The Open API client: application and account authorisation, token refresh,
-symbols, spot quotes, depth, trendbars, ticks, orders and positions,
-reconcile, execution events, trader details, deal and order history, margin
-calls and cash flow.
-
-|`fix`
-|The FIX 4.4 client: quote session (security list, spot prices, depth) and
-trade session (orders, replacement, cancellation, order status, mass status,
-positions), with reconnection.
-
-|`logging`
-|Diagnostic events of the Open API connection through `tracing`.
-|===
-
-== Requirements
+## Requirements
 
 - Rust 1.86 or later (the minimum supported version), edition 2024.
 - A tokio runtime in the calling application.
 
-== Use
+## Use
 
 The crate is a library. Add it to an application with the protocol features
 needed:
 
-[source,toml]
-----
+```toml
 [dependencies]
 ctrader-connector = { version = "0.3", features = ["open-api", "fix"] }
-----
+```
 
-=== Open API
+### Open API
 
-[source,rust]
-----
+```rust
 use ctrader_connector::common::config::ConfigurationOpenApi;
 use ctrader_connector::open_api::client::OpenApiClient;
 
@@ -61,17 +46,16 @@ for account in client.accounts().await? {
     client.authorise_account(account.id).await?;
 }
 client.shutdown().await;
-----
+```
 
 One connection serves the application and every account of the access token.
 The connection sends heartbeats, keeps within the request limits of the
 server, reconnects after a loss and restores authorisations and
 subscriptions.
 
-=== FIX
+### FIX
 
-[source,rust]
-----
+```rust
 use ctrader_connector::common::config::ConfigurationFix;
 use ctrader_connector::fix::client::FixClient;
 use ctrader_connector::fix::session::SessionKind;
@@ -79,7 +63,7 @@ use ctrader_connector::fix::session::SessionKind;
 let quote = FixClient::connect(ConfigurationFix::from_env()?, SessionKind::Quote).await?;
 let securities = quote.securities().await?;
 quote.logout().await?;
-----
+```
 
 An account has a quote session and a trade session, each a client of its
 own. A session answers heartbeats, closes gaps in the sequence numbers and
@@ -95,115 +79,44 @@ The module documentation covers configuration, connection lifecycle, error
 handling, streams, rate limits, logging, testing and protocol facts for each
 protocol:
 
-[source,sh]
-----
+```sh
 cargo doc --all-features --no-deps --open
-----
+```
 
-== Environment variables
+## Environment variables
 
 Both clients can be configured from the environment. Values are secrets or
 account details and belong in no file under version control.
 
-[cols="2,1,3"]
-|===
-|Variable |Required |Meaning
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `BROKER_CLIENT_ID` | Open API | Client identifier of the application. |
+| `BROKER_CLIENT_SECRET` | Open API | Client secret of the application. |
+| `BROKER_ACCESS_TOKEN` | Open API | Access token that grants the trading accounts. |
+| `BROKER_REFRESH_TOKEN` | no | Refresh token; needed to refresh the pair. |
+| `BROKER_ENVIRONMENT` | no | `demo` or `live`; `demo` when absent. |
+| `BROKER_DEMO_HOST` | no | Host of the demo environment in place of the default one. |
+| `BROKER_TOKEN_URL` | no | Token endpoint in place of the default one. |
+| `BROKER_FIX_HOST` | FIX | Host of the FIX sessions. |
+| `BROKER_FIX_SENDER_COMP_ID` | FIX | Sender identifier of the sessions. |
+| `BROKER_FIX_USERNAME` | FIX | User name of the sessions. |
+| `BROKER_FIX_PASSWORD` | FIX | Password of the sessions. |
+| `BROKER_FIX_QUOTE_PORT` | no | TLS port of the quote session; 5211 when absent. |
+| `BROKER_FIX_TRADE_PORT` | no | TLS port of the trade session; 5212 when absent. |
+| `BROKER_FIX_TARGET_COMP_ID` | no | Target identifier; `CSERVER` when absent. |
+| `BROKER_ENV_FILE` | live tests of the Open API | Absolute path of the file that holds the token pair as `export` lines; the live tests that use the Open API (`open_api_live`, and `fix_live_trading` for its read-back) read the pair from it, and the refresh test writes the new pair back. `fix_live` does not use it. The token refresh example needs it when asked to rotate. |
+| `BROKER_EXAMPLE_SYMBOL` | no | Symbol the examples work with; `BTCUSD` when absent. |
+| `BROKER_EXAMPLE_QUANTITY` | no | Quantity the FIX trading examples order, in units; `0.01` when absent. |
+| `BROKER_EXAMPLE_ROTATE` | no | Set to `1`, `true` or `yes` to let the token refresh example rotate the pair. |
+| `BROKER_EXAMPLE_MARKET` | no | Set to `1`, `true` or `yes` to let the FIX order example also trade at market. |
+| `BROKER_EXAMPLE_ALLOW_LIVE` | no | Lets the examples leave the demo environment: `read-only` for the examples that place no order, `yes` for every example and for rotating the token pair. Absent or any other value: demo only. |
 
-|`BROKER_CLIENT_ID`
-|Open API
-|Client identifier of the application.
-
-|`BROKER_CLIENT_SECRET`
-|Open API
-|Client secret of the application.
-
-|`BROKER_ACCESS_TOKEN`
-|Open API
-|Access token that grants the trading accounts.
-
-|`BROKER_REFRESH_TOKEN`
-|no
-|Refresh token; needed to refresh the pair.
-
-|`BROKER_ENVIRONMENT`
-|no
-|`demo` or `live`; `demo` when absent.
-
-|`BROKER_DEMO_HOST`
-|no
-|Host of the demo environment in place of the default one.
-
-|`BROKER_TOKEN_URL`
-|no
-|Token endpoint in place of the default one.
-
-|`BROKER_FIX_HOST`
-|FIX
-|Host of the FIX sessions.
-
-|`BROKER_FIX_SENDER_COMP_ID`
-|FIX
-|Sender identifier of the sessions.
-
-|`BROKER_FIX_USERNAME`
-|FIX
-|User name of the sessions.
-
-|`BROKER_FIX_PASSWORD`
-|FIX
-|Password of the sessions.
-
-|`BROKER_FIX_QUOTE_PORT`
-|no
-|TLS port of the quote session; 5211 when absent.
-
-|`BROKER_FIX_TRADE_PORT`
-|no
-|TLS port of the trade session; 5212 when absent.
-
-|`BROKER_FIX_TARGET_COMP_ID`
-|no
-|Target identifier; `CSERVER` when absent.
-
-|`BROKER_ENV_FILE`
-|live tests of the Open API
-|Absolute path of the file that holds the token pair as `export` lines; the
-live tests that use the Open API (`open_api_live`, and `fix_live_trading`
-for its read-back) read the pair from it, and the refresh test writes the
-new pair back. `fix_live` does not use it. The token
-refresh example needs it when asked to rotate.
-
-|`BROKER_EXAMPLE_SYMBOL`
-|no
-|Symbol the examples work with; `BTCUSD` when absent.
-
-|`BROKER_EXAMPLE_QUANTITY`
-|no
-|Quantity the FIX trading examples order, in units; `0.01` when absent.
-
-|`BROKER_EXAMPLE_ROTATE`
-|no
-|Set to `1`, `true` or `yes` to let the token refresh example rotate the
-pair.
-
-|`BROKER_EXAMPLE_MARKET`
-|no
-|Set to `1`, `true` or `yes` to let the FIX order example also trade at
-market.
-
-|`BROKER_EXAMPLE_ALLOW_LIVE`
-|no
-|Lets the examples leave the demo environment: `read-only` for the examples
-that place no order, `yes` for every example and for rotating the token
-pair. Absent or any other value: demo only.
-|===
-
-== Examples
+## Examples
 
 One runnable program per group of requests, each behind the feature of its
 protocol:
 
-----
+```text
 examples/
 ├── open_api/
 │   ├── connect.rs         connect and authorise
@@ -227,15 +140,14 @@ examples/
 │   ├── reports.rs         order status, mass status and positions
 │   └── reconnect.rs       recovery after a lost connection
 └── support/               pieces the examples share; guard.rs is the demo guard
-----
+```
 
 An example is named after its protocol and its file:
 
-[source,sh]
-----
+```sh
 cargo run --example open_api_connect --features open-api
 cargo run --example fix_spot --features fix
-----
+```
 
 Every example reads its configuration from the environment, prints a short
 result without secrets and exits with a non-zero status and a message that
@@ -276,7 +188,7 @@ token pair or changes the environment. The same test pins the access level
 every example asks for, and an example pinned read-only names nothing of the
 library that places, changes, cancels or closes an order or a position.
 
-== Known limitations
+## Known limitations
 
 - The guard of the examples checks neither the ports nor the token endpoint:
   `BROKER_FIX_QUOTE_PORT`, `BROKER_FIX_TRADE_PORT` and `BROKER_TOKEN_URL`
@@ -289,23 +201,21 @@ library that places, changes, cancels or closes an order or a position.
   before the n-th attempt is n times the delay, so a session pauses for up
   to five hours before its last attempt.
 
-== Build
+## Build
 
-[source,sh]
-----
+```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-features
 cargo build --all-features --examples
-----
+```
 
-== Test
+## Test
 
-[source,sh]
-----
+```sh
 cargo test --all-features
 cargo llvm-cov --all-features --fail-under-lines 85
-----
+```
 
 - Unit tests and the tests against scripted mock servers need no
   credentials and no network beyond the loopback interface.
@@ -320,7 +230,14 @@ cargo llvm-cov --all-features --fail-under-lines 85
 - The live test of the token refresh rotates the pair and writes the new one
   to the file `BROKER_ENV_FILE` names; the old pair stops working at once.
 
-== Changes
+## Changes
 
-link:CHANGELOG.adoc[CHANGELOG.adoc] lists what each version added, changed
+[CHANGELOG.adoc](CHANGELOG.adoc) lists what each version added, changed
 and fixed.
+
+## Licence
+
+This library is free software: it can be redistributed and modified under
+the terms of the GNU Lesser General Public License, version 3 or (at your
+option) any later version. See [COPYING.LESSER](COPYING.LESSER) and
+[COPYING](COPYING).
