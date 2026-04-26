@@ -4,6 +4,13 @@ All notable changes to this crate are recorded here. The format follows
 https://keepachangelog.com/en/1.1.0/[Keep a Changelog] and the versions
 follow https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
+== Unreleased
+
+=== Changed
+
+- `README.md` shows badges: build, version, documentation, licence and the
+  minimum toolchain.
+
 == 0.3.10 - 2026-04-23
 
 === Added

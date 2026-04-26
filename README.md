@@ -1,5 +1,11 @@
 # ctrader-connector
 
+[![ci](https://github.com/andreoss/ctrader-connector-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/andreoss/ctrader-connector-rust/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ctrader-connector.svg)](https://crates.io/crates/ctrader-connector)
+[![docs.rs](https://img.shields.io/docsrs/ctrader-connector)](https://docs.rs/ctrader-connector)
+[![licence](https://img.shields.io/crates/l/ctrader-connector.svg)](COPYING.LESSER)
+[![rustc](https://img.shields.io/crates/msrv/ctrader-connector.svg)](Cargo.toml)
+
 A Rust library for the cTrader Open API (Protobuf over TLS) and the cTrader
 FIX 4.4 API: connection and authorisation, market data, trading and account
 data.
