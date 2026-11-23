@@ -10,6 +10,9 @@ A Rust library for the cTrader Open API (Protobuf over TLS) and the cTrader
 FIX 4.4 API: connection and authorisation, market data, trading and account
 data.
 
+**This library is not an official cTrader product. Spotware bears no
+responsibility for any use of it.**
+
 In the typed API prices, volumes and money are exact decimals, never floats;
 the generated Protobuf messages in `open_api::messages` keep the types of the
 wire. An order is written to the wire at most once and is never sent again
